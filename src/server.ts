@@ -9,6 +9,7 @@ import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
 
+// Carrega as variáveis de ambiente (.env)
 dotenv.config();
 
 const app = express();
@@ -17,6 +18,7 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// Verificação de segurança das chaves do banco de dados
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -25,9 +27,10 @@ if (!supabaseUrl || !supabaseKey) {
   process.exit(1);
 }
 
+// Conexão administrativa com o Supabase
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Dicionário para guardar instâncias de WhatsApp em memória
+// Dicionário em memória para gerir as conexões ativas do WhatsApp
 const sessions: Record<string, ReturnType<typeof makeWASocket>> = {};
 
 // ==========================================
@@ -41,32 +44,33 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
     return;
   }
 
-  // Cria um identificador seguro para a pasta baseando-se no email
+  // Cria uma pasta segura para salvar os dados de autenticação do aparelho deste cliente
   const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
   const sessionDir = path.join(__dirname, '..', 'auth_info_baileys', safeEmailFolder);
 
-  // Força uma sessão nova apagando as credenciais antigas
+  // Se o cliente pedir um novo QR Code, apagamos a sessão antiga localmente
   if (fs.existsSync(sessionDir)) {
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }
 
-  // Fecha o socket antigo caso o utilizador tenha clicado novamente no botão
+  // Derruba o socket antigo se ele ainda estiver ativo na memória
   if (sessions[email]) {
     sessions[email].ws.close();
     delete sessions[email];
   }
 
-  // Inicializa a gestão de estado do Baileys
+  // Inicializa o gerenciador de chaves do Baileys
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
-    logger: pino({ level: 'silent' }) // Desliga os logs excessivos
+    logger: pino({ level: 'silent' }) // Mantém o console limpo
   });
 
   sessions[email] = sock;
 
+  // Salva as credenciais sempre que o WhatsApp atualizar as chaves de segurança
   sock.ev.on('creds.update', saveCreds);
 
   let qrSent = false;
@@ -74,7 +78,7 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Se o Baileys gerou o texto do QR, convertemos para Imagem e enviamos
+    // Converte o código bruto do WhatsApp em uma imagem Base64 para o Frontend
     if (qr && !qrSent) {
       try {
         qrSent = true;
@@ -88,21 +92,60 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
       }
     }
 
+    // Gerencia quedas de conexão
     if (connection === 'close') {
       const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log(`Conexão fechada para ${email}. Reconectar? ${shouldReconnect}`);
+      console.log(`Conexão fechada para ${email}. Motivo: Reconectar? ${shouldReconnect}`);
+      
+      // Se não foi um logout intencional, o Baileys tentará reconectar sozinho depois
     } else if (connection === 'open') {
       console.log(`WhatsApp conectado com sucesso para: ${email}`);
-      // Resposta de salvaguarda caso a rota ainda esteja aberta
       if (!qrSent && !res.headersSent) {
-         res.status(200).json({ message: 'Sessão conectada.' });
+         res.status(200).json({ message: 'Sessão conectada nativamente.' });
       }
     }
   });
 });
 
 // ==========================================
-// ROTA 2: Ligar/Desligar a Inteligência Artificial
+// ROTA 2: Desconectar o WhatsApp de forma segura
+// ==========================================
+app.post('/api/whatsapp/disconnect', async (req: Request, res: Response): Promise<void> => {
+  const { email } = req.body;
+
+  if (!email) {
+    res.status(400).json({ error: 'Email é obrigatório.' });
+    return;
+  }
+
+  console.log(`Solicitação de desconexão recebida para: ${email}`);
+
+  try {
+    // 1. Encerra a comunicação de rede do WhatsApp
+    if (sessions[email]) {
+      sessions[email].ws.close();
+      delete sessions[email];
+    }
+
+    // 2. Apaga apenas a pasta física de tokens de autenticação
+    const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
+    const sessionDir = path.join(__dirname, '..', 'auth_info_baileys', safeEmailFolder);
+    
+    if (fs.existsSync(sessionDir)) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+      console.log(`Arquivos de sessão removidos para ${email}`);
+    }
+
+    // Nota: O banco de dados (Supabase) permanece inalterado.
+    res.status(200).json({ message: 'WhatsApp desconectado com sucesso. Dados preservados no banco.' });
+  } catch (error) {
+    console.error('Erro ao tentar desconectar:', error);
+    res.status(500).json({ error: 'Erro interno ao tentar desconectar o WhatsApp.' });
+  }
+});
+
+// ==========================================
+// ROTA 3: Ligar/Desligar a Inteligência Artificial
 // ==========================================
 app.post('/api/settings/ai', async (req: Request, res: Response): Promise<void> => {
   const { email, aiEnabled } = req.body;
@@ -111,6 +154,8 @@ app.post('/api/settings/ai', async (req: Request, res: Response): Promise<void> 
     res.status(400).json({ error: 'Email é obrigatório.' });
     return;
   }
+
+  console.log(`Alterando status da IA do cliente ${email} para: ${aiEnabled ? 'Ligada' : 'Desligada'}`);
 
   try {
     const { error } = await supabase
@@ -125,17 +170,18 @@ app.post('/api/settings/ai', async (req: Request, res: Response): Promise<void> 
     res.status(200).json({ message: 'Configuração de IA atualizada com sucesso!' });
   } catch (error) {
     console.error('Erro ao atualizar banco de dados:', error);
-    res.status(500).json({ error: 'Falha ao salvar as configurações.' });
+    res.status(500).json({ error: 'Falha ao salvar as configurações no banco.' });
   }
 });
 
 // ==========================================
-// ROTA BÁSICA: Teste de saúde
+// ROTA BÁSICA: Health Check
 // ==========================================
 app.get('/', (req: Request, res: Response) => {
-  res.send('Servidor TS com Baileys está rodando perfeitamente!');
+  res.send('API do WAG BOT operando normalmente!');
 });
 
+// Inicialização do servidor
 app.listen(port, () => {
-  console.log(`Backend rodando na porta ${port}`);
+  console.log(`🚀 Backend rodando na porta ${port}`);
 });
