@@ -9,17 +9,15 @@ import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
 
-// Carrega as variáveis de ambiente (.env)
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// 1. CORREÇÃO DO CORS: Liberando explicitamente a sua Vercel e o Localhost
 app.use(cors({
   origin: [
-    'https://wag-frontend-korvenlabcontato-4447s-projects.vercel.app', // Sua Vercel
-    'http://localhost:5173', // Vite local
+    'https://wag-frontend-korvenlabcontato-4447s-projects.vercel.app', 
+    'http://localhost:5173', 
     'http://localhost:3000' 
   ],
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -28,7 +26,6 @@ app.use(cors({
 
 app.use(express.json());
 
-// Verificação de segurança das chaves do banco de dados
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -41,7 +38,7 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 const sessions: Record<string, ReturnType<typeof makeWASocket>> = {};
 
 // ==========================================
-// ROTA 1: Geração de QR Code via Baileys
+// ROTA: Geração de QR Code e Motor do Bot
 // ==========================================
 app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> => {
   const { email } = req.body;
@@ -51,7 +48,6 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
     return;
   }
 
-  // 2. ESCUDO CONTRA CRASHES (Try/Catch Global na Rota)
   try {
     const baseAuthDir = path.join(__dirname, '..', 'auth_info_baileys');
     if (!fs.existsSync(baseAuthDir)) {
@@ -71,10 +67,7 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-
-    console.log(`Buscando versão do WhatsApp para ${email}...`);
     const { version } = await fetchLatestBaileysVersion();
-    console.log(`Versão encontrada: v${version.join('.')}`);
 
     const sock = makeWASocket({
       version,
@@ -113,8 +106,6 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
         const boomError = lastDisconnect?.error as Boom;
         const statusCode = boomError?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-
-        console.log(`Conexão fechada. Status: ${statusCode}. Reconectar? ${shouldReconnect}`);
         
         if (!shouldReconnect && !qrSent && !res.headersSent) {
            res.status(500).json({ error: 'A conexão falhou permanentemente. Tente novamente.' });
@@ -128,8 +119,39 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
       }
     });
 
+    // ========================================================
+    // FEATURE: O BOT "OUVINDO" E CONTANDO MENSAGENS
+    // ========================================================
+    sock.ev.on('messages.upsert', async (m) => {
+      const msg = m.messages[0];
+      // Ignora mensagens enviadas pelo próprio bot/dono para não contar em duplicidade
+      if (!msg.message || msg.key.fromMe) return;
+
+      console.log(`Nova mensagem recebida no bot de ${email}`);
+
+      // 1. Busca se a IA está ligada no banco de dados para este cliente
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('is_ai_enabled, messages_answered')
+        .eq('email', email)
+        .single();
+
+      // 2. Se a IA estiver ligada, ele registra a métrica
+      if (profile?.is_ai_enabled) {
+        // FUTURO: Aqui entrará o código que envia o texto para o Gemini responder
+
+        // Atualiza a métrica no Supabase somando +1
+        const novasMensagens = (profile.messages_answered || 0) + 1;
+        await supabase
+          .from('profiles')
+          .update({ messages_answered: novasMensagens })
+          .eq('email', email);
+          
+        console.log(`Métrica atualizada para ${email}: ${novasMensagens} mensagens.`);
+      }
+    });
+
   } catch (criticalError) {
-    // Se o Baileys tentar crashar o servidor, nós capturamos o erro aqui!
     console.error('ERRO CRÍTICO na rota de QR Code:', criticalError);
     if (!res.headersSent) {
       res.status(500).json({ error: 'Erro interno no servidor ao tentar conectar ao WhatsApp.' });
@@ -138,46 +160,96 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
 });
 
 // ==========================================
-// ROTA 2: Desconectar o WhatsApp
+// ROTA: Desconectar WhatsApp
 // ==========================================
 app.post('/api/whatsapp/disconnect', async (req: Request, res: Response): Promise<void> => {
   const { email } = req.body;
-  if (!email) {
-    res.status(400).json({ error: 'Email é obrigatório.' });
-    return;
-  }
+  if (!email) return res.status(400).end();
+
   try {
     if (sessions[email]) {
       sessions[email].ws.close();
       delete sessions[email];
     }
-    const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
-    const sessionDir = path.join(__dirname, '..', 'auth_info_baileys', safeEmailFolder);
+    const sessionDir = path.join(__dirname, '..', 'auth_info_baileys', email.replace(/[^a-zA-Z0-9]/g, '_'));
+    if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
     
-    if (fs.existsSync(sessionDir)) {
-      fs.rmSync(sessionDir, { recursive: true, force: true });
-    }
-    res.status(200).json({ message: 'WhatsApp desconectado com sucesso.' });
+    res.status(200).json({ message: 'Desconectado.' });
   } catch (error) {
     res.status(500).json({ error: 'Erro ao desconectar.' });
   }
 });
 
 // ==========================================
-// ROTA 3: Ligar/Desligar a Inteligência Artificial
+// ROTA: Ligar/Desligar IA
 // ==========================================
 app.post('/api/settings/ai', async (req: Request, res: Response): Promise<void> => {
   const { email, aiEnabled } = req.body;
-  if (!email) {
-    res.status(400).json({ error: 'Email é obrigatório.' });
-    return;
-  }
+  if (!email) return res.status(400).end();
+
   try {
-    const { error } = await supabase.from('profiles').update({ is_ai_enabled: aiEnabled }).eq('email', email);
-    if (error) throw error;
+    await supabase.from('profiles').update({ is_ai_enabled: aiEnabled }).eq('email', email);
     res.status(200).json({ message: 'Configuração atualizada!' });
   } catch (error) {
-    res.status(500).json({ error: 'Falha ao salvar as configurações.' });
+    res.status(500).json({ error: 'Falha.' });
+  }
+});
+
+// ==========================================
+// NOVAS ROTAS PARA O DASHBOARD FRONTEND
+// ==========================================
+
+// Rota para buscar TODOS os dados do perfil quando o Dashboard carrega
+app.get('/api/user/profile', async (req: Request, res: Response): Promise<void> => {
+  const email = req.query.email as string;
+  if (!email) {
+    res.status(400).json({ error: 'Email não fornecido.' });
+    return;
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    if (error) throw error;
+    res.status(200).json(data);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao buscar perfil.' });
+  }
+});
+
+// Rota para salvar o Nome da Loja
+app.post('/api/settings/store', async (req: Request, res: Response): Promise<void> => {
+  const { email, storeName } = req.body;
+  if (!email) return res.status(400).end();
+
+  try {
+    await supabase.from('profiles').update({ store_name: storeName }).eq('email', email);
+    res.status(200).json({ message: 'Nome salvo com sucesso!' });
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao salvar.' });
+  }
+});
+
+// Rota para salvar Horários de Funcionamento
+app.post('/api/settings/hours', async (req: Request, res: Response): Promise<void> => {
+  const { email, startTime, endTime, activeDays, serviceDuration } = req.body;
+  if (!email) return res.status(400).end();
+
+  try {
+    await supabase.from('profiles').update({ 
+      start_time: startTime,
+      end_time: endTime,
+      active_days: activeDays,
+      service_duration: serviceDuration
+    }).eq('email', email);
+    
+    res.status(200).json({ message: 'Horários salvos com sucesso!' });
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao salvar horários.' });
   }
 });
 
