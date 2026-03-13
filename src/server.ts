@@ -44,9 +44,15 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
     return;
   }
 
-  // Cria uma pasta segura para salvar os dados de autenticação do aparelho deste cliente
+  // 1. GARANTIA DE PASTA: Cria a pasta principal se ela não existir
+  const baseAuthDir = path.join(__dirname, '..', 'auth_info_baileys');
+  if (!fs.existsSync(baseAuthDir)) {
+    fs.mkdirSync(baseAuthDir, { recursive: true });
+  }
+
+  // Cria a pasta específica do cliente
   const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
-  const sessionDir = path.join(__dirname, '..', 'auth_info_baileys', safeEmailFolder);
+  const sessionDir = path.join(baseAuthDir, safeEmailFolder);
 
   // Se o cliente pedir um novo QR Code, apagamos a sessão antiga localmente
   if (fs.existsSync(sessionDir)) {
@@ -65,15 +71,14 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
-    logger: pino({ level: 'silent' }), // Mantém o console limpo
-    browser: ['WAG BOT', 'Chrome', '1.0.0'], // Identificação para o WhatsApp não bloquear
-    syncFullHistory: false, // Poupa a RAM do Render não descarregando mensagens antigas
+    logger: pino({ level: 'silent' }), 
+    browser: ['Ubuntu', 'Chrome', '20.0.04'], // Disfarce de segurança atualizado
+    syncFullHistory: false, 
     generateHighQualityLinkPreview: false
   });
 
   sessions[email] = sock;
 
-  // Salva as credenciais sempre que o WhatsApp atualizar as chaves de segurança
   sock.ev.on('creds.update', saveCreds);
 
   let qrSent = false;
@@ -81,7 +86,7 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // Converte o código bruto do WhatsApp em uma imagem Base64 para o Frontend
+    // Converte o código bruto do WhatsApp em uma imagem Base64
     if (qr && !qrSent) {
       try {
         qrSent = true;
@@ -95,14 +100,17 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
       }
     }
 
-    // Gerencia quedas de conexão
     if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log(`Conexão fechada para ${email}. Motivo: Reconectar? ${shouldReconnect}`);
+      const boomError = lastDisconnect?.error as Boom;
+      const statusCode = boomError?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+      console.log(`Conexão fechada para ${email}. Status: ${statusCode}. Reconectar? ${shouldReconnect}`);
       
-      // Quebra o carregamento infinito: avisa o frontend se o WhatsApp derrubar a conexão antes do QR
-      if (!qrSent && !res.headersSent) {
-         res.status(500).json({ error: 'A conexão com o WhatsApp caiu. Por favor, tente novamente.' });
+      // 2. CORREÇÃO: Só devolvemos o erro 500 se o Baileys disser que NÃO vai tentar de novo.
+      // Se ele disser que vai reconectar (shouldReconnect = true), deixamos ele trabalhar!
+      if (!shouldReconnect && !qrSent && !res.headersSent) {
+         res.status(500).json({ error: 'A conexão falhou permanentemente. Tente novamente.' });
       }
       
     } else if (connection === 'open') {
@@ -125,28 +133,23 @@ app.post('/api/whatsapp/disconnect', async (req: Request, res: Response): Promis
     return;
   }
 
-  console.log(`Solicitação de desconexão recebida para: ${email}`);
-
   try {
-    // 1. Encerra a comunicação de rede do WhatsApp
     if (sessions[email]) {
       sessions[email].ws.close();
       delete sessions[email];
     }
 
-    // 2. Apaga apenas a pasta física de tokens de autenticação
     const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
     const sessionDir = path.join(__dirname, '..', 'auth_info_baileys', safeEmailFolder);
     
     if (fs.existsSync(sessionDir)) {
       fs.rmSync(sessionDir, { recursive: true, force: true });
-      console.log(`Arquivos de sessão removidos para ${email}`);
     }
 
-    res.status(200).json({ message: 'WhatsApp desconectado com sucesso. Dados preservados no banco.' });
+    res.status(200).json({ message: 'WhatsApp desconectado com sucesso.' });
   } catch (error) {
     console.error('Erro ao tentar desconectar:', error);
-    res.status(500).json({ error: 'Erro interno ao tentar desconectar o WhatsApp.' });
+    res.status(500).json({ error: 'Erro ao desconectar.' });
   }
 });
 
@@ -161,8 +164,6 @@ app.post('/api/settings/ai', async (req: Request, res: Response): Promise<void> 
     return;
   }
 
-  console.log(`Alterando status da IA do cliente ${email} para: ${aiEnabled ? 'Ligada' : 'Desligada'}`);
-
   try {
     const { error } = await supabase
       .from('profiles')
@@ -173,21 +174,17 @@ app.post('/api/settings/ai', async (req: Request, res: Response): Promise<void> 
       throw error;
     }
 
-    res.status(200).json({ message: 'Configuração de IA atualizada com sucesso!' });
+    res.status(200).json({ message: 'Configuração atualizada!' });
   } catch (error) {
-    console.error('Erro ao atualizar banco de dados:', error);
-    res.status(500).json({ error: 'Falha ao salvar as configurações no banco.' });
+    console.error('Erro no Supabase:', error);
+    res.status(500).json({ error: 'Falha ao salvar as configurações.' });
   }
 });
 
-// ==========================================
-// ROTA BÁSICA: Health Check
-// ==========================================
 app.get('/', (req: Request, res: Response) => {
   res.send('API do WAG BOT operando normalmente!');
 });
 
-// Inicialização do servidor
 app.listen(port, () => {
   console.log(`🚀 Backend rodando na porta ${port}`);
 });
