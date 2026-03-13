@@ -3,7 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import qrcode from 'qrcode';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import fs from 'fs';
@@ -68,11 +68,16 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
   // Inicializa o gerenciador de chaves do Baileys
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
+  // 2. BUSCA DA VERSÃO ATUALIZADA (CORREÇÃO DO ERRO 405)
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  console.log(`Iniciando WhatsApp v${version.join('.')} para o email: ${email}`);
+
   const sock = makeWASocket({
+    version, // Injeta a versão atualizada para a Meta não rejeitar a conexão
     auth: state,
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }), 
-    browser: ['Ubuntu', 'Chrome', '20.0.04'], // Disfarce de segurança atualizado
+    browser: ['Ubuntu', 'Chrome', '20.0.04'], 
     syncFullHistory: false, 
     generateHighQualityLinkPreview: false
   });
@@ -107,8 +112,6 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
 
       console.log(`Conexão fechada para ${email}. Status: ${statusCode}. Reconectar? ${shouldReconnect}`);
       
-      // 2. CORREÇÃO: Só devolvemos o erro 500 se o Baileys disser que NÃO vai tentar de novo.
-      // Se ele disser que vai reconectar (shouldReconnect = true), deixamos ele trabalhar!
       if (!shouldReconnect && !qrSent && !res.headersSent) {
          res.status(500).json({ error: 'A conexão falhou permanentemente. Tente novamente.' });
       }
