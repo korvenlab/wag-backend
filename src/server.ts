@@ -65,7 +65,10 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
-    logger: pino({ level: 'silent' }) // Mantém o console limpo
+    logger: pino({ level: 'silent' }), // Mantém o console limpo
+    browser: ['WAG BOT', 'Chrome', '1.0.0'], // Identificação para o WhatsApp não bloquear
+    syncFullHistory: false, // Poupa a RAM do Render não descarregando mensagens antigas
+    generateHighQualityLinkPreview: false
   });
 
   sessions[email] = sock;
@@ -97,7 +100,11 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
       const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
       console.log(`Conexão fechada para ${email}. Motivo: Reconectar? ${shouldReconnect}`);
       
-      // Se não foi um logout intencional, o Baileys tentará reconectar sozinho depois
+      // Quebra o carregamento infinito: avisa o frontend se o WhatsApp derrubar a conexão antes do QR
+      if (!qrSent && !res.headersSent) {
+         res.status(500).json({ error: 'A conexão com o WhatsApp caiu. Por favor, tente novamente.' });
+      }
+      
     } else if (connection === 'open') {
       console.log(`WhatsApp conectado com sucesso para: ${email}`);
       if (!qrSent && !res.headersSent) {
@@ -136,7 +143,6 @@ app.post('/api/whatsapp/disconnect', async (req: Request, res: Response): Promis
       console.log(`Arquivos de sessão removidos para ${email}`);
     }
 
-    // Nota: O banco de dados (Supabase) permanece inalterado.
     res.status(200).json({ message: 'WhatsApp desconectado com sucesso. Dados preservados no banco.' });
   } catch (error) {
     console.error('Erro ao tentar desconectar:', error);
