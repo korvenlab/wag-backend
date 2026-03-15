@@ -1,3 +1,4 @@
+// LOGICA DO CELEBRO DA IA COMO LER E ENVIAR MENSAGENS
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from 'dotenv';
 
