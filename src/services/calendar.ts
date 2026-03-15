@@ -1,3 +1,4 @@
+// LOGICA DA INTEGRACAO COM O CALENDARIO DO GOOGLE
 import { google } from 'googleapis';
 import { addHours, parseISO } from 'date-fns';
 import { supabase } from '../lib/supabase';
