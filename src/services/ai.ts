@@ -15,7 +15,6 @@ const isMessageUseless = (message: string): boolean => {
     return isLaugh || ignoreList.includes(lowerMsg) || lowerMsg.length <= 2;
 };
 
-// MUDANÇA: Adicionado o parâmetro operatingHours
 export const analyzeMessage = async (history: string, currentMessage: string, isAiEnabled: boolean, operatingHours: { start: string, end: string }) => {
     
     // Se a IA estiver desligada pelo interruptor geral, para aqui.
@@ -30,7 +29,14 @@ export const analyzeMessage = async (history: string, currentMessage: string, is
     }
 
     try {
-        const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
+        // ALTERAÇÃO: Nome do modelo corrigido para evitar o erro 404 e usar a versão mais barata
+        const model = genAI.getGenerativeModel({ 
+            model: "gemini-1.5-flash",
+            // FEATURE: Força a resposta a ser sempre um JSON, economizando tokens de texto explicativo
+            generationConfig: {
+                responseMimeType: "application/json",
+            }
+        });
 
         const prompt = `
         Aja como a secretária virtual "Lucy".
@@ -52,43 +58,30 @@ export const analyzeMessage = async (history: string, currentMessage: string, is
            - O cliente quer agendar? (Ex: "quero marcar", "tem vaga?", "14h").
            - Se a conversa for aleatória, retorne "response": null.
         
-        2. VALIDAÇÃO DE HORÁRIO DE FUNCIONAMENTO (MUITO IMPORTANTE):
+        2. VALIDAÇÃO DE HORÁRIO DE FUNCIONAMENTO:
            - Se o cliente pedir um horário ANTES das ${operatingHours.start} ou DEPOIS das ${operatingHours.end}, NÃO AGENDE.
-           - Retorne "isScheduling": false e em "response" informe amigavelmente qual é o horário de funcionamento e peça para ele escolher outro horário.
+           - Retorne "isScheduling": false e em "response" informe o horário de funcionamento e peça outro horário.
 
         3. VERIFICAÇÃO DE DADOS:
-           CASO A: DADOS COMPLETOS E DENTRO DO HORÁRIO (Dia E Hora identificados válidos)
-           - Retorne "isScheduling": true
-           - Retorne "date": "Data em formato ISO (yyyy-MM-ddTHH:mm:ss)"
+           CASO A: DADOS COMPLETOS (Dia E Hora válidos) -> "isScheduling": true, "date": "ISO String"
+           CASO B: FALTA O DIA (Só Hora) -> "isScheduling": false, "response": "Para qual dia seria esse horário?"
+           CASO C: FALTA A HORA (Só Dia) -> "isScheduling": false, "response": "Qual horário você prefere?"
+           CASO D: INTENÇÃO VAGA -> "isScheduling": false, "response": "Para qual dia e horário você gostaria?"
+           
+        4. TOLERÂNCIA LINGUÍSTICA: Aceite "hj", "amn" e ignore erros.
 
-           CASO B: FALTA O DIA (Só tem a Hora)
-           - NÃO ASSUMA QUE É HOJE.
-           - Retorne "isScheduling": false, "response": "Para qual dia seria esse horário?"
-           
-           CASO C: FALTA A HORA (Só tem o Dia)
-           - Retorne "isScheduling": false, "response": "Qual horário você prefere para esse dia?"
-           
-           CASO D: INTENÇÃO VAGA
-           - Retorne "isScheduling": false, "response": "Para qual dia e horário você gostaria?"
-           
-        4. TOLERÂNCIA LINGUÍSTICA:
-           - Aceite "hj", "amn". Ignore erros ortográficos.
-
-        FORMATO DE RESPOSTA (JSON PURO, SEM MARKDOWN):
+        Responda obrigatoriamente neste formato JSON:
         {
             "isScheduling": boolean,
-            "date": "2025-01-01T15:00:00" | null,
-            "response": "Texto da pergunta ou null"
-        }
-        `;
+            "date": string | null,
+            "response": string | null
+        }`;
 
         const result = await model.generateContent(prompt);
         const response = await result.response;
-        let text = response.text();
+        const text = response.text();
 
         console.log("🤖 Gemini Analisou Contexto:", text);
-
-        text = text.replace(/```json/g, '').replace(/```/g, '').trim();
 
         try {
             return JSON.parse(text);
