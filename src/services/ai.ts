@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI } from "@google-generative-ai/javascript";
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -6,7 +6,7 @@ dotenv.config();
 // Inicializa com a chave de API
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
-// Filtro rápido para ignorar mensagens inúteis
+// Filtro rápido para ignorar mensagens inúteis e economizar tokens
 const isMessageUseless = (message: string): boolean => {
     if (!message) return true;
     const lowerMsg = message.toLowerCase().trim();
@@ -17,81 +17,75 @@ const isMessageUseless = (message: string): boolean => {
 
 export const analyzeMessage = async (history: string, currentMessage: string, isAiEnabled: boolean, operatingHours: { start: string, end: string }) => {
     
-    // Se a IA estiver desligada pelo interruptor geral, para aqui.
     if (!isAiEnabled) {
-        console.log("⏸️ IA desativada pelo interruptor. Mensagem ignorada.");
+        console.log("⏸️ IA desativada pelo interruptor.");
         return { isScheduling: false, response: null };
     }
 
     if (isMessageUseless(currentMessage)) {
-        console.log("🛑 Mensagem retida na porta pelo filtro rápido:", currentMessage);
+        console.log("🛑 Mensagem retida pelo filtro rápido:", currentMessage);
         return { isScheduling: false, response: null };
     }
 
     try {
-        // ALTERAÇÃO: Nome do modelo corrigido para evitar o erro 404 e usar a versão mais barata
+        // CORREÇÃO: Usando o caminho completo 'models/gemini-1.5-flash' para evitar o erro 404
+        // Este é o modelo mais barato e rápido disponível.
         const model = genAI.getGenerativeModel({ 
-            model: "gemini-1.5-flash",
-            // FEATURE: Força a resposta a ser sempre um JSON, economizando tokens de texto explicativo
-            generationConfig: {
-                responseMimeType: "application/json",
-            }
+            model: "models/gemini-1.5-flash"
         });
 
+        // Configuração de geração para economia e precisão
+        const generationConfig = {
+            temperature: 0.1, // Menor criatividade = mais precisão e menos tokens desperdiçados
+            topP: 0.95,
+            topK: 40,
+            maxOutputTokens: 200, // Limita o gasto de tokens na resposta
+            responseMimeType: "application/json", // Força JSON nativo (se a SDK suportar)
+        };
+
         const prompt = `
-        Aja como a secretária virtual "Lucy".
-        Data/Hora atual do sistema: ${new Date().toLocaleString('pt-BR')}
+        Aja como Lucy, secretária virtual.
+        Data/Hora atual: ${new Date().toLocaleString('pt-BR')}
+        Aberto: ${operatingHours.start} às ${operatingHours.end}.
 
-        🏪 HORÁRIO DE FUNCIONAMENTO DO ESTABELECIMENTO:
-        Aberto das ${operatingHours.start} até às ${operatingHours.end}.
-
-        HISTÓRICO DA CONVERSA (Do mais antigo para o mais recente):
-        ---
+        HISTÓRICO:
         ${history}
-        ---
 
-        SUA MISSÃO: Analisar o histórico acima e gerenciar o agendamento.
-        Você deve ser RIGOROSA: Só agende se tiver certeza absoluta do DIA e da HORA.
-        REGRAS DE DECISÃO:
+        REGRAS:
+        1. Identifique intenção de agendamento.
+        2. Se fora do horário (${operatingHours.start}-${operatingHours.end}), negue e informe horário.
+        3. Se faltar Dia ou Hora, peça o dado faltante.
+        4. Só confirme (isScheduling: true) se tiver Dia e Hora válidos.
 
-        1. INTENÇÃO:
-           - O cliente quer agendar? (Ex: "quero marcar", "tem vaga?", "14h").
-           - Se a conversa for aleatória, retorne "response": null.
-        
-        2. VALIDAÇÃO DE HORÁRIO DE FUNCIONAMENTO:
-           - Se o cliente pedir um horário ANTES das ${operatingHours.start} ou DEPOIS das ${operatingHours.end}, NÃO AGENDE.
-           - Retorne "isScheduling": false e em "response" informe o horário de funcionamento e peça outro horário.
-
-        3. VERIFICAÇÃO DE DADOS:
-           CASO A: DADOS COMPLETOS (Dia E Hora válidos) -> "isScheduling": true, "date": "ISO String"
-           CASO B: FALTA O DIA (Só Hora) -> "isScheduling": false, "response": "Para qual dia seria esse horário?"
-           CASO C: FALTA A HORA (Só Dia) -> "isScheduling": false, "response": "Qual horário você prefere?"
-           CASO D: INTENÇÃO VAGA -> "isScheduling": false, "response": "Para qual dia e horário você gostaria?"
-           
-        4. TOLERÂNCIA LINGUÍSTICA: Aceite "hj", "amn" e ignore erros.
-
-        Responda obrigatoriamente neste formato JSON:
+        Responda APENAS este JSON:
         {
             "isScheduling": boolean,
-            "date": string | null,
+            "date": "YYYY-MM-DDTHH:mm:ss" | null,
             "response": string | null
         }`;
 
-        const result = await model.generateContent(prompt);
-        const response = await result.response;
-        const text = response.text();
+        const result = await model.generateContent({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig
+        });
 
-        console.log("🤖 Gemini Analisou Contexto:", text);
+        const response = await result.response;
+        let text = response.text();
+
+        console.log("🤖 Resposta Lucy:", text);
+
+        // Limpeza extra caso a IA ignore o comando de JSON puro
+        text = text.replace(/```json/g, '').replace(/```/g, '').trim();
 
         try {
             return JSON.parse(text);
         } catch (jsonError) {
-            console.error("❌ Erro ao ler JSON da IA:", text);
-            return { isScheduling: false, response: null };
+            console.error("❌ Erro no parse do JSON:", text);
+            return { isScheduling: false, response: "Desculpe, tive um erro interno. Pode repetir?" };
         }
 
     } catch (error: any) {
-        console.error("❌ Erro Geral na IA:", error);
+        console.error("❌ Erro Geral na IA:", error.message);
         return { isScheduling: false, response: null };
     }
 };
