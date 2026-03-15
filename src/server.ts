@@ -10,8 +10,8 @@ import fs from 'fs';
 import path from 'path';
 
 // Importações dos nossos módulos separados
-import { analyzeMessage } from './ai';
-import { checkAvailability, createEvent } from './calendar';
+import { analyzeMessage } from './services/ai';
+import { checkAvailability, createEvent } from './services/calendar';
 
 dotenv.config();
 
