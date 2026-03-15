@@ -3,12 +3,8 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Inicializa a IA com a chave de API
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
-/**
- * Filtro para evitar gastos desnecessários com mensagens curtas ou risadas.
- */
 const isMessageUseless = (message: string): boolean => {
     if (!message) return true;
     const lowerMsg = message.toLowerCase().trim();
@@ -17,19 +13,12 @@ const isMessageUseless = (message: string): boolean => {
     return isLaugh || ignoreList.includes(lowerMsg) || lowerMsg.length <= 2;
 };
 
-/**
- * Mantém apenas as últimas 7 mensagens para controle de custo (Tokens de entrada).
- */
 const truncateHistory = (history: string): string => {
     if (!history) return "";
     const messages = history.split('\n').filter(msg => msg.trim() !== '');
-    if (messages.length <= 7) return history;
     return messages.slice(-7).join('\n');
 };
 
-/**
- * Função Principal de Análise da Lucy
- */
 export const analyzeMessage = async (
     history: string, 
     currentMessage: string, 
@@ -37,7 +26,7 @@ export const analyzeMessage = async (
     dbRow: { 
         start_time: string, 
         end_time: string, 
-        active_days: any, // Pode vir como string ou array do Supabase
+        active_days: any, 
         store_name: string 
     }
 ) => {
@@ -46,16 +35,26 @@ export const analyzeMessage = async (
     if (isMessageUseless(currentMessage)) return { isScheduling: false, response: null };
 
     try {
-        // Modelo 3.1 Flash Lite: Mais rápido e barato para 2026
         const model = genAI.getGenerativeModel({ 
             model: "gemini-3.1-flash-lite-preview" 
         });
 
+        // ==========================================
+        // CORREÇÃO DE FUSO HORÁRIO (Brasília)
+        // ==========================================
         const now = new Date();
+        // Converte o horário do servidor para o horário de Brasília
+        const brTime = new Intl.DateTimeFormat('pt-BR', {
+            timeZone: 'America/Sao_Paulo',
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit',
+            hour12: false
+        }).format(now);
+
         const diasSemanaMap = ["Domingo", "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado"];
         const diaAtualNome = diasSemanaMap[now.getDay()];
 
-        // Tratamento do active_days (converte string do banco em array se necessário)
+        // Tratamento do active_days
         let activeDaysArray: string[] = [];
         try {
             activeDaysArray = typeof dbRow.active_days === 'string' 
@@ -65,16 +64,18 @@ export const analyzeMessage = async (
             activeDaysArray = [];
         }
 
-        // Verifica se a loja abre HOJE de acordo com o banco
         const isClosedToday = !activeDaysArray.includes(diaAtualNome);
 
-        // Define o status que será enviado no prompt para a IA não alucinar
+        // EXTRAÇÃO DA HORA ATUAL PARA LÓGICA DE BLOQUEIO
+        // Pegamos apenas a parte "HH:mm" da string formatada de Brasília
+        const currentTimeBR = brTime.split(', ')[1].substring(0, 5); 
+
         const statusFuncionamento = isClosedToday 
-            ? `FECHADA. Hoje (${diaAtualNome}) não atendemos. Dias ativos são: ${activeDaysArray.join(', ')}.`
-            : `ABERTA. Atendimento hoje das ${dbRow.start_time} às ${dbRow.end_time}.`;
+            ? `FECHADA (Hoje é ${diaAtualNome} e não atendemos).`
+            : `ABERTA (Hoje é ${diaAtualNome}. Atendimento das ${dbRow.start_time} às ${dbRow.end_time}. Agora são exatamente ${currentTimeBR}).`;
 
         const generationConfig = {
-            temperature: 0.1, // Baixa temperatura para evitar respostas criativas demais
+            temperature: 0.1, 
             maxOutputTokens: 150, 
             responseMimeType: "application/json",
         };
@@ -82,26 +83,24 @@ export const analyzeMessage = async (
         const prompt = `
         Aja como Lucy, secretária virtual da loja "${dbRow.store_name}".
         
-        CONTEXTO DE AGORA:
-        - Data e Hora: ${now.toLocaleString('pt-BR')}
+        CONTEXTO DE AGORA (Sempre use este horário):
+        - Data e Hora em Brasília: ${brTime}
         - Dia da Semana: ${diaAtualNome}
-        - Status da Loja: ${statusFuncionamento}
+        - Status: ${statusFuncionamento}
 
         HISTÓRICO RECENTE:
         ${truncateHistory(history)}
 
         MISSÃO:
-        1. Responda em nome da "${dbRow.store_name}".
-        2. Se o Status for FECHADA, diga educadamente que hoje não abrimos.
-        3. Se estiver ABERTA, valide se o horário pedido está entre ${dbRow.start_time} e ${dbRow.end_time}.
-        4. Use a data ${now.toISOString().split('T')[0]} se o cliente disser "hoje" ou "agora".
-        5. isScheduling só é true se você tiver certeza do DIA e HORA.
+        1. Se o cliente pedir um horário, compare com ${currentTimeBR}. Se o horário solicitado já passou ou a loja fechou às ${dbRow.end_time}, informe que encerramos.
+        2. IMPORTANTE: Só diga que encerrou se a hora atual (${currentTimeBR}) for maior que ${dbRow.end_time}.
+        3. Se estiver dentro do horário, prossiga com o agendamento.
 
-        Responda APENAS este JSON:
+        Responda APENAS JSON:
         {
             "isScheduling": boolean,
             "date": "YYYY-MM-DDTHH:mm:ss" | null,
-            "response": "Texto da resposta em nome da ${dbRow.store_name}"
+            "response": "Texto amigável em nome da ${dbRow.store_name}"
         }`;
 
         const result = await model.generateContent({
@@ -114,13 +113,12 @@ export const analyzeMessage = async (
 
         try {
             return JSON.parse(text);
-        } catch (jsonError) {
-            console.error("❌ Erro ao converter JSON da Lucy:", text);
-            return { isScheduling: false, response: "Desculpe, tive um erro técnico. Pode repetir?" };
+        } catch (e) {
+            return { isScheduling: false, response: null };
         }
 
     } catch (error: any) {
-        console.error("❌ Erro na API do Gemini:", error.message);
+        console.error("❌ Erro Gemini:", error.message);
         return { isScheduling: false, response: null };
     }
 };
