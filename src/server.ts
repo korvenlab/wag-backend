@@ -9,6 +9,10 @@ import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
 
+// Importações dos nossos módulos separados
+import { analyzeMessage } from './ai';
+import { checkAvailability, createEvent } from './calendar';
+
 dotenv.config();
 
 const app = express();
@@ -76,7 +80,6 @@ async function startWhatsApp(email: string, res: Response | null) {
 
     sessions[email] = sock;
     
-    // Ouve as mudanças de chaves e salva-as (Crucial para o erro 515)
     sock.ev.on('creds.update', () => {
       saveCreds();
     });
@@ -86,7 +89,6 @@ async function startWhatsApp(email: string, res: Response | null) {
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      // Se existir um QR Code e nós tivermos o objeto "res" do frontend disponível
       if (qr && res && !qrSent) {
         console.log(`📸 [WHATSAPP] Novo QR Code gerado! Enviando ao frontend...`);
         try {
@@ -103,7 +105,6 @@ async function startWhatsApp(email: string, res: Response | null) {
         }
       }
 
-      // GERENCIAMENTO DE QUEDAS E RECONEXÃO (A SOLUÇÃO DO ERRO 515)
       if (connection === 'close') {
         const boomError = lastDisconnect?.error as Boom;
         const statusCode = boomError?.output?.statusCode;
@@ -113,8 +114,6 @@ async function startWhatsApp(email: string, res: Response | null) {
 
         if (shouldReconnect) {
           console.log(`🔄 [WHATSAPP] Meta solicitou reinício. Executando reconexão automática para ${email}...`);
-          // Chamada RECURSIVA: O servidor liga para a função de novo, mas passa "null" no "res" 
-          // para não quebrar a resposta HTTP do express que já foi enviada.
           startWhatsApp(email, null);
         } else {
           console.log(`🛑 [WHATSAPP] Sessão desconectada permanentemente (Logged Out).`);
@@ -137,34 +136,94 @@ async function startWhatsApp(email: string, res: Response | null) {
     });
 
     // ========================================================
-    // OUVINTE DE MENSAGENS E MÉTRICAS DA IA
+    // INTEGRAÇÃO: OUVIR, PENSAR (AI) E AGENDAR (CALENDAR)
     // ========================================================
     sock.ev.on('messages.upsert', async (m) => {
       const msg = m.messages[0];
+      
       if (!msg.message || msg.key.fromMe) return;
 
-      console.log(`\n💬 [BOT] Nova mensagem recebida no número de ${email}`);
+      const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
+      if (!textMessage) return;
+
+      const remoteJid = msg.key.remoteJid; 
+      console.log(`\n💬 [BOT] Mensagem recebida de ${remoteJid}: "${textMessage}"`);
 
       try {
+        // 1. Busca os dados da loja no banco
         const { data: profile, error } = await supabase
           .from('profiles')
-          .select('is_ai_enabled, messages_answered')
+          .select('*')
           .eq('email', email)
           .single();
 
         if (error) return;
 
         if (profile?.is_ai_enabled) {
-          const novasMensagens = (profile.messages_answered || 0) + 1;
-          await supabase
-            .from('profiles')
-            .update({ messages_answered: novasMensagens })
-            .eq('email', email);
+          console.log(`🤖 [GEMINI] Analisando intenção do cliente...`);
+          
+          const storeConfig = {
+            storeName: profile.store_name || 'Nossa Loja',
+            start: profile.start_time || '08:00',
+            end: profile.end_time || '18:00',
+            activeDays: profile.active_days || 'Segunda a Sexta',
+            serviceDuration: profile.service_duration || 30
+          };
+
+          const history = ""; 
+
+          // 2. Chama a Inteligência Artificial
+          const aiResult = await analyzeMessage(history, textMessage, profile.is_ai_enabled, storeConfig);
+
+          // 3. CENÁRIO A: Resposta normal (Dúvidas ou falta de dados)
+          if (!aiResult.isScheduling && aiResult.response && remoteJid) {
+            await sock.sendMessage(remoteJid, { text: aiResult.response });
+            console.log(`✅ [WHATSAPP] Resposta enviada: "${aiResult.response}"`);
             
-          console.log(`📈 [MÉTRICAS] Contador atualizado: ${novasMensagens} mensagens.`);
+            const novasMensagens = (profile.messages_answered || 0) + 1;
+            await supabase.from('profiles').update({ messages_answered: novasMensagens }).eq('email', email);
+          }
+
+          // 4. CENÁRIO B: IA identificou um agendamento válido!
+          if (aiResult.isScheduling && aiResult.date && remoteJid) {
+             console.log(`📅 [AGENDAMENTO] Data extraída: ${aiResult.date}. Verificando Google Calendar...`);
+             
+             const clientId = profile.id; 
+             
+             // Checa conflitos na agenda do Google
+             const isAvailable = await checkAvailability(clientId, aiResult.date);
+
+             if (isAvailable) {
+                 console.log(`🟢 [CALENDÁRIO] Horário LIVRE! Criando evento...`);
+                 
+                 const clientName = msg.pushName || "Cliente WhatsApp";
+                 const clientPhone = remoteJid.split('@')[0];
+                 
+                 // Cria o evento na agenda do lojista
+                 const success = await createEvent(clientId, clientName, clientPhone, aiResult.date);
+                 
+                 if (success) {
+                     const msgSucesso = aiResult.response || `✅ Agendamento confirmado com sucesso para o dia e horário solicitados! Te espero lá.`;
+                     await sock.sendMessage(remoteJid, { text: msgSucesso });
+                     
+                     // Atualiza o Dashboard com a vitória
+                     const novosAgendamentos = (profile.appointments_made || 0) + 1;
+                     await supabase.from('profiles').update({ appointments_made: novosAgendamentos }).eq('email', email);
+                     console.log(`📈 [MÉTRICAS] Agendamentos atualizados: ${novosAgendamentos}`);
+                     
+                 } else {
+                     await sock.sendMessage(remoteJid, { text: "❌ Ocorreu um erro ao salvar na nossa agenda. Pode tentar novamente em alguns minutos?" });
+                 }
+                 
+             } else {
+                 console.log(`🔴 [CALENDÁRIO] Horário OCUPADO.`);
+                 await sock.sendMessage(remoteJid, { text: "⚠️ Infelizmente esse horário já está ocupado na nossa agenda. Qual outro horário ficaria bom para você?" });
+             }
+          }
+
         }
-      } catch (dbError) {
-        console.error(`❌ [ERRO] Falha ao salvar métrica:`, dbError);
+      } catch (error) {
+        console.error(`❌ [ERRO SISTEMA] Falha ao processar a requisição de IA/Calendário:`, error);
       }
     });
 
@@ -177,7 +236,7 @@ async function startWhatsApp(email: string, res: Response | null) {
 }
 
 // ==========================================
-// ROTA DA API: O botão de "Gerar QR Code" chama esta rota
+// ROTAS DA API
 // ==========================================
 app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> => {
   const { email } = req.body;
@@ -188,8 +247,6 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
     return;
   }
 
-  // Só limpamos a pasta física quando o cliente CLICA no botão para gerar um QR novo do zero.
-  // Se for uma reconexão do sistema (515), esta rota não é chamada, preservando os arquivos.
   const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
   const sessionDir = path.join(__dirname, '..', 'auth_info_baileys', safeEmailFolder);
 
@@ -203,13 +260,9 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
     delete sessions[email];
   }
 
-  // Dispara a função principal, enviando o objeto de resposta (res) do Express
   startWhatsApp(email, res);
 });
 
-// ==========================================
-// ROTA: Desconectar WhatsApp
-// ==========================================
 app.post('/api/whatsapp/disconnect', async (req: Request, res: Response): Promise<void> => {
   const { email } = req.body;
   
@@ -233,9 +286,6 @@ app.post('/api/whatsapp/disconnect', async (req: Request, res: Response): Promis
   }
 });
 
-// ==========================================
-// ROTA: Ligar/Desligar IA
-// ==========================================
 app.post('/api/settings/ai', async (req: Request, res: Response): Promise<void> => {
   const { email, aiEnabled } = req.body;
   
@@ -252,9 +302,6 @@ app.post('/api/settings/ai', async (req: Request, res: Response): Promise<void> 
   }
 });
 
-// ==========================================
-// ROTAS PARA O DASHBOARD FRONTEND
-// ==========================================
 app.get('/api/user/profile', async (req: Request, res: Response): Promise<void> => {
   const email = req.query.email as string;
   
