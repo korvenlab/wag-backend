@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from "@google-generative-ai/javascript";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -28,34 +28,32 @@ export const analyzeMessage = async (history: string, currentMessage: string, is
     }
 
     try {
-        // CORREÇÃO: Usando o caminho completo 'models/gemini-1.5-flash' para evitar o erro 404
-        // Este é o modelo mais barato e rápido disponível.
+        // CORREÇÃO: O modelo 1.5-flash é a versão mais barata e rápida.
+        // Usamos apenas o nome simples "gemini-1.5-flash" que é o padrão da SDK oficial.
         const model = genAI.getGenerativeModel({ 
-            model: "models/gemini-1.5-flash"
+            model: "gemini-1.5-flash"
         });
 
-        // Configuração de geração para economia e precisão
+        // Configurações para economia extrema de tokens e precisão
         const generationConfig = {
-            temperature: 0.1, // Menor criatividade = mais precisão e menos tokens desperdiçados
-            topP: 0.95,
-            topK: 40,
-            maxOutputTokens: 200, // Limita o gasto de tokens na resposta
-            responseMimeType: "application/json", // Força JSON nativo (se a SDK suportar)
+            temperature: 0.1, 
+            maxOutputTokens: 150, // Reduzi ainda mais para garantir o menor custo
+            responseMimeType: "application/json",
         };
 
         const prompt = `
         Aja como Lucy, secretária virtual.
-        Data/Hora atual: ${new Date().toLocaleString('pt-BR')}
-        Aberto: ${operatingHours.start} às ${operatingHours.end}.
+        Data atual: ${new Date().toLocaleString('pt-BR')}
+        Horário: ${operatingHours.start} às ${operatingHours.end}.
 
         HISTÓRICO:
         ${history}
 
         REGRAS:
         1. Identifique intenção de agendamento.
-        2. Se fora do horário (${operatingHours.start}-${operatingHours.end}), negue e informe horário.
-        3. Se faltar Dia ou Hora, peça o dado faltante.
-        4. Só confirme (isScheduling: true) se tiver Dia e Hora válidos.
+        2. Se fora do horário (${operatingHours.start}-${operatingHours.end}), peça outro horário.
+        3. Se faltar Dia ou Hora, pergunte.
+        4. Só isScheduling: true se tiver Dia e Hora confirmados.
 
         Responda APENAS este JSON:
         {
@@ -74,14 +72,14 @@ export const analyzeMessage = async (history: string, currentMessage: string, is
 
         console.log("🤖 Resposta Lucy:", text);
 
-        // Limpeza extra caso a IA ignore o comando de JSON puro
+        // Limpeza de segurança caso a IA envie markdown
         text = text.replace(/```json/g, '').replace(/```/g, '').trim();
 
         try {
             return JSON.parse(text);
         } catch (jsonError) {
             console.error("❌ Erro no parse do JSON:", text);
-            return { isScheduling: false, response: "Desculpe, tive um erro interno. Pode repetir?" };
+            return { isScheduling: false, response: null };
         }
 
     } catch (error: any) {
