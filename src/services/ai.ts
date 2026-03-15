@@ -40,19 +40,19 @@ export const analyzeMessage = async (
         });
 
         // ==========================================
-        // CORREÇÃO DE FUSO HORÁRIO (Brasília)
+        // LÓGICA DE FUSO HORÁRIO REFORÇADA (BRT - UTC-3)
         // ==========================================
-        const now = new Date();
-        // Converte o horário do servidor para o horário de Brasília
-        const brTime = new Intl.DateTimeFormat('pt-BR', {
-            timeZone: 'America/Sao_Paulo',
-            year: 'numeric', month: '2-digit', day: '2-digit',
-            hour: '2-digit', minute: '2-digit', second: '2-digit',
-            hour12: false
-        }).format(now);
+        const date = new Date();
+        // Forçamos o cálculo para garantir que, independente do servidor, o horário seja Brasília
+        const brDate = new Date(date.toLocaleString("en-US", {timeZone: "America/Sao_Paulo"}));
+        
+        const hours = brDate.getHours().toString().padStart(2, '0');
+        const minutes = brDate.getMinutes().toString().padStart(2, '0');
+        const currentTimeBR = `${hours}:${minutes}`;
+        const dataFormatadaBR = brDate.toLocaleDateString('pt-BR');
 
         const diasSemanaMap = ["Domingo", "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado"];
-        const diaAtualNome = diasSemanaMap[now.getDay()];
+        const diaAtualNome = diasSemanaMap[brDate.getDay()];
 
         // Tratamento do active_days
         let activeDaysArray: string[] = [];
@@ -66,13 +66,17 @@ export const analyzeMessage = async (
 
         const isClosedToday = !activeDaysArray.includes(diaAtualNome);
 
-        // EXTRAÇÃO DA HORA ATUAL PARA LÓGICA DE BLOQUEIO
-        // Pegamos apenas a parte "HH:mm" da string formatada de Brasília
-        const currentTimeBR = brTime.split(', ')[1].substring(0, 5); 
+        // Verificação lógica se o estabelecimento já fechou
+        // Isso ajuda a IA a não cometer erros de comparação
+        const [hourNow, minNow] = currentTimeBR.split(':').map(Number);
+        const [hourEnd, minEnd] = dbRow.end_time.split(':').map(Number);
+        const isPastClosing = (hourNow > hourEnd) || (hourNow === hourEnd && minNow >= minEnd);
 
         const statusFuncionamento = isClosedToday 
             ? `FECHADA (Hoje é ${diaAtualNome} e não atendemos).`
-            : `ABERTA (Hoje é ${diaAtualNome}. Atendimento das ${dbRow.start_time} às ${dbRow.end_time}. Agora são exatamente ${currentTimeBR}).`;
+            : isPastClosing 
+                ? `ENCERRADA (A loja fechou às ${dbRow.end_time} e agora são ${currentTimeBR}).`
+                : `ABERTA (Atendimento até às ${dbRow.end_time}. Agora são exatamente ${currentTimeBR}).`;
 
         const generationConfig = {
             temperature: 0.1, 
@@ -83,24 +87,22 @@ export const analyzeMessage = async (
         const prompt = `
         Aja como Lucy, secretária virtual da loja "${dbRow.store_name}".
         
-        CONTEXTO DE AGORA (Sempre use este horário):
-        - Data e Hora em Brasília: ${brTime}
+        CONTEXTO TEMPORAL OBRIGATÓRIO:
+        - Data de Hoje: ${dataFormatadaBR}
         - Dia da Semana: ${diaAtualNome}
-        - Status: ${statusFuncionamento}
+        - Horário Oficial agora: ${currentTimeBR}
+        - Status Atual: ${statusFuncionamento}
 
-        HISTÓRICO RECENTE:
-        ${truncateHistory(history)}
-
-        MISSÃO:
-        1. Se o cliente pedir um horário, compare com ${currentTimeBR}. Se o horário solicitado já passou ou a loja fechou às ${dbRow.end_time}, informe que encerramos.
-        2. IMPORTANTE: Só diga que encerrou se a hora atual (${currentTimeBR}) for maior que ${dbRow.end_time}.
-        3. Se estiver dentro do horário, prossiga com o agendamento.
+        REGRAS:
+        1. Se o Status for ENCERRADA ou FECHADA, explique ao cliente que no momento não há atendimento, citando que agora são ${currentTimeBR}.
+        2. Se o cliente pedir para agendar "hoje" ou "agora" e já passou das ${dbRow.end_time}, sugira o próximo dia disponível.
+        3. Nunca use o horário do seu sistema interno, use APENAS o Horário Oficial informado acima: ${currentTimeBR}.
 
         Responda APENAS JSON:
         {
             "isScheduling": boolean,
             "date": "YYYY-MM-DDTHH:mm:ss" | null,
-            "response": "Texto amigável em nome da ${dbRow.store_name}"
+            "response": "Texto da resposta em nome da ${dbRow.store_name}"
         }`;
 
         const result = await model.generateContent({
