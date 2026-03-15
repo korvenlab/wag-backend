@@ -31,7 +31,7 @@ export const analyzeMessage = async (history: string, currentMessage: string, is
         // CORREÇÃO: O modelo 1.5-flash é a versão mais barata e rápida.
         // Usamos apenas o nome simples "gemini-1.5-flash" que é o padrão da SDK oficial.
         const model = genAI.getGenerativeModel({ 
-            model: "gemini-1.5-flash"
+            model: "gemini-3.1-flash-lite-preview"
         });
 
         // Configurações para economia extrema de tokens e precisão
