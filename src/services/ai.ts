@@ -3,10 +3,8 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Inicializa com a chave de API
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
-// Filtro rápido para ignorar mensagens inúteis e economizar tokens
 const isMessageUseless = (message: string): boolean => {
     if (!message) return true;
     const lowerMsg = message.toLowerCase().trim();
@@ -15,51 +13,73 @@ const isMessageUseless = (message: string): boolean => {
     return isLaugh || ignoreList.includes(lowerMsg) || lowerMsg.length <= 2;
 };
 
-export const analyzeMessage = async (history: string, currentMessage: string, isAiEnabled: boolean, operatingHours: { start: string, end: string }) => {
-    
-    if (!isAiEnabled) {
-        console.log("⏸️ IA desativada pelo interruptor.");
-        return { isScheduling: false, response: null };
-    }
+const truncateHistory = (history: string): string => {
+    const messages = history.split('\n').filter(msg => msg.trim() !== '');
+    if (messages.length <= 7) return history;
+    return messages.slice(-7).join('\n');
+};
 
-    if (isMessageUseless(currentMessage)) {
-        console.log("🛑 Mensagem retida pelo filtro rápido:", currentMessage);
-        return { isScheduling: false, response: null };
+/**
+ * FEATURE: A Lucy agora recebe as configurações dinâmicas do Banco de Dados.
+ * @param operatingConfig - Objeto contendo o nome da loja e os horários vindos do banco.
+ */
+export const analyzeMessage = async (
+    history: string, 
+    currentMessage: string, 
+    isAiEnabled: boolean, 
+    operatingConfig: { 
+        storeName: string, 
+        start: string, 
+        end: string,
+        isClosedToday: boolean // Adicione esta flag vinda do seu banco (ex: se domingo está desmarcado)
     }
+) => {
+    
+    if (!isAiEnabled) return { isScheduling: false, response: null };
+    if (isMessageUseless(currentMessage)) return { isScheduling: false, response: null };
 
     try {
-        // CORREÇÃO: O modelo 1.5-flash é a versão mais barata e rápida.
-        // Usamos apenas o nome simples "gemini-1.5-flash" que é o padrão da SDK oficial.
         const model = genAI.getGenerativeModel({ 
-            model: "gemini-3.1-flash-lite-preview"
+            model: "gemini-3.1-flash-lite-preview" 
         });
 
-        // Configurações para economia extrema de tokens e precisão
+        const limitedHistory = truncateHistory(history);
+        const now = new Date();
+        const diasSemana = ["Domingo", "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado"];
+        const diaAtualNome = diasSemana[now.getDay()];
+
+        // FEATURE: Construção dinâmica do status de funcionamento
+        const statusFuncionamento = operatingConfig.isClosedToday 
+            ? `Hoje (${diaAtualNome}), a loja ${operatingConfig.storeName} está FECHADA para agendamentos.`
+            : `Hoje (${diaAtualNome}), a loja ${operatingConfig.storeName} atende das ${operatingConfig.start} às ${operatingConfig.end}.`;
+
         const generationConfig = {
             temperature: 0.1, 
-            maxOutputTokens: 150, // Reduzi ainda mais para garantir o menor custo
+            maxOutputTokens: 150, 
             responseMimeType: "application/json",
         };
 
         const prompt = `
-        Aja como Lucy, secretária virtual.
-        Data atual: ${new Date().toLocaleString('pt-BR')}
-        Horário: ${operatingHours.start} às ${operatingHours.end}.
+        Aja como Lucy, secretária virtual da "${operatingConfig.storeName}".
+        
+        SITUAÇÃO ATUAL DO ESTABELECIMENTO:
+        - Agora são: ${now.toLocaleString('pt-BR')}
+        - Status: ${statusFuncionamento}
 
-        HISTÓRICO:
-        ${history}
+        HISTÓRICO RECENTE:
+        ${limitedHistory}
 
-        REGRAS:
-        1. Identifique intenção de agendamento.
-        2. Se fora do horário (${operatingHours.start}-${operatingHours.end}), peça outro horário.
-        3. Se faltar Dia ou Hora, pergunte.
-        4. Só isScheduling: true se tiver Dia e Hora confirmados.
+        SUA MISSÃO:
+        1. Se o status for FECHADA, informe educadamente que hoje não abrimos e peça para escolher outro dia.
+        2. Se estiver ABERTA, valide se o horário pedido está entre ${operatingConfig.start} e ${operatingConfig.end}.
+        3. Se o cliente disser "hoje" ou "agora", considere a data: ${now.toISOString().split('T')[0]}.
+        4. Agende (isScheduling: true) somente com DIA e HORA confirmados.
 
         Responda APENAS este JSON:
         {
             "isScheduling": boolean,
             "date": "YYYY-MM-DDTHH:mm:ss" | null,
-            "response": string | null
+            "response": "Texto amigável da Lucy em nome da ${operatingConfig.storeName}"
         }`;
 
         const result = await model.generateContent({
@@ -68,22 +88,17 @@ export const analyzeMessage = async (history: string, currentMessage: string, is
         });
 
         const response = await result.response;
-        let text = response.text();
-
-        console.log("🤖 Resposta Lucy:", text);
-
-        // Limpeza de segurança caso a IA envie markdown
-        text = text.replace(/```json/g, '').replace(/```/g, '').trim();
+        let text = response.text().replace(/```json/g, '').replace(/```/g, '').trim();
 
         try {
             return JSON.parse(text);
         } catch (jsonError) {
-            console.error("❌ Erro no parse do JSON:", text);
+            console.error("❌ Erro JSON:", text);
             return { isScheduling: false, response: null };
         }
 
     } catch (error: any) {
-        console.error("❌ Erro Geral na IA:", error.message);
+        console.error("❌ Erro Gemini:", error.message);
         return { isScheduling: false, response: null };
     }
 };
