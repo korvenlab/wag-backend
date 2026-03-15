@@ -3,8 +3,12 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// Inicializa a IA com a chave de API
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
+/**
+ * Filtro para evitar gastos desnecessários com mensagens curtas ou risadas.
+ */
 const isMessageUseless = (message: string): boolean => {
     if (!message) return true;
     const lowerMsg = message.toLowerCase().trim();
@@ -13,25 +17,28 @@ const isMessageUseless = (message: string): boolean => {
     return isLaugh || ignoreList.includes(lowerMsg) || lowerMsg.length <= 2;
 };
 
+/**
+ * Mantém apenas as últimas 7 mensagens para controle de custo (Tokens de entrada).
+ */
 const truncateHistory = (history: string): string => {
+    if (!history) return "";
     const messages = history.split('\n').filter(msg => msg.trim() !== '');
     if (messages.length <= 7) return history;
     return messages.slice(-7).join('\n');
 };
 
 /**
- * FEATURE: A Lucy agora recebe as configurações dinâmicas do Banco de Dados.
- * @param operatingConfig - Objeto contendo o nome da loja e os horários vindos do banco.
+ * Função Principal de Análise da Lucy
  */
 export const analyzeMessage = async (
     history: string, 
     currentMessage: string, 
     isAiEnabled: boolean, 
-    operatingConfig: { 
-        storeName: string, 
-        start: string, 
-        end: string,
-        isClosedToday: boolean // Adicione esta flag vinda do seu banco (ex: se domingo está desmarcado)
+    dbRow: { 
+        start_time: string, 
+        end_time: string, 
+        active_days: any, // Pode vir como string ou array do Supabase
+        store_name: string 
     }
 ) => {
     
@@ -39,47 +46,62 @@ export const analyzeMessage = async (
     if (isMessageUseless(currentMessage)) return { isScheduling: false, response: null };
 
     try {
+        // Modelo 3.1 Flash Lite: Mais rápido e barato para 2026
         const model = genAI.getGenerativeModel({ 
             model: "gemini-3.1-flash-lite-preview" 
         });
 
-        const limitedHistory = truncateHistory(history);
         const now = new Date();
-        const diasSemana = ["Domingo", "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado"];
-        const diaAtualNome = diasSemana[now.getDay()];
+        const diasSemanaMap = ["Domingo", "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado"];
+        const diaAtualNome = diasSemanaMap[now.getDay()];
 
-        // FEATURE: Construção dinâmica do status de funcionamento
-        const statusFuncionamento = operatingConfig.isClosedToday 
-            ? `Hoje (${diaAtualNome}), a loja ${operatingConfig.storeName} está FECHADA para agendamentos.`
-            : `Hoje (${diaAtualNome}), a loja ${operatingConfig.storeName} atende das ${operatingConfig.start} às ${operatingConfig.end}.`;
+        // Tratamento do active_days (converte string do banco em array se necessário)
+        let activeDaysArray: string[] = [];
+        try {
+            activeDaysArray = typeof dbRow.active_days === 'string' 
+                ? JSON.parse(dbRow.active_days) 
+                : dbRow.active_days;
+        } catch (e) {
+            activeDaysArray = [];
+        }
+
+        // Verifica se a loja abre HOJE de acordo com o banco
+        const isClosedToday = !activeDaysArray.includes(diaAtualNome);
+
+        // Define o status que será enviado no prompt para a IA não alucinar
+        const statusFuncionamento = isClosedToday 
+            ? `FECHADA. Hoje (${diaAtualNome}) não atendemos. Dias ativos são: ${activeDaysArray.join(', ')}.`
+            : `ABERTA. Atendimento hoje das ${dbRow.start_time} às ${dbRow.end_time}.`;
 
         const generationConfig = {
-            temperature: 0.1, 
+            temperature: 0.1, // Baixa temperatura para evitar respostas criativas demais
             maxOutputTokens: 150, 
             responseMimeType: "application/json",
         };
 
         const prompt = `
-        Aja como Lucy, secretária virtual da "${operatingConfig.storeName}".
+        Aja como Lucy, secretária virtual da loja "${dbRow.store_name}".
         
-        SITUAÇÃO ATUAL DO ESTABELECIMENTO:
-        - Agora são: ${now.toLocaleString('pt-BR')}
-        - Status: ${statusFuncionamento}
+        CONTEXTO DE AGORA:
+        - Data e Hora: ${now.toLocaleString('pt-BR')}
+        - Dia da Semana: ${diaAtualNome}
+        - Status da Loja: ${statusFuncionamento}
 
         HISTÓRICO RECENTE:
-        ${limitedHistory}
+        ${truncateHistory(history)}
 
-        SUA MISSÃO:
-        1. Se o status for FECHADA, informe educadamente que hoje não abrimos e peça para escolher outro dia.
-        2. Se estiver ABERTA, valide se o horário pedido está entre ${operatingConfig.start} e ${operatingConfig.end}.
-        3. Se o cliente disser "hoje" ou "agora", considere a data: ${now.toISOString().split('T')[0]}.
-        4. Agende (isScheduling: true) somente com DIA e HORA confirmados.
+        MISSÃO:
+        1. Responda em nome da "${dbRow.store_name}".
+        2. Se o Status for FECHADA, diga educadamente que hoje não abrimos.
+        3. Se estiver ABERTA, valide se o horário pedido está entre ${dbRow.start_time} e ${dbRow.end_time}.
+        4. Use a data ${now.toISOString().split('T')[0]} se o cliente disser "hoje" ou "agora".
+        5. isScheduling só é true se você tiver certeza do DIA e HORA.
 
         Responda APENAS este JSON:
         {
             "isScheduling": boolean,
             "date": "YYYY-MM-DDTHH:mm:ss" | null,
-            "response": "Texto amigável da Lucy em nome da ${operatingConfig.storeName}"
+            "response": "Texto da resposta em nome da ${dbRow.store_name}"
         }`;
 
         const result = await model.generateContent({
@@ -93,12 +115,12 @@ export const analyzeMessage = async (
         try {
             return JSON.parse(text);
         } catch (jsonError) {
-            console.error("❌ Erro JSON:", text);
-            return { isScheduling: false, response: null };
+            console.error("❌ Erro ao converter JSON da Lucy:", text);
+            return { isScheduling: false, response: "Desculpe, tive um erro técnico. Pode repetir?" };
         }
 
     } catch (error: any) {
-        console.error("❌ Erro Gemini:", error.message);
+        console.error("❌ Erro na API do Gemini:", error.message);
         return { isScheduling: false, response: null };
     }
 };
