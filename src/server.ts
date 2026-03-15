@@ -65,7 +65,6 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
     const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
     const sessionDir = path.join(baseAuthDir, safeEmailFolder);
 
-    // Limpa qualquer sessão corrompida anterior para garantir um login limpo
     if (fs.existsSync(sessionDir)) {
       console.log(`🧹 [SISTEMA] Limpando sessão antiga do cliente ${email}...`);
       fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -89,7 +88,7 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
       version,
       auth: state,
       printQRInTerminal: false,
-      logger: pino({ level: 'silent' }), // Mantido silencioso para não poluir com logs inúteis da biblioteca
+      logger: pino({ level: 'silent' }), 
       browser: Browsers.macOS('Desktop'), 
       syncFullHistory: false, 
       generateHighQualityLinkPreview: false,
@@ -100,7 +99,6 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
 
     sessions[email] = sock;
     
-    // Salva as credenciais sempre que houver atualização
     sock.ev.on('creds.update', () => {
       console.log(`💾 [WHATSAPP] Credenciais atualizadas e salvas para ${email}.`);
       saveCreds();
@@ -108,7 +106,6 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
 
     let qrSent = false;
 
-    // EVENTO DE ATUALIZAÇÃO DE CONEXÃO
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
@@ -154,9 +151,6 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response): Promise<void> 
       }
     });
 
-    // ========================================================
-    // FEATURE: O BOT "OUVINDO" E CONTANDO MENSAGENS
-    // ========================================================
     sock.ev.on('messages.upsert', async (m) => {
       const msg = m.messages[0];
       if (!msg.message || msg.key.fromMe) return;
@@ -208,7 +202,10 @@ app.post('/api/whatsapp/disconnect', async (req: Request, res: Response): Promis
   const { email } = req.body;
   console.log(`\n🔴 [API] Solicitação de DESCONEXÃO recebida para: ${email}`);
   
-  if (!email) return res.status(400).end();
+  if (!email) {
+    res.status(400).json({ error: 'Email obrigatório.' });
+    return;
+  }
 
   try {
     if (sessions[email]) {
@@ -236,7 +233,10 @@ app.post('/api/settings/ai', async (req: Request, res: Response): Promise<void> 
   const { email, aiEnabled } = req.body;
   console.log(`\n⚙️ [API] Alterando status da IA de ${email} para: ${aiEnabled ? 'LIGADO' : 'DESLIGADO'}`);
   
-  if (!email) return res.status(400).end();
+  if (!email) {
+    res.status(400).json({ error: 'Email obrigatório.' });
+    return;
+  }
 
   try {
     await supabase.from('profiles').update({ is_ai_enabled: aiEnabled }).eq('email', email);
@@ -280,7 +280,10 @@ app.post('/api/settings/store', async (req: Request, res: Response): Promise<voi
   const { email, storeName } = req.body;
   console.log(`\n🏪 [API] Atualizando nome da loja de ${email} para: "${storeName}"`);
   
-  if (!email) return res.status(400).end();
+  if (!email) {
+    res.status(400).json({ error: 'Email obrigatório.' });
+    return;
+  }
 
   try {
     await supabase.from('profiles').update({ store_name: storeName }).eq('email', email);
@@ -296,7 +299,10 @@ app.post('/api/settings/hours', async (req: Request, res: Response): Promise<voi
   const { email, startTime, endTime, activeDays, serviceDuration } = req.body;
   console.log(`\n⏰ [API] Atualizando horários de ${email}...`);
   
-  if (!email) return res.status(400).end();
+  if (!email) {
+    res.status(400).json({ error: 'Email obrigatório.' });
+    return;
+  }
 
   try {
     await supabase.from('profiles').update({ 
