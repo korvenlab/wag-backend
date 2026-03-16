@@ -1,3 +1,5 @@
+import { analyzeMessage } from './ai';
+import { checkAvailability, createEvent } from './calendar';
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from 'dotenv';
 
