@@ -1,76 +1,76 @@
 import express, { Request, Response } from 'express';
 import Stripe from 'stripe';
 import dotenv from 'dotenv';
+import { createClient } from '@supabase/supabase-js';
 
-// Garante que as variáveis sejam lidas
 dotenv.config();
-
 const router = express.Router();
 
-// Inicializa o Stripe
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
-  // @ts-ignore
-});
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, { apiVersion: '2023-10-16' });
+const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
 router.post('/create-checkout-session', async (req: Request, res: Response) => {
   try {
     const { email, userId } = req.body;
-
-    // 1. Limpeza rigorosa das variáveis do seu .env
     const priceId = process.env.STRIPE_PRICE_ID?.trim();
-    const frontendUrl = process.env.FRONTEND_URL?.trim().replace(/\/$/, ""); // Remove barra no final se houver
+    const frontendUrl = process.env.FRONTEND_URL?.trim().replace(/\/$/, "");
 
-    // Log de segurança (aparecerá no log da Render)
-    console.log("--- Iniciando Checkout ---");
-    console.log("User:", userId);
-    console.log("Price ID:", priceId);
-    console.log("Frontend URL:", frontendUrl);
-
-    // 2. Verificações de Erro Explícitas
-    if (!priceId) {
-      return res.status(400).json({ error: "ERRO: STRIPE_PRICE_ID não configurado no .env" });
-    }
-
-    if (!frontendUrl || !frontendUrl.startsWith("http")) {
-      return res.status(400).json({ error: `ERRO: URL inválida detectada: ${frontendUrl}` });
-    }
-
-    // 3. Criação da Sessão
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
-      line_items: [
-        {
-          price: priceId,
-          quantity: 1,
-        },
-      ],
+      line_items: [{ price: priceId, quantity: 1 }],
       mode: 'subscription',
       customer_email: email,
       client_reference_id: userId,
-      // Montagem da URL sem risco de barras duplas
       success_url: `${frontendUrl}/dashboard?success=true`,
       cancel_url: `${frontendUrl}/pricing`,
-      subscription_data: {
-        metadata: {
-          supabase_user_id: userId,
-        },
-      },
+      subscription_data: { metadata: { supabase_user_id: userId } },
     });
-
-    console.log("✅ Sessão criada com sucesso:", session.id);
     res.json({ url: session.url });
-
   } catch (error: any) {
-    console.error("🔥 Erro Stripe detalhado:", error.message);
-    res.status(500).json({ 
-      error: "Falha na comunicação com Stripe", 
-      message: error.message 
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Rota de Webhook (Apenas estrutura para não quebrar)
-router.post('/webhook', express.raw({ type: 'application/json' }), async (req: Request, res: Response) => {
+router.post('/webhook', async (req: Request, res: Response) => {
+  const sig = req.headers['stripe-signature'] as string;
+  let event: Stripe.Event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET!);
+  } catch (err: any) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  switch (event.type) {
+    case 'checkout.session.completed': {
+      const session = event.data.object as Stripe.Checkout.Session;
+      const userId = session.client_reference_id;
+      if (userId) {
+        // Ao pagar, marca como pago e JÁ LIGA o botão da IA automaticamente
+        await supabase
+          .from('profiles')
+          .update({ has_paid: true, is_ai_enabled: true })
+          .eq('id', userId);
+      }
+      break;
+    }
+
+    case 'customer.subscription.deleted':
+    case 'customer.subscription.updated': {
+      const sub = event.data.object as Stripe.Subscription;
+      if (sub.status === 'canceled' || sub.status === 'unpaid') {
+        const userId = sub.metadata.supabase_user_id;
+        if (userId) {
+          // SE O PAGAMENTO ACABOU: Desliga o 'has_paid' E o botão 'is_ai_enabled'
+          await supabase
+            .from('profiles')
+            .update({ has_paid: false, is_ai_enabled: false })
+            .eq('id', userId);
+        }
+      }
+      break;
+    }
+  }
   res.json({ received: true });
 });
 
