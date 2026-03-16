@@ -12,6 +12,7 @@ import path from 'path';
 // Nossos módulos
 import { analyzeMessage } from './services/ai';
 import { checkAvailability, createEvent } from './services/calendar';
+import stripeRoutes from './routes/stripe'; // Importando as novas rotas do Stripe
 
 dotenv.config();
 
@@ -19,7 +20,14 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // ==========================================
-// CONFIGURAÇÃO DO CORS
+// 1. WEBHOOK DO STRIPE (DEVE VIR ANTES DE TUDO)
+// ==========================================
+// O Stripe precisa dos dados "crus" (Buffer) para validar a assinatura.
+// Se o express.json() rodar antes, a validação falhará.
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeRoutes);
+
+// ==========================================
+// 2. CONFIGURAÇÃO DO CORS
 // ==========================================
 app.use(cors({
   origin: [
@@ -32,7 +40,15 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
+// ==========================================
+// 3. MIDDLEWARE JSON (PARA AS DEMAIS ROTAS)
+// ==========================================
 app.use(express.json());
+
+// ==========================================
+// 4. ROTAS DO STRIPE (CHECKOUT SESSION, ETC)
+// ==========================================
+app.use('/api/stripe', stripeRoutes);
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -102,9 +118,6 @@ async function startWhatsApp(email: string, res: Response | null) {
       }
     });
 
-    // ========================================================
-    // INTEGRAÇÃO: OUVIR, PENSAR (AI) E AGENDAR
-    // ========================================================
     sock.ev.on('messages.upsert', async (m) => {
       const msg = m.messages[0];
       if (!msg.message || msg.key.fromMe) return;
@@ -176,7 +189,6 @@ async function startWhatsApp(email: string, res: Response | null) {
 // ROTAS DA API
 // ==========================================
 
-// Rota de Ping para Keep-Alive (Sem Log)
 app.get('/ping', (req, res) => {
   res.status(200).send('pong');
 });
@@ -234,13 +246,10 @@ app.get('/', (req, res) => res.send('WBOT Online!'));
 app.listen(port, () => {
   console.log(`🚀 Servidor rodando na porta ${port}`);
   
-  // Auto-ping interno a cada 14 minutos para evitar suspensão na Render
   const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${port}`;
   
   setInterval(() => {
-    fetch(`${RENDER_EXTERNAL_URL}/ping`).catch(() => {
-        // Silencioso conforme solicitado
-    });
+    fetch(`${RENDER_EXTERNAL_URL}/ping`).catch(() => {});
   }, 840000); // 14 minutos
   
   console.log(`📡 Sistema de Auto-ping iniciado para: ${RENDER_EXTERNAL_URL}/ping`);
