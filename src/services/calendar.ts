@@ -1,6 +1,5 @@
 // LOGICA DA INTEGRACAO COM O CALENDARIO DO GOOGLE
-import { analyzeMessage } from './ai';
-import { checkAvailability, createEvent } from './calendar';
+
 import { google } from 'googleapis';
 import { addHours, parseISO } from 'date-fns';
 import { supabase } from '../lib/supabase';
