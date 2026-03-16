@@ -5,6 +5,9 @@ dotenv.config();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
+// Puxa a versão do modelo do .env ou usa uma versão segura como fallback
+const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+
 const isMessageUseless = (message: string): boolean => {
     if (!message) return true;
     const lowerMsg = message.toLowerCase().trim();
@@ -29,8 +32,9 @@ export const analyzeMessage = async (
     if (isMessageUseless(currentMessage)) return { isScheduling: false, response: null };
 
     try {
+        // Agora utiliza a variável dinâmica do .env
         const model = genAI.getGenerativeModel({ 
-            model: "gemini-1.5-flash" 
+            model: MODEL_NAME 
         });
 
         // ==========================================
@@ -45,7 +49,7 @@ export const analyzeMessage = async (
         const diaAtualNome = diasSemanaMap[brDate.getDay()];
 
         const generationConfig = {
-            temperature: 0.3, // Aumentado levemente para maior naturalidade no texto
+            temperature: 0.3, 
             maxOutputTokens: 400, 
             responseMimeType: "application/json",
         };
@@ -107,7 +111,7 @@ export const analyzeMessage = async (
         }
 
     } catch (error: any) {
-        console.error("❌ Erro Gemini:", error.message);
+        console.error(`❌ Erro Gemini (${MODEL_NAME}):`, error.message);
         return { isScheduling: false, response: "No momento estou com uma instabilidade técnica. Poderia tentar novamente em alguns minutos, por gentileza?" };
     }
 };
