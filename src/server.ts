@@ -7,7 +7,8 @@ import path from 'path';
 
 // Importação das Rotas e Serviços
 import stripeRoutes from './routes/stripe';
-import { startWhatsApp, sessions, autoReconnectAll } from './services/whatsapp';
+// Adicionada a importação do disconnectWhatsApp
+import { startWhatsApp, sessions, autoReconnectAll, disconnectWhatsApp } from './services/whatsapp';
 
 dotenv.config();
 
@@ -48,7 +49,7 @@ app.use(express.json());
 // Rotas do Stripe
 app.use('/api/stripe', stripeRoutes);
 
-// Rota para salvar o Nome da Loja (CORREÇÃO DO ERRO 404)
+// Rota para salvar o Nome da Loja
 app.post('/api/settings/store', async (req: Request, res: Response) => {
   const { email, storeName } = req.body;
 
@@ -125,6 +126,7 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email obrigatório.' });
 
+  // Limpa sessão antiga antes de gerar novo QR
   const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
   const sessionDir = path.join(__dirname, '..', 'auth_info_baileys', safeEmailFolder);
 
@@ -137,28 +139,25 @@ app.post('/api/whatsapp/qr', async (req: Request, res: Response) => {
   startWhatsApp(email, res);
 });
 
+// Rota de Desconexão (Atualizada para usar o serviço centralizado)
 app.post('/api/whatsapp/disconnect', async (req: Request, res: Response) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email obrigatório.' });
 
-  if (sessions[email]) {
-    try { sessions[email].ws.close(); } catch (e) {}
-    delete sessions[email];
+  try {
+    await disconnectWhatsApp(email);
+    res.status(200).json({ message: 'WhatsApp desconectado com sucesso.' });
+  } catch (error) {
+    console.error("Erro ao desconectar:", error);
+    res.status(500).json({ error: 'Erro ao processar desconexão.' });
   }
-
-  const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
-  const sessionDir = path.join(__dirname, '..', 'auth_info_baileys', safeEmailFolder);
-  
-  if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-
-  res.status(200).json({ message: 'WhatsApp desconectado.' });
 });
 
 // ==========================================
 // 5. INICIALIZAÇÃO
 // ==========================================
 app.get('/ping', (req, res) => res.status(200).send('pong'));
-app.get('/', (req, res) => res.send('WAG Backend Online!'));
+app.get('/', (req, res) => res.send('WBOT Backend Online!'));
 
 app.listen(port, () => {
   console.log(`🚀 Servidor rodando na porta ${port}`);
