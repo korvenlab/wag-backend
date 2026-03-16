@@ -12,21 +12,19 @@ router.post('/create-checkout-session', async (req: Request, res: Response) => {
     const { email, userId } = req.body;
     const priceId = process.env.STRIPE_PRICE_ID;
     
-    // Pegamos a URL e limpamos espaços em branco acidentais
-    let frontendUrl = (process.env.FRONTEND_URL || '').trim();
+    // 1. Pegamos a URL do Render e limpamos
+    let rawUrl = process.env.FRONTEND_URL || 'https://wagbot.vercel.app';
+    
+    // 2. Removemos espaços, aspas ou barras duplicadas que podem vir do painel do Render
+    const cleanUrl = rawUrl.trim().replace(/['"]+/g, '').replace(/\/+$/, '');
 
-    // FEATURE: Validação e correção automática de protocolo
-    if (!frontendUrl.startsWith('http')) {
-      // Se você esqueceu o https no Render, isso tenta corrigir ou avisar
-      if (frontendUrl.includes('localhost')) {
-        frontendUrl = `http://${frontendUrl}`;
-      } else {
-        frontendUrl = `https://${frontendUrl}`;
-      }
-    }
+    // 3. Garantimos o protocolo HTTPS
+    const finalUrl = cleanUrl.startsWith('http') ? cleanUrl : `https://${cleanUrl}`;
+
+    console.log("🔗 Gerando checkout para URL:", finalUrl);
 
     if (!priceId) {
-      return res.status(500).json({ error: "STRIPE_PRICE_ID não configurado no Render." });
+      throw new Error("STRIPE_PRICE_ID está faltando no servidor.");
     }
 
     const session = await stripe.checkout.sessions.create({
@@ -35,17 +33,19 @@ router.post('/create-checkout-session', async (req: Request, res: Response) => {
       mode: 'subscription',
       customer_email: email,
       client_reference_id: userId,
-      // Usamos a URL limpa e validada
-      success_url: `${frontendUrl}/dashboard?success=true`,
-      cancel_url: `${frontendUrl}/pricing`,
+      // Usamos a URL processada e garantida
+      success_url: `${finalUrl}/dashboard?success=true`,
+      cancel_url: `${finalUrl}/#precos`,
     });
 
     res.json({ url: session.url });
   } catch (error: any) {
-    console.error("🔥 Erro Stripe:", error.message);
-    res.status(500).json({ error: error.message });
+    console.error("🔥 Erro detalhado no Stripe:", error.message);
+    res.status(500).json({ 
+      error: "Erro ao configurar URL de pagamento",
+      details: error.message 
+    });
   }
 });
 
-// ... (Webhook)
 export default router;
