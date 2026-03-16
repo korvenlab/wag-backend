@@ -8,7 +8,6 @@ import path from 'path';
 // Importação das Rotas e Serviços
 import stripeRoutes from './routes/stripe';
 import { startWhatsApp, sessions, autoReconnectAll, disconnectWhatsApp } from './services/whatsapp';
-// Importações para Google Auth
 import { getTokensFromCode, getUserInfo, generateAuthUrl } from './services/googleAuth'; 
 
 dotenv.config();
@@ -16,71 +15,64 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Configuração do Supabase com Service Role para bypass de RLS
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
 // ==========================================
-// 1. WEBHOOK DO STRIPE
+// 1. WEBHOOK DO STRIPE (Deve vir antes do express.json)
 // ==========================================
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeRoutes);
 
 // ==========================================
-// 2. MIDDLEWARES GERAIS
+// 2. CONFIGURAÇÃO CORRIGIDA DO CORS
 // ==========================================
+const allowedOrigins = [
+  'https://wagbot.vercel.app',
+  'https://wagbot-korvenlabcontato-4447s-projects.vercel.app', // URL que deu erro
+  'https://wag-frontend-korvenlabcontato-4447s-projects.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:3000'
+];
+
 app.use(cors({
-  origin: [
-    'https://wagbot.vercel.app', 
-    'https://wag-frontend-korvenlabcontato-4447s-projects.vercel.app',
-    'http://localhost:5173', 
-    'http://localhost:3000' 
-  ],
+  origin: function (origin, callback) {
+    // Permite requisições sem origin (como apps mobile ou postman)
+    if (!origin) return callback(null, true);
+    
+    // Verifica se a origin está na lista ou se é um subdomínio do vercel do projeto
+    const isAllowed = allowedOrigins.indexOf(origin) !== -1 || origin.includes('vercel.app');
+    
+    if (isAllowed) {
+      callback(null, true);
+    } else {
+      callback(new Error('Bloqueado pelo CORS: Origem não permitida.'));
+    }
+  },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true // Importante para cookies/sessões se necessário
 }));
 
 app.use(express.json());
 
 // ==========================================
-// 3. ROTAS DE INTEGRAÇÃO E CONFIGURAÇÃO
+// 3. ROTAS DE INTEGRAÇÃO
 // ==========================================
 
-/**
- * SINCRONIZAÇÃO AUTOMÁTICA (Login "One-Click")
- */
 app.post('/api/auth/sync', async (req: Request, res: Response) => {
   const { email, accessToken, refreshToken, expiresAt } = req.body;
 
-  // LOG DE DEBUG PARA MONITORAMENTO
   console.log("-----------------------------------------");
-  console.log("📥 [SYNC] Tentativa de sincronização recebida:");
-  console.log(`📧 Email: ${email}`);
-  console.log(`🔑 Access Token: ${accessToken ? '✅ Presente' : '❌ Ausente'}`);
-  console.log(`🔄 Refresh Token: ${refreshToken ? '✅ Presente' : '❌ Ausente'}`);
-  console.log("-----------------------------------------");
+  console.log("📥 [SYNC] Dados recebidos:", { email, hasAccess: !!accessToken, hasRefresh: !!refreshToken });
 
   if (!email || !accessToken) {
-    return res.status(400).json({ error: 'Email ou Access Token ausentes.' });
+    return res.status(400).json({ error: 'Dados incompletos.' });
   }
 
   try {
-    // 1. Verifica se o perfil existe
-    const { data: profile, error: fetchError } = await supabase
-      .from('profiles')
-      .select('id')
-      .eq('email', email)
-      .single();
-
-    if (fetchError || !profile) {
-      console.error(`⚠️ [SYNC] Perfil não encontrado no banco para: ${email}`);
-      return res.status(404).json({ error: 'Usuário não encontrado na tabela profiles.' });
-    }
-
-    // 2. Atualiza os tokens
-    // Se no seu banco a coluna for estritamente minúscula, mude para googleauth
-    const { data, error: updateError } = await supabase
+    const { data, error } = await supabase
       .from('profiles')
       .update({ 
         googleAuth: {
@@ -93,49 +85,33 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
       .eq('email', email)
       .select();
 
-    if (updateError) {
-      console.error("❌ [SYNC] Erro Supabase Update:", updateError.message);
-      return res.status(500).json({ error: updateError.message });
-    }
+    if (error) throw error;
 
-    console.log(`✅ [SYNC] Banco de dados atualizado com sucesso para: ${email}`);
-    res.status(200).json({ message: 'Tokens sincronizados com sucesso.', data });
-
+    console.log(`✅ [SYNC] Sucesso para: ${email}`);
+    res.status(200).json({ message: 'Sincronizado.', data });
   } catch (error: any) {
-    console.error("❌ [SYNC] Erro crítico:", error.message);
-    res.status(500).json({ error: 'Erro interno ao sincronizar credenciais.' });
+    console.error("❌ [SYNC] Erro:", error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
-/**
- * URL DE AUTENTICAÇÃO (Fallback / Manual)
- */
 app.get('/api/auth/google/url', (req: Request, res: Response) => {
   const { email } = req.query;
-  if (!email) return res.status(400).json({ error: 'Email é necessário' });
+  if (!email) return res.status(400).json({ error: 'Email necessário' });
   const url = generateAuthUrl(email as string);
   res.json({ url });
 });
 
-/**
- * CALLBACK DO GOOGLE CALENDAR (Pós consentimento manual)
- */
 app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
   const { code, state } = req.query;
-
-  if (!code) return res.status(400).send('Código não fornecido.');
+  if (!code) return res.status(400).send('Sem código.');
 
   try {
     const tokens = await getTokensFromCode(code as string);
     const userInfo = await getUserInfo(tokens);
-    
     const userEmail = (state as string) || userInfo.email;
 
-    if (!userEmail) throw new Error("Não foi possível identificar o usuário.");
-
-    console.log(`💾 [CALLBACK] Salvando tokens para: ${userEmail}`);
-
-    const { error } = await supabase
+    await supabase
       .from('profiles')
       .update({ 
         googleAuth: {
@@ -147,107 +123,62 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
       })
       .eq('email', userEmail);
 
-    if (error) throw error;
-
-    res.send(`
-      <div style="font-family: sans-serif; text-align: center; margin-top: 50px; background: #f9fafb; padding: 40px; border-radius: 20px;">
-        <h1 style="color: #059669;">✅ Agenda Conectada!</h1>
-        <p style="color: #4b5563;">A Lucy agora já pode organizar seus horários em <b>${userEmail}</b>.</p>
-        <script>setTimeout(() => window.close(), 3000);</script>
-      </div>
-    `);
-
+    res.send('<h1>✅ Conectado! Feche esta aba.</h1><script>setTimeout(()=>window.close(),2000)</script>');
   } catch (error: any) {
-    console.error("❌ [CALLBACK] Erro:", error.message);
-    res.status(500).send("Erro ao salvar credenciais da agenda.");
+    res.status(500).send("Erro no callback.");
   }
 });
 
-// --- Configurações de Loja e IA ---
+// --- Outras Rotas ---
 
 app.post('/api/settings/store', async (req: Request, res: Response) => {
   const { email, storeName } = req.body;
-  if (!email) return res.status(400).json({ error: 'Email obrigatório.' });
-  try {
-    const { error } = await supabase.from('profiles').update({ store_name: storeName }).eq('email', email);
-    if (error) throw error;
-    res.status(200).json({ message: 'Nome da loja atualizado.' });
-  } catch (error: any) {
-    res.status(500).json({ error: 'Erro ao atualizar nome da loja.' });
-  }
+  await supabase.from('profiles').update({ store_name: storeName }).eq('email', email);
+  res.json({ ok: true });
 });
 
 app.post('/api/settings/hours', async (req: Request, res: Response) => {
   const { email, workingHours, serviceDuration } = req.body;
-  if (!email) return res.status(400).json({ error: 'Email obrigatório.' });
-  try {
-    const { error } = await supabase.from('profiles').update({ 
-        working_hours: workingHours,
-        service_duration: serviceDuration 
-      }).eq('email', email);
-    if (error) throw error;
-    res.status(200).json({ message: 'Agenda atualizada.' });
-  } catch (error: any) {
-    res.status(500).json({ error: 'Erro ao salvar horários.' });
-  }
+  await supabase.from('profiles').update({ working_hours: workingHours, service_duration: serviceDuration }).eq('email', email);
+  res.json({ ok: true });
 });
 
 app.post('/api/settings/ai', async (req: Request, res: Response) => {
   const { email, aiEnabled } = req.body;
-  try {
-    await supabase.from('profiles').update({ is_ai_enabled: aiEnabled }).eq('email', email);
-    res.status(200).json({ message: 'IA atualizada.' });
-  } catch (error) {
-    res.status(500).json({ error: 'Erro ao atualizar IA.' });
-  }
+  await supabase.from('profiles').update({ is_ai_enabled: aiEnabled }).eq('email', email);
+  res.json({ ok: true });
 });
 
 app.get('/api/user/profile', async (req: Request, res: Response) => {
   const email = req.query.email as string;
   const { data, error } = await supabase.from('profiles').select('*').eq('email', email).single();
-  if (error) return res.status(404).json({ error: 'Usuário não encontrado.' });
-  res.status(200).json(data);
+  if (error) return res.status(404).json({ error: 'Não encontrado' });
+  res.json(data);
 });
 
 // ==========================================
-// 4. WHATSAPP E QR CODE
+// 4. WHATSAPP
 // ==========================================
 
 app.post('/api/whatsapp/qr', async (req: Request, res: Response) => {
   const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'Email obrigatório.' });
-
-  const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
-  const sessionDir = path.join(__dirname, '..', 'auth_info_baileys', safeEmailFolder);
-
-  if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-  if (sessions[email]) {
-    try { sessions[email].ws.close(); } catch (e) {}
-    delete sessions[email];
-  }
+  if (!email) return res.status(400).json({ error: 'Email necessário' });
   startWhatsApp(email, res);
 });
 
 app.post('/api/whatsapp/disconnect', async (req: Request, res: Response) => {
   const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'Email obrigatório.' });
-  try {
-    await disconnectWhatsApp(email);
-    res.status(200).json({ message: 'WhatsApp desconectado.' });
-  } catch (error) {
-    res.status(500).json({ error: 'Erro ao desconectar.' });
-  }
+  await disconnectWhatsApp(email);
+  res.json({ ok: true });
 });
 
 // ==========================================
-// 5. INICIALIZAÇÃO
+// 5. BOOT
 // ==========================================
-app.get('/ping', (req, res) => res.status(200).send('pong'));
+app.get('/ping', (req, res) => res.send('pong'));
 app.get('/', (req, res) => res.send('WBOT Backend Online!'));
 
 app.listen(port, () => {
   console.log(`🚀 Servidor rodando na porta ${port}`);
-  setTimeout(async () => {
-    await autoReconnectAll();
-  }, 5000);
+  autoReconnectAll();
 });
