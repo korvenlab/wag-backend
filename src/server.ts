@@ -9,7 +9,7 @@ import path from 'path';
 import stripeRoutes from './routes/stripe';
 import { startWhatsApp, sessions, autoReconnectAll, disconnectWhatsApp } from './services/whatsapp';
 // Importações para Google Auth
-import { getTokensFromCode, getUserInfo } from './services/googleAuth'; 
+import { getTokensFromCode, getUserInfo, generateAuthUrl } from './services/googleAuth'; 
 
 dotenv.config();
 
@@ -46,6 +46,19 @@ app.use(express.json());
 // ==========================================
 // 3. ROTAS DE INTEGRAÇÃO E CONFIGURAÇÃO
 // ==========================================
+
+/**
+ * ROTA PARA GERAR A URL DE AUTENTICAÇÃO DO GOOGLE
+ * O Frontend chama isso passando o email para ser usado como 'state'
+ */
+app.get('/api/auth/google/url', (req: Request, res: Response) => {
+  const { email } = req.query;
+  if (!email) return res.status(400).json({ error: 'Email é necessário' });
+  
+  // Gera a URL passando o email no state para identificar o usuário no retorno
+  const url = generateAuthUrl(email as string);
+  res.json({ url });
+});
 
 /**
  * ROTA DE CALLBACK DO GOOGLE CALENDAR
