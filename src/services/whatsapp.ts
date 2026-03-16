@@ -18,6 +18,39 @@ import { checkAvailability, createEvent, getBusySlots } from './calendar';
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 export const sessions: Record<string, any> = {};
 
+/**
+ * Função para desconectar o WhatsApp (Chamada pela rota API)
+ */
+export async function disconnectWhatsApp(email: string) {
+  try {
+    const sock = sessions[email];
+    const baseAuthDir = path.join(__dirname, '..', '..', 'auth_info_baileys');
+    const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
+    const sessionDir = path.join(baseAuthDir, safeEmailFolder);
+
+    if (sock) {
+      // 1. Desconecta do servidor do WhatsApp
+      await sock.logout();
+      // 2. Remove da memória
+      delete sessions[email];
+    }
+
+    // 3. Limpa os arquivos de autenticação locais
+    if (fs.existsSync(sessionDir)) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+
+    // 4. Limpa no banco de dados Supabase
+    await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
+
+    console.log(`\x1b[31m[OFFLINE]\x1b[0m Sessão encerrada e limpa para: ${email}`);
+    return { success: true };
+  } catch (error) {
+    console.error('Erro ao desconectar WhatsApp:', error);
+    throw error;
+  }
+}
+
 export async function startWhatsApp(email: string, res: Response | null) {
   try {
     const baseAuthDir = path.join(__dirname, '..', '..', 'auth_info_baileys');
@@ -69,6 +102,8 @@ export async function startWhatsApp(email: string, res: Response | null) {
       }
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        
+        // Só reconecta se NÃO for um logout intencional
         if (statusCode !== DisconnectReason.loggedOut) {
           startWhatsApp(email, null);
         } else {
@@ -97,11 +132,8 @@ export async function startWhatsApp(email: string, res: Response | null) {
         const { data: p } = await supabase.from('profiles').select('*').eq('email', email).single();
         if (!p || !p.has_paid || !p.is_ai_enabled) return;
 
-        // 1. Busca slots ocupados para o dia atual (ou o dia mencionado na conversa)
-        // Passamos a data de hoje como base para a busca inicial
         const busySlots = await getBusySlots(p.id, new Date().toISOString());
 
-        // 2. Lucy analisa a mensagem
         const aiResult = await analyzeMessage("", textMessage, true, busySlots, {
             store_name: p.store_name,
             working_hours: p.working_hours,
@@ -113,7 +145,6 @@ export async function startWhatsApp(email: string, res: Response | null) {
           await supabase.from('profiles').update({ messages_answered: (p.messages_answered || 0) + 1 }).eq('email', email);
         }
 
-        // 3. Se a Lucy confirmou um agendamento válido
         if (aiResult.isScheduling && aiResult.date) {
             const isFree = await checkAvailability(p.id, aiResult.date, p.service_duration);
             
@@ -124,9 +155,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
                 const created = await createEvent(p.id, clientName, clientPhone, aiResult.date, p.service_duration);
                 
                 if (created) {
-                    // Opcional: Notificar o usuário que o agendamento caiu no calendário
                     console.log(`📅 Agendamento realizado: ${clientName} em ${aiResult.date}`);
-                    // Atualiza estatísticas no banco
                     await supabase.from('profiles').update({ 
                         appointments_count: (p.appointments_count || 0) + 1 
                     }).eq('email', email);
