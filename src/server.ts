@@ -116,7 +116,6 @@ async function startWhatsApp(email: string, res: Response | null) {
       console.log(`💬 [BOT] Mensagem de ${remoteJid}: "${textMessage}"`);
 
       try {
-        // 1. Busca dados atualizados do perfil no Supabase
         const { data: profile, error } = await supabase
           .from('profiles')
           .select('*')
@@ -125,7 +124,6 @@ async function startWhatsApp(email: string, res: Response | null) {
 
         if (error || !profile || !profile.is_ai_enabled) return;
 
-        // Prepara as configurações exatamente como estão no seu banco
         const dbRow = {
           store_name: profile.store_name || 'Nossa Loja',
           start_time: profile.start_time || '08:00',
@@ -133,37 +131,28 @@ async function startWhatsApp(email: string, res: Response | null) {
           active_days: profile.active_days || '[]'
         };
 
-        // TODO: Buscar histórico de mensagens real do banco se necessário
         const history = ""; 
 
-        // 2. Chama a Lucy (Gemini 3.1 Flash Lite)
         const aiResult = await analyzeMessage(history, textMessage, profile.is_ai_enabled, dbRow);
 
-        // 3. Caso de resposta comum (dúvidas ou pedidos incompletos)
         if (!aiResult.isScheduling && aiResult.response && remoteJid) {
           await sock.sendMessage(remoteJid, { text: aiResult.response });
-          
-          // Incrementa métricas de mensagens
           const novasMensagens = (profile.messages_answered || 0) + 1;
           await supabase.from('profiles').update({ messages_answered: novasMensagens }).eq('email', email);
         }
 
-        // 4. Caso de agendamento detectado
         if (aiResult.isScheduling && aiResult.date && remoteJid) {
            console.log(`📅 Verificando disponibilidade para: ${aiResult.date}`);
-           
            const isAvailable = await checkAvailability(profile.id, aiResult.date);
 
            if (isAvailable) {
                const clientName = msg.pushName || "Cliente WhatsApp";
                const clientPhone = remoteJid.split('@')[0];
-               
                const success = await createEvent(profile.id, clientName, clientPhone, aiResult.date);
                
                if (success) {
                    const msgSucesso = aiResult.response || `✅ Agendamento confirmado para ${aiResult.date}!`;
                    await sock.sendMessage(remoteJid, { text: msgSucesso });
-                   
                    const novosAgendamentos = (profile.appointments_made || 0) + 1;
                    await supabase.from('profiles').update({ appointments_made: novosAgendamentos }).eq('email', email);
                } else {
@@ -186,6 +175,12 @@ async function startWhatsApp(email: string, res: Response | null) {
 // ==========================================
 // ROTAS DA API
 // ==========================================
+
+// Rota de Ping para Keep-Alive (Sem Log)
+app.get('/ping', (req, res) => {
+  res.status(200).send('pong');
+});
+
 app.post('/api/whatsapp/qr', async (req: Request, res: Response) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'Email obrigatório.' });
@@ -233,4 +228,20 @@ app.post('/api/settings/hours', async (req: Request, res: Response) => {
 
 app.get('/', (req, res) => res.send('WBOT Online!'));
 
-app.listen(port, () => console.log(`🚀 Servidor rodando na porta ${port}`));
+// ==========================================
+// CONFIGURAÇÃO DE INICIALIZAÇÃO E AUTO-PING
+// ==========================================
+app.listen(port, () => {
+  console.log(`🚀 Servidor rodando na porta ${port}`);
+  
+  // Auto-ping interno a cada 14 minutos para evitar suspensão na Render
+  const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${port}`;
+  
+  setInterval(() => {
+    fetch(`${RENDER_EXTERNAL_URL}/ping`).catch(() => {
+        // Silencioso conforme solicitado
+    });
+  }, 840000); // 14 minutos
+  
+  console.log(`📡 Sistema de Auto-ping iniciado para: ${RENDER_EXTERNAL_URL}/ping`);
+});
