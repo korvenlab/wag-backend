@@ -16,14 +16,14 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Configuração do Supabase para rotas administrativas (Service Role para poder dar bypass no RLS)
+// Configuração do Supabase com Service Role para bypass de RLS
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
 // ==========================================
-// 1. WEBHOOK DO STRIPE (DEVE VIR ANTES DO JSON)
+// 1. WEBHOOK DO STRIPE
 // ==========================================
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeRoutes);
 
@@ -48,8 +48,7 @@ app.use(express.json());
 // ==========================================
 
 /**
- * NOVO: ROTA DE SINCRONIZAÇÃO AUTOMÁTICA (ONE-CLICK)
- * Essa rota é chamada pela LoginPage.tsx imediatamente após o login bem sucedido.
+ * SINCRONIZAÇÃO AUTOMÁTICA (Login "One-Click")
  */
 app.post('/api/auth/sync', async (req: Request, res: Response) => {
   const { email, accessToken, refreshToken, expiresAt } = req.body;
@@ -59,23 +58,28 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
   }
 
   try {
-    console.log(`🔄 Sincronizando tokens da agenda para: ${email}`);
+    console.log(`🔄 Sincronizando tokens One-Click para: ${email}`);
 
-    // Atualiza a coluna googleAuth com os tokens capturados no login
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from('profiles')
       .update({ 
         googleAuth: {
           accessToken,
           refreshToken,
-          expiryDate: expiresAt ? expiresAt * 1000 : null // Supabase envia expires_at em segundos, convertemos para ms
+          expiryDate: expiresAt ? Number(expiresAt) * 1000 : null
         }
       })
-      .eq('email', email);
+      .eq('email', email)
+      .select();
 
     if (error) throw error;
 
-    console.log(`✅ Agenda sincronizada para ${email}`);
+    if (!data || data.length === 0) {
+      console.warn(`⚠️ Perfil não encontrado para o email: ${email}`);
+      return res.status(404).json({ error: 'Perfil não encontrado no banco.' });
+    }
+
+    console.log(`✅ Agenda sincronizada via login para ${email}`);
     res.status(200).json({ message: 'Tokens sincronizados com sucesso.' });
   } catch (error: any) {
     console.error("❌ Erro na sincronização automática:", error.message);
@@ -84,7 +88,7 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
 });
 
 /**
- * ROTA PARA GERAR A URL DE AUTENTICAÇÃO DO GOOGLE (Fallback / Manual)
+ * URL DE AUTENTICAÇÃO (Fallback / Manual)
  */
 app.get('/api/auth/google/url', (req: Request, res: Response) => {
   const { email } = req.query;
@@ -94,7 +98,7 @@ app.get('/api/auth/google/url', (req: Request, res: Response) => {
 });
 
 /**
- * ROTA DE CALLBACK DO GOOGLE CALENDAR
+ * CALLBACK DO GOOGLE CALENDAR (Pós consentimento manual)
  */
 app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
   const { code, state } = req.query;
@@ -104,11 +108,15 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
   try {
     const tokens = await getTokensFromCode(code as string);
     const userInfo = await getUserInfo(tokens);
-    const userIdentifier = state || userInfo.email;
+    
+    // Fallback: se o state não vier, usamos o email confirmado pelo Google
+    const userEmail = (state as string) || userInfo.email;
 
-    if (!userIdentifier) throw new Error("Não foi possível identificar o usuário.");
+    if (!userEmail) throw new Error("Não foi possível identificar o usuário.");
 
-    const { error } = await supabase
+    console.log(`💾 Salvando tokens via Callback para: ${userEmail}`);
+
+    const { data, error } = await supabase
       .from('profiles')
       .update({ 
         googleAuth: {
@@ -117,21 +125,23 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
           expiryDate: tokens.expiry_date
         }
       })
-      .or(`email.eq.${userIdentifier},id.eq.${userIdentifier}`);
+      .eq('email', userEmail)
+      .select();
 
     if (error) throw error;
 
     res.send(`
-      <div style="font-family: sans-serif; text-align: center; margin-top: 50px;">
-        <h1 style="color: #4CAF50;">Agenda Conectada!</h1>
-        <p>A Lucy agora já pode organizar seus horários. Você já pode fechar esta aba.</p>
+      <div style="font-family: sans-serif; text-align: center; margin-top: 50px; background: #f9fafb; padding: 40px; border-radius: 20px;">
+        <h1 style="color: #059669;">✅ Agenda Conectada!</h1>
+        <p style="color: #4b5563;">A Lucy agora já pode organizar seus horários em <b>${userEmail}</b>.</p>
+        <p style="font-size: 0.8rem; color: #9ca3af;">Esta aba fechará sozinha em instantes...</p>
         <script>setTimeout(() => window.close(), 3000);</script>
       </div>
     `);
 
   } catch (error: any) {
     console.error("❌ Erro no Google Callback:", error.message);
-    res.status(500).send("Erro ao conectar com o Google Calendar.");
+    res.status(500).send("Erro ao salvar credenciais da agenda.");
   }
 });
 
