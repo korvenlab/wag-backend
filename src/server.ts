@@ -16,7 +16,7 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Configuração do Supabase para rotas administrativas
+// Configuração do Supabase para rotas administrativas (Service Role para poder dar bypass no RLS)
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
@@ -48,38 +48,66 @@ app.use(express.json());
 // ==========================================
 
 /**
- * ROTA PARA GERAR A URL DE AUTENTICAÇÃO DO GOOGLE
- * O Frontend chama isso passando o email para ser usado como 'state'
+ * NOVO: ROTA DE SINCRONIZAÇÃO AUTOMÁTICA (ONE-CLICK)
+ * Essa rota é chamada pela LoginPage.tsx imediatamente após o login bem sucedido.
+ */
+app.post('/api/auth/sync', async (req: Request, res: Response) => {
+  const { email, accessToken, refreshToken, expiresAt } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: 'Email não fornecido para sincronização.' });
+  }
+
+  try {
+    console.log(`🔄 Sincronizando tokens da agenda para: ${email}`);
+
+    // Atualiza a coluna googleAuth com os tokens capturados no login
+    const { error } = await supabase
+      .from('profiles')
+      .update({ 
+        googleAuth: {
+          accessToken,
+          refreshToken,
+          expiryDate: expiresAt ? expiresAt * 1000 : null // Supabase envia expires_at em segundos, convertemos para ms
+        }
+      })
+      .eq('email', email);
+
+    if (error) throw error;
+
+    console.log(`✅ Agenda sincronizada para ${email}`);
+    res.status(200).json({ message: 'Tokens sincronizados com sucesso.' });
+  } catch (error: any) {
+    console.error("❌ Erro na sincronização automática:", error.message);
+    res.status(500).json({ error: 'Erro interno ao sincronizar credenciais.' });
+  }
+});
+
+/**
+ * ROTA PARA GERAR A URL DE AUTENTICAÇÃO DO GOOGLE (Fallback / Manual)
  */
 app.get('/api/auth/google/url', (req: Request, res: Response) => {
   const { email } = req.query;
   if (!email) return res.status(400).json({ error: 'Email é necessário' });
-  
-  // Gera a URL passando o email no state para identificar o usuário no retorno
   const url = generateAuthUrl(email as string);
   res.json({ url });
 });
 
 /**
  * ROTA DE CALLBACK DO GOOGLE CALENDAR
- * Esta rota recebe o código do Google e salva os tokens no Supabase (Profiles)
  */
 app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
-  const { code, state } = req.query; // 'state' deve conter o email ou ID do usuário
+  const { code, state } = req.query;
 
   if (!code) return res.status(400).send('Código não fornecido.');
 
   try {
-    // 1. Troca o código pelos tokens (Access e Refresh)
     const tokens = await getTokensFromCode(code as string);
-    
-    // 2. Opcional: Busca info do usuário para garantir o email se o state falhar
     const userInfo = await getUserInfo(tokens);
     const userIdentifier = state || userInfo.email;
 
     if (!userIdentifier) throw new Error("Não foi possível identificar o usuário.");
 
-    // 3. Salva os tokens na coluna googleAuth (JSONB) da tabela profiles
     const { error } = await supabase
       .from('profiles')
       .update({ 
@@ -93,7 +121,6 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
 
     if (error) throw error;
 
-    // 4. Resposta visual para o usuário
     res.send(`
       <div style="font-family: sans-serif; text-align: center; margin-top: 50px;">
         <h1 style="color: #4CAF50;">Agenda Conectada!</h1>
@@ -104,27 +131,24 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
 
   } catch (error: any) {
     console.error("❌ Erro no Google Callback:", error.message);
-    res.status(500).send("Erro ao conectar com o Google Calendar. Tente novamente.");
+    res.status(500).send("Erro ao conectar com o Google Calendar.");
   }
 });
 
-// Rotas do Stripe
-app.use('/api/stripe', stripeRoutes);
+// --- Configurações de Loja e IA ---
 
-// Rota para salvar o Nome da Loja
 app.post('/api/settings/store', async (req: Request, res: Response) => {
   const { email, storeName } = req.body;
   if (!email) return res.status(400).json({ error: 'Email obrigatório.' });
   try {
     const { error } = await supabase.from('profiles').update({ store_name: storeName }).eq('email', email);
     if (error) throw error;
-    res.status(200).json({ message: 'Nome da loja atualizado com sucesso.' });
+    res.status(200).json({ message: 'Nome da loja atualizado.' });
   } catch (error: any) {
     res.status(500).json({ error: 'Erro ao atualizar nome da loja.' });
   }
 });
 
-// Rota para salvar os horários de funcionamento (JSONB)
 app.post('/api/settings/hours', async (req: Request, res: Response) => {
   const { email, workingHours, serviceDuration } = req.body;
   if (!email) return res.status(400).json({ error: 'Email obrigatório.' });
@@ -134,13 +158,12 @@ app.post('/api/settings/hours', async (req: Request, res: Response) => {
         service_duration: serviceDuration 
       }).eq('email', email);
     if (error) throw error;
-    res.status(200).json({ message: 'Configurações de agenda atualizadas.' });
+    res.status(200).json({ message: 'Agenda atualizada.' });
   } catch (error: any) {
-    res.status(500).json({ error: 'Erro interno ao salvar horários.' });
+    res.status(500).json({ error: 'Erro ao salvar horários.' });
   }
 });
 
-// Rota para atualizar o botão de IA (On/Off)
 app.post('/api/settings/ai', async (req: Request, res: Response) => {
   const { email, aiEnabled } = req.body;
   try {
@@ -151,7 +174,6 @@ app.post('/api/settings/ai', async (req: Request, res: Response) => {
   }
 });
 
-// Rota para buscar perfil do usuário
 app.get('/api/user/profile', async (req: Request, res: Response) => {
   const email = req.query.email as string;
   const { data, error } = await supabase.from('profiles').select('*').eq('email', email).single();
@@ -183,9 +205,9 @@ app.post('/api/whatsapp/disconnect', async (req: Request, res: Response) => {
   if (!email) return res.status(400).json({ error: 'Email obrigatório.' });
   try {
     await disconnectWhatsApp(email);
-    res.status(200).json({ message: 'WhatsApp desconectado com sucesso.' });
+    res.status(200).json({ message: 'WhatsApp desconectado.' });
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao processar desconexão.' });
+    res.status(500).json({ error: 'Erro ao desconectar.' });
   }
 });
 
