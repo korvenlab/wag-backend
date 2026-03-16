@@ -3,19 +3,24 @@ import { google } from 'googleapis';
 import { addMinutes, parseISO, startOfDay, endOfDay } from 'date-fns';
 import { supabase } from '../lib/supabase';
 
-const getOAuthClient = async (clientId: string) => {
-    // Busca as credenciais do Google no Supabase
-    const { data: client, error } = await supabase
-        .from('clients')
-        .select('"googleAuth"') 
-        .eq('id', clientId)
+/**
+ * Obtém o cliente OAuth e atualiza o banco automaticamente se o token renovar
+ */
+const getOAuthClient = async (userId: string) => {
+    // 1. Busca as credenciais na tabela 'profiles'
+    const { data: profile, error } = await supabase
+        .from('profiles')
+        .select('googleAuth') 
+        .eq('id', userId)
         .single();
 
-    if (error || !client || !client.googleAuth) {
-        throw new Error("Usuário não possui credenciais do Google.");
+    // Se não houver tokens, retornamos null para não quebrar o fluxo da Lucy
+    if (error || !profile || !profile.googleAuth) {
+        console.warn(`⚠️ [CALENDAR] Usuário ${userId} não possui integração configurada na tabela profiles.`);
+        return null;
     }
 
-    const googleAuth = client.googleAuth as any;
+    const googleAuth = profile.googleAuth as any;
 
     const oauth2Client = new google.auth.OAuth2(
         process.env.GOOGLE_CLIENT_ID,
@@ -29,16 +34,39 @@ const getOAuthClient = async (clientId: string) => {
         expiry_date: googleAuth.expiryDate
     });
 
+    // Listener para salvar novos tokens automaticamente quando o Google renovar o acesso
+    oauth2Client.on('tokens', async (tokens) => {
+        console.log(`🔄 [CALENDAR] Renovando tokens para o perfil ${userId}...`);
+        
+        const updatedAuth = {
+            ...googleAuth,
+            accessToken: tokens.access_token || googleAuth.accessToken,
+            expiryDate: tokens.expiry_date || googleAuth.expiryDate,
+        };
+
+        if (tokens.refresh_token) {
+            updatedAuth.refreshToken = tokens.refresh_token;
+        }
+
+        await supabase
+            .from('profiles')
+            .update({ googleAuth: updatedAuth })
+            .eq('id', userId);
+            
+        console.log(`✅ [CALENDAR] Novos tokens persistidos no banco.`);
+    });
+
     return google.calendar({ version: 'v3', auth: oauth2Client });
 };
 
 /**
  * BUSCA TODOS OS HORÁRIOS OCUPADOS DE UM DIA
- * Essencial para a Lucy saber o que sugerir como livre
  */
-export const getBusySlots = async (clientId: string, dateIso: string): Promise<string[]> => {
+export const getBusySlots = async (userId: string, dateIso: string): Promise<string[]> => {
     try {
-        const calendar = await getOAuthClient(clientId);
+        const calendar = await getOAuthClient(userId);
+        if (!calendar) return []; // Retorna lista vazia se não houver Google conectado
+
         const dayStart = startOfDay(parseISO(dateIso));
         const dayEnd = endOfDay(parseISO(dateIso));
 
@@ -51,17 +79,18 @@ export const getBusySlots = async (clientId: string, dateIso: string): Promise<s
         });
 
         const busy = response.data.calendars?.['primary'].busy || [];
-        // Retorna apenas o horário de início de cada compromisso para a Lucy ler
         return busy.map(slot => slot.start as string);
     } catch (error) {
-        console.error(`Erro ao buscar slots ocupados de ${clientId}:`, error);
+        console.error(`❌ Erro ao buscar slots ocupados de ${userId}:`, error);
         return [];
     }
 };
 
-export const checkAvailability = async (clientId: string, dateIso: string, durationMin: number = 30): Promise<boolean> => {
+export const checkAvailability = async (userId: string, dateIso: string, durationMin: number = 30): Promise<boolean> => {
     try {
-        const calendar = await getOAuthClient(clientId);
+        const calendar = await getOAuthClient(userId);
+        if (!calendar) return true; // Se não tem agenda, assume disponível para não travar a Lucy
+
         const start = parseISO(dateIso);
         const end = addMinutes(start, durationMin);
 
@@ -76,20 +105,22 @@ export const checkAvailability = async (clientId: string, dateIso: string, durat
         const busySlots = response.data.calendars?.['primary'].busy;
         return !busySlots || busySlots.length === 0;
     } catch (error) {
-        console.error(`Erro ao checar agenda de ${clientId}:`, error);
-        return false;
+        console.error(`❌ Erro ao checar agenda de ${userId}:`, error);
+        return true; 
     }
 };
 
 export const createEvent = async (
-    clientId: string, 
+    userId: string, 
     clientName: string, 
     clientPhone: string, 
     dateIso: string,
-    durationMin: number = 30 // Agora aceita duração dinâmica
+    durationMin: number = 30 
 ): Promise<boolean> => {
     try {
-        const calendar = await getOAuthClient(clientId);
+        const calendar = await getOAuthClient(userId);
+        if (!calendar) return false;
+
         const start = parseISO(dateIso);
         const end = addMinutes(start, durationMin);
 
@@ -103,10 +134,10 @@ export const createEvent = async (
             }
         });
         
-        console.log(`✅ Evento criado na agenda de ${clientId}`);
+        console.log(`✅ Evento criado na agenda de ${userId}`);
         return true;
     } catch (error) {
-        console.error(`Erro ao criar evento para ${clientId}:`, error);
+        console.error(`❌ Erro ao criar evento para ${userId}:`, error);
         return false;
     }
 };
