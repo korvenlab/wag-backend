@@ -1,4 +1,3 @@
-
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from 'dotenv';
 
@@ -14,21 +13,17 @@ const isMessageUseless = (message: string): boolean => {
     return isLaugh || ignoreList.includes(lowerMsg) || lowerMsg.length <= 2;
 };
 
-const truncateHistory = (history: string): string => {
-    if (!history) return "";
-    const messages = history.split('\n').filter(msg => msg.trim() !== '');
-    return messages.slice(-7).join('\n');
-};
-
 export const analyzeMessage = async (
     history: string, 
     currentMessage: string, 
     isAiEnabled: boolean, 
     dbRow: { 
-        start_time: string, 
-        end_time: string, 
-        active_days: any, 
-        store_name: string 
+        store_name: string,
+        active_days: any,
+        // Turnos e Status
+        start_time: string, end_time: string, is_turno1_active: boolean,
+        start_time_2: string, end_time_2: string, is_turno2_active: boolean,
+        start_time_3: string, end_time_3: string, is_turno3_active: boolean
     }
 ) => {
     
@@ -37,73 +32,65 @@ export const analyzeMessage = async (
 
     try {
         const model = genAI.getGenerativeModel({ 
-            model: "gemini-3.1-flash-lite-preview" 
+            model: "gemini-1.5-flash" 
         });
 
         // ==========================================
-        // LÓGICA DE FUSO HORÁRIO REFORÇADA (BRT - UTC-3)
+        // DATA E HORA EM TEMPO REAL (BRASÍLIA)
         // ==========================================
         const date = new Date();
-        // Forçamos o cálculo para garantir que, independente do servidor, o horário seja Brasília
         const brDate = new Date(date.toLocaleString("en-US", {timeZone: "America/Sao_Paulo"}));
         
-        const hours = brDate.getHours().toString().padStart(2, '0');
-        const minutes = brDate.getMinutes().toString().padStart(2, '0');
-        const currentTimeBR = `${hours}:${minutes}`;
+        const currentTimeBR = brDate.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
         const dataFormatadaBR = brDate.toLocaleDateString('pt-BR');
 
         const diasSemanaMap = ["Domingo", "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado"];
         const diaAtualNome = diasSemanaMap[brDate.getDay()];
 
-        // Tratamento do active_days
+        // Parse dos dias de atendimento
         let activeDaysArray: string[] = [];
         try {
-            activeDaysArray = typeof dbRow.active_days === 'string' 
-                ? JSON.parse(dbRow.active_days) 
-                : dbRow.active_days;
-        } catch (e) {
-            activeDaysArray = [];
-        }
+            activeDaysArray = typeof dbRow.active_days === 'string' ? JSON.parse(dbRow.active_days) : dbRow.active_days;
+        } catch (e) { activeDaysArray = []; }
 
-        const isClosedToday = !activeDaysArray.includes(diaAtualNome);
-
-        // Verificação lógica se o estabelecimento já fechou
-        // Isso ajuda a IA a não cometer erros de comparação
-        const [hourNow, minNow] = currentTimeBR.split(':').map(Number);
-        const [hourEnd, minEnd] = dbRow.end_time.split(':').map(Number);
-        const isPastClosing = (hourNow > hourEnd) || (hourNow === hourEnd && minNow >= minEnd);
-
-        const statusFuncionamento = isClosedToday 
-            ? `FECHADA (Hoje é ${diaAtualNome} e não atendemos).`
-            : isPastClosing 
-                ? `ENCERRADA (A loja fechou às ${dbRow.end_time} e agora são ${currentTimeBR}).`
-                : `ABERTA (Atendimento até às ${dbRow.end_time}. Agora são exatamente ${currentTimeBR}).`;
+        // Construção da lista de turnos para a Lucy saber o que responder
+        let infoTurnos = "";
+        if (dbRow.is_turno1_active) infoTurnos += `- Turno 1: ${dbRow.start_time} às ${dbRow.end_time}\n`;
+        if (dbRow.is_turno2_active) infoTurnos += `- Turno 2: ${dbRow.start_time_2} às ${dbRow.end_time_2}\n`;
+        if (dbRow.is_turno3_active) infoTurnos += `- Turno 3: ${dbRow.start_time_3} às ${dbRow.end_time_3}\n`;
 
         const generationConfig = {
             temperature: 0.1, 
-            maxOutputTokens: 150, 
+            maxOutputTokens: 250, 
             responseMimeType: "application/json",
         };
 
         const prompt = `
-        Aja como Lucy, secretária virtual da loja "${dbRow.store_name}".
-        
-        CONTEXTO TEMPORAL OBRIGATÓRIO:
-        - Data de Hoje: ${dataFormatadaBR}
-        - Dia da Semana: ${diaAtualNome}
-        - Horário Oficial agora: ${currentTimeBR}
-        - Status Atual: ${statusFuncionamento}
+        Você é a Lucy, assistente da loja "${dbRow.store_name}".
+        Seu objetivo é agendar clientes. Você conversa 24h por dia, mas o agendamento no sistema só é permitido nos horários da loja.
 
-        REGRAS:
-        1. Se o Status for ENCERRADA ou FECHADA, explique ao cliente que no momento não há atendimento, citando que agora são ${currentTimeBR}.
-        2. Se o cliente pedir para agendar "hoje" ou "agora" e já passou das ${dbRow.end_time}, sugira o próximo dia disponível.
-        3. Nunca use o horário do seu sistema interno, use APENAS o Horário Oficial informado acima: ${currentTimeBR}.
+        REGRAS DE OURO:
+        1. HORÁRIOS DA LOJA:
+        ${infoTurnos}
+        2. DIAS DE ATENDIMENTO: ${activeDaysArray.join(", ")}
+        3. AGORA SÃO: ${currentTimeBR} de ${diaAtualNome}, ${dataFormatadaBR}.
+
+        COMPORTAMENTO:
+        - Se o cliente solicitar um horário que ESTÁ dentro de um turno ativo e no dia correto, defina "isScheduling": true.
+        - Se o cliente solicitar um horário que NÃO está nos turnos (ex: no intervalo ou após o fechamento), defina "isScheduling": false e explique educadamente que esse horário não está disponível, informando quais são os nossos horários de atendimento.
+        - Seja sempre prestativa. Se o cliente falar às 7h querendo marcar para as 18h e a loja fecha às 17h, explique isso a ele.
+
+        HISTÓRICO:
+        ${history}
+
+        MENSAGEM DO CLIENTE:
+        ${currentMessage}
 
         Responda APENAS JSON:
         {
             "isScheduling": boolean,
             "date": "YYYY-MM-DDTHH:mm:ss" | null,
-            "response": "Texto da resposta em nome da ${dbRow.store_name}"
+            "response": "Sua resposta carismática"
         }`;
 
         const result = await model.generateContent({
@@ -117,7 +104,8 @@ export const analyzeMessage = async (
         try {
             return JSON.parse(text);
         } catch (e) {
-            return { isScheduling: false, response: null };
+            console.error("Erro no Parse JSON da Lucy");
+            return { isScheduling: false, response: "Ops, tive um pequeno problema técnico. Pode me dizer novamente o horário que deseja?" };
         }
 
     } catch (error: any) {
