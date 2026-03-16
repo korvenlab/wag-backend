@@ -5,8 +5,8 @@ dotenv.config();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
-// Puxa a versão do modelo do .env ou usa uma versão segura como fallback
-const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+// Define o Gemini 3.1 Flash Lite como padrão absoluto
+const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite-preview";
 
 const isMessageUseless = (message: string): boolean => {
     if (!message) return true;
@@ -32,7 +32,6 @@ export const analyzeMessage = async (
     if (isMessageUseless(currentMessage)) return { isScheduling: false, response: null };
 
     try {
-        // Agora utiliza a variável dinâmica do .env
         const model = genAI.getGenerativeModel({ 
             model: MODEL_NAME 
         });
@@ -71,17 +70,10 @@ export const analyzeMessage = async (
         - Duração de cada serviço: ${dbRow.service_duration} minutos.
 
         SUA MISSÃO AO INTERAGIR:
-        1. Se o cliente pedir um horário indisponível hoje (seja por estar fora do turno ou por já estar ocupado):
-           - Explique a situação de forma gentil.
-           - Sugira o mesmo horário para o dia seguinte, caso o cronograma permita.
-           - Se não for possível amanhã, ofereça as opções livres mais próximas de forma textual.
-        2. Se o cliente for vago, pergunte qual horário ficaria melhor para ele dentro das opções que você tem.
-        3. Nunca diga apenas "não". Sempre apresente uma alternativa que ajude o cliente a agendar.
-
-        REGRAS PARA O JSON:
-        - isScheduling: true (apenas se houver um horário claro e disponível).
-        - date: ISO string da data escolhida.
-        - response: Sua resposta humanizada sem emojis.
+        1. Se o cliente pedir um horário indisponível hoje:
+           - Explique a situação de forma gentil e sugira o mesmo horário para amanhã ou opções próximas.
+        2. Se o cliente for vago, pergunte o horário preferido.
+        3. Nunca diga apenas "não". Ofereça alternativas.
 
         HISTÓRICO:
         ${history}
@@ -107,11 +99,11 @@ export const analyzeMessage = async (
         try {
             return JSON.parse(text);
         } catch (e) {
-            return { isScheduling: false, response: "Peço desculpas, mas não consegui processar sua mensagem agora. Você poderia me dizer novamente o horário que deseja?" };
+            return { isScheduling: false, response: "Perdão, não consegui processar isso agora. Pode repetir o horário desejado?" };
         }
 
     } catch (error: any) {
-        console.error(`❌ Erro Gemini (${MODEL_NAME}):`, error.message);
-        return { isScheduling: false, response: "No momento estou com uma instabilidade técnica. Poderia tentar novamente em alguns minutos, por gentileza?" };
+        console.error(`❌ Erro Gemini 3.1:`, error.message);
+        return { isScheduling: false, response: "Estou passando por uma instabilidade técnica momentânea. Pode tentar novamente em instantes?" };
     }
 };
