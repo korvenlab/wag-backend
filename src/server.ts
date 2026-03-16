@@ -48,28 +48,48 @@ app.use(express.json());
 // Rotas do Stripe
 app.use('/api/stripe', stripeRoutes);
 
-// Rota para salvar os horários de funcionamento (JSONB com 3 turnos por dia)
+// Rota para salvar o Nome da Loja (CORREÇÃO DO ERRO 404)
+app.post('/api/settings/store', async (req: Request, res: Response) => {
+  const { email, storeName } = req.body;
+
+  if (!email) return res.status(400).json({ error: 'Email obrigatório.' });
+
+  try {
+    const { error } = await supabase
+      .from('profiles')
+      .update({ store_name: storeName })
+      .eq('email', email);
+
+    if (error) throw error;
+
+    res.status(200).json({ message: 'Nome da loja atualizado com sucesso.' });
+  } catch (error: any) {
+    console.error("❌ Erro ao salvar nome da loja:", error.message);
+    res.status(500).json({ error: 'Erro ao atualizar nome da loja.' });
+  }
+});
+
+// Rota para salvar os horários de funcionamento (JSONB)
 app.post('/api/settings/hours', async (req: Request, res: Response) => {
   const { email, workingHours, serviceDuration } = req.body;
 
   if (!email) return res.status(400).json({ error: 'Email obrigatório.' });
 
   try {
-    // IMPORTANTE: Verifique se o nome da tabela é 'profiles' ou 'user_profiles'
     const { error } = await supabase
       .from('profiles') 
       .update({ 
-        working_hours: workingHours, // Salva o objeto JSONB com todos os dias
+        working_hours: workingHours,
         service_duration: serviceDuration 
       })
       .eq('email', email);
 
     if (error) throw error;
 
-    res.status(200).json({ message: 'Configurações de agenda atualizadas com sucesso.' });
+    res.status(200).json({ message: 'Configurações de agenda atualizadas.' });
   } catch (error: any) {
     console.error("❌ Erro ao salvar agenda:", error.message);
-    res.status(500).json({ error: 'Erro interno ao salvar configurações de horário.' });
+    res.status(500).json({ error: 'Erro interno ao salvar horários.' });
   }
 });
 
@@ -78,13 +98,13 @@ app.post('/api/settings/ai', async (req: Request, res: Response) => {
   const { email, aiEnabled } = req.body;
   try {
     await supabase.from('profiles').update({ is_ai_enabled: aiEnabled }).eq('email', email);
-    res.status(200).json({ message: 'Configuração de IA atualizada.' });
+    res.status(200).json({ message: 'IA atualizada.' });
   } catch (error) {
     res.status(500).json({ error: 'Erro ao atualizar IA.' });
   }
 });
 
-// Rota para buscar perfil do usuário (incluindo os novos horários)
+// Rota para buscar perfil do usuário
 app.get('/api/user/profile', async (req: Request, res: Response) => {
   const email = req.query.email as string;
   const { data, error } = await supabase
@@ -142,7 +162,6 @@ app.get('/', (req, res) => res.send('WAG Backend Online!'));
 
 app.listen(port, () => {
   console.log(`🚀 Servidor rodando na porta ${port}`);
-
   setTimeout(async () => {
     await autoReconnectAll();
   }, 5000);
