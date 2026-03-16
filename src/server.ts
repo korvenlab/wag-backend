@@ -53,36 +53,56 @@ app.use(express.json());
 app.post('/api/auth/sync', async (req: Request, res: Response) => {
   const { email, accessToken, refreshToken, expiresAt } = req.body;
 
-  if (!email) {
-    return res.status(400).json({ error: 'Email não fornecido para sincronização.' });
+  // LOG DE DEBUG PARA MONITORAMENTO
+  console.log("-----------------------------------------");
+  console.log("📥 [SYNC] Tentativa de sincronização recebida:");
+  console.log(`📧 Email: ${email}`);
+  console.log(`🔑 Access Token: ${accessToken ? '✅ Presente' : '❌ Ausente'}`);
+  console.log(`🔄 Refresh Token: ${refreshToken ? '✅ Presente' : '❌ Ausente'}`);
+  console.log("-----------------------------------------");
+
+  if (!email || !accessToken) {
+    return res.status(400).json({ error: 'Email ou Access Token ausentes.' });
   }
 
   try {
-    console.log(`🔄 Sincronizando tokens One-Click para: ${email}`);
+    // 1. Verifica se o perfil existe
+    const { data: profile, error: fetchError } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('email', email)
+      .single();
 
-    const { data, error } = await supabase
+    if (fetchError || !profile) {
+      console.error(`⚠️ [SYNC] Perfil não encontrado no banco para: ${email}`);
+      return res.status(404).json({ error: 'Usuário não encontrado na tabela profiles.' });
+    }
+
+    // 2. Atualiza os tokens
+    // Se no seu banco a coluna for estritamente minúscula, mude para googleauth
+    const { data, error: updateError } = await supabase
       .from('profiles')
       .update({ 
         googleAuth: {
           accessToken,
           refreshToken,
-          expiryDate: expiresAt ? Number(expiresAt) * 1000 : null
+          expiryDate: expiresAt ? Number(expiresAt) * 1000 : null,
+          updatedAt: new Date().toISOString()
         }
       })
       .eq('email', email)
       .select();
 
-    if (error) throw error;
-
-    if (!data || data.length === 0) {
-      console.warn(`⚠️ Perfil não encontrado para o email: ${email}`);
-      return res.status(404).json({ error: 'Perfil não encontrado no banco.' });
+    if (updateError) {
+      console.error("❌ [SYNC] Erro Supabase Update:", updateError.message);
+      return res.status(500).json({ error: updateError.message });
     }
 
-    console.log(`✅ Agenda sincronizada via login para ${email}`);
-    res.status(200).json({ message: 'Tokens sincronizados com sucesso.' });
+    console.log(`✅ [SYNC] Banco de dados atualizado com sucesso para: ${email}`);
+    res.status(200).json({ message: 'Tokens sincronizados com sucesso.', data });
+
   } catch (error: any) {
-    console.error("❌ Erro na sincronização automática:", error.message);
+    console.error("❌ [SYNC] Erro crítico:", error.message);
     res.status(500).json({ error: 'Erro interno ao sincronizar credenciais.' });
   }
 });
@@ -109,24 +129,23 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
     const tokens = await getTokensFromCode(code as string);
     const userInfo = await getUserInfo(tokens);
     
-    // Fallback: se o state não vier, usamos o email confirmado pelo Google
     const userEmail = (state as string) || userInfo.email;
 
     if (!userEmail) throw new Error("Não foi possível identificar o usuário.");
 
-    console.log(`💾 Salvando tokens via Callback para: ${userEmail}`);
+    console.log(`💾 [CALLBACK] Salvando tokens para: ${userEmail}`);
 
-    const { data, error } = await supabase
+    const { error } = await supabase
       .from('profiles')
       .update({ 
         googleAuth: {
           accessToken: tokens.access_token,
           refreshToken: tokens.refresh_token,
-          expiryDate: tokens.expiry_date
+          expiryDate: tokens.expiry_date,
+          updatedAt: new Date().toISOString()
         }
       })
-      .eq('email', userEmail)
-      .select();
+      .eq('email', userEmail);
 
     if (error) throw error;
 
@@ -134,13 +153,12 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
       <div style="font-family: sans-serif; text-align: center; margin-top: 50px; background: #f9fafb; padding: 40px; border-radius: 20px;">
         <h1 style="color: #059669;">✅ Agenda Conectada!</h1>
         <p style="color: #4b5563;">A Lucy agora já pode organizar seus horários em <b>${userEmail}</b>.</p>
-        <p style="font-size: 0.8rem; color: #9ca3af;">Esta aba fechará sozinha em instantes...</p>
         <script>setTimeout(() => window.close(), 3000);</script>
       </div>
     `);
 
   } catch (error: any) {
-    console.error("❌ Erro no Google Callback:", error.message);
+    console.error("❌ [CALLBACK] Erro:", error.message);
     res.status(500).send("Erro ao salvar credenciais da agenda.");
   }
 });
