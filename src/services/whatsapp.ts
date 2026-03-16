@@ -58,7 +58,6 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
     const credsFilePath = path.join(sessionDir, 'creds.json');
 
-    // Validação de restauração do banco
     if (!fs.existsSync(credsFilePath) && profile?.whatsapp_session) {
       console.log(`📥 [Supabase] Restaurando credenciais para: ${email}`);
       fs.writeFileSync(credsFilePath, JSON.stringify(profile.whatsapp_session));
@@ -83,8 +82,6 @@ export async function startWhatsApp(email: string, res: Response | null) {
       try {
         if (fs.existsSync(credsFilePath)) {
           const fileContent = fs.readFileSync(credsFilePath, 'utf-8');
-          
-          // PROTEÇÃO: Verifica se o arquivo não está vazio antes do Parse
           if (fileContent && fileContent.trim().length > 0) {
             const credsData = JSON.parse(fileContent);
             await supabase.from('profiles').update({ whatsapp_session: credsData }).eq('email', email);
@@ -92,8 +89,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
         }
       } catch (parseError) {
         console.error(`⚠️ Erro ao processar credenciais de ${email}:`, parseError);
-        // Se o arquivo estiver corrompido, removemos para evitar loop de erro
-        fs.unlinkSync(credsFilePath);
+        if (fs.existsSync(credsFilePath)) fs.unlinkSync(credsFilePath);
       }
     });
 
@@ -120,11 +116,19 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
     sock.ev.on('messages.upsert', async (m) => {
       const msg = m.messages[0];
+      
+      // 1. Validações básicas e prevenção de auto-resposta
       if (!msg.message || msg.key.fromMe) return;
-      const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
-      if (!textMessage) return;
+
       const remoteJid = msg.key.remoteJid;
       if (!remoteJid) return;
+
+      // 2. BLOQUEIO DE GRUPOS: Se o ID contiver '@g.us', interrompe na hora.
+      const isGroup = remoteJid.endsWith('@g.us');
+      if (isGroup) return;
+
+      const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
+      if (!textMessage) return;
 
       try {
         const { data: p } = await supabase.from('profiles').select('*').eq('email', email).single();
@@ -132,12 +136,14 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
         const busySlots = await getBusySlots(p.id, new Date().toISOString());
 
-        const aiResult = await analyzeMessage("", textMessage, true, busySlots, {
+        // 3. Chamada para a IA passando o parâmetro isGroup (falso aqui devido ao filtro acima)
+        const aiResult = await analyzeMessage("", textMessage, true, isGroup, busySlots, {
             store_name: p.store_name,
             working_hours: p.working_hours,
             service_duration: p.service_duration
         });
 
+        // Só envia se a IA retornou uma resposta (o filtro de palavras-chave está dentro da analyzeMessage)
         if (aiResult.response) {
           await sock.sendMessage(remoteJid, { text: aiResult.response });
           await supabase.from('profiles').update({ messages_answered: (p.messages_answered || 0) + 1 }).eq('email', email);
