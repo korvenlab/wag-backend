@@ -15,7 +15,7 @@ import { getTokensFromCode, getUserInfo, generateAuthUrl } from './services/goog
 
 const app = express();
 
-// CORREÇÃO: Forçando a variável port a ser um número, satisfazendo a exigência do app.listen
+// Forçando a variável port a ser um número, satisfazendo a exigência do app.listen
 const port: number = process.env.PORT ? Number(process.env.PORT) : 3000;
 
 const supabase = createClient(
@@ -81,13 +81,12 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
       updatedAt: new Date().toISOString()
     };
 
-    // Usando UPSERT para evitar erros caso o perfil ainda não exista
+    // Usando UPSERT sem a coluna updated_at que não existe no banco
     const { data, error } = await supabase
       .from('profiles')
       .upsert({ 
         email: email.toLowerCase().trim(),
-        googleAuth: googleAuthData,
-        updated_at: new Date().toISOString()
+        googleAuth: googleAuthData
       }, { onConflict: 'email' })
       .select();
 
@@ -120,12 +119,11 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
     const userInfo = await getUserInfo(tokens);
     const userEmail = (state as string) || userInfo.email;
 
-    // CORREÇÃO: Verificação de segurança para o TypeScript saber que userEmail não é nulo
     if (!userEmail) {
       return res.status(400).send("Erro: E-mail não pôde ser verificado.");
     }
 
-    // Usando UPSERT na rota de callback também
+    // Usando UPSERT sem a coluna updated_at que não existe no banco
     await supabase
       .from('profiles')
       .upsert({ 
@@ -135,8 +133,7 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
           refreshToken: tokens.refresh_token,
           expiryDate: tokens.expiry_date,
           updatedAt: new Date().toISOString()
-        },
-        updated_at: new Date().toISOString()
+        }
       }, { onConflict: 'email' });
 
     res.send('<h1>✅ Conectado! Feche esta aba.</h1><script>setTimeout(()=>window.close(),2000)</script>');
@@ -197,7 +194,7 @@ app.post('/api/whatsapp/disconnect', async (req: Request, res: Response) => {
 app.get('/ping', (req, res) => res.send('pong'));
 app.get('/', (req, res) => res.send('WBOT Backend Online!'));
 
-// CORREÇÃO: A porta agora é estritamente um número para evitar o erro de Overload
+// A porta agora é estritamente um número para evitar o erro de Overload
 app.listen(port, '0.0.0.0', () => {
   console.log(`🚀 Servidor rodando na porta ${port}`);
   autoReconnectAll();
