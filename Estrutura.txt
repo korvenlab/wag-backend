@@ -1,0 +1,9 @@
+src/server.ts (Gerencia as rotas e o servidor HTTP).
+
+src/routes/stripe.ts (Gerencia pagamentos e webhooks).
+
+src/services/whatsapp.ts (Gerencia o motor do WhatsApp).
+
+src/services/ai.ts (Gerencia a Lucy/Gemini).
+
+src/services/calendar.ts (Gerencia o agendamento).
