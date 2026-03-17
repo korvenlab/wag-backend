@@ -99,23 +99,21 @@ export async function startWhatsApp(email: string, res: Response | null) {
         const qrCodeImage = await qrcode.toDataURL(qr);
         res.status(200).json({ qrCode: qrCodeImage });
       }
+      
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         console.log(`⚠️ Conexão fechada para ${email}. Código de erro: ${statusCode}`);
         
-        // LIMPEZA DE MEMÓRIA: Destrói a sessão fantasma da memória RAM
         delete sessions[email];
 
-        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 440 || statusCode === 403) {
+          console.log(`🛑 Erro fatal (${statusCode}). Limpando sessão e abortando reconexão para: ${email}`);
+          
           await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
           if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-          console.log(`🚪 Dispositivo desconectado (logged out) para: ${email}`);
+          
+          console.log(`🧹 Sessão corrompida destruída. O utilizador deve ler um novo QR Code.`);
         } 
-        else if (statusCode === 440) {
-          // ERRO 440 (Connection Replaced): Impede o Loop Infinito e deixa a máquina respirar
-          console.log(`🛑 Conflito de Sessão (440). Evitando loop de reconexão imediata.`);
-          setTimeout(() => startWhatsApp(email, null), 15000);
-        }
         else {
           console.log(`🔄 Agendando reconexão para ${email} em 5 segundos...`);
           setTimeout(() => startWhatsApp(email, null), 5000);
@@ -144,7 +142,6 @@ export async function startWhatsApp(email: string, res: Response | null) {
         const { data: p } = await supabase.from('profiles').select('*').eq('email', email).single();
         if (!p || !p.has_paid || !p.is_ai_enabled) return;
 
-        // CORREÇÃO: Enviando o email para ler os horários ocupados
         const busySlots = await getBusySlots(email, new Date().toISOString());
 
         const aiResult = await analyzeMessage("", textMessage, true, isGroup, busySlots, {
@@ -159,13 +156,10 @@ export async function startWhatsApp(email: string, res: Response | null) {
         }
 
         if (aiResult.isScheduling && aiResult.date) {
-            // CORREÇÃO: Enviando o email para checar disponibilidade
             const isFree = await checkAvailability(email, aiResult.date, p.service_duration);
             if (isFree) {
                 const clientName = msg.pushName || "Cliente WhatsApp";
                 const clientPhone = remoteJid.split('@')[0];
-                
-                // CORREÇÃO: Enviando o email para criar o evento
                 const created = await createEvent(email, clientName, clientPhone, aiResult.date, p.service_duration);
                 if (created) {
                     await supabase.from('profiles').update({ 
