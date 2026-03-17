@@ -18,6 +18,14 @@ import { checkAvailability, createEvent, getBusySlots } from './calendar';
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 export const sessions: Record<string, any> = {};
 
+/**
+ * 🧠 MEMÓRIA RAM VOLÁTIL (SaaS Ready)
+ * Armazena o contexto das conversas sem lotar o banco de dados.
+ * Chave: "email_do_lojista:jid_do_cliente"
+ */
+const memoryCache: Record<string, { lastUpdate: number, messages: { role: string, content: string }[] }> = {};
+const SESSION_EXPIRATION = 24 * 60 * 60 * 1000; // 24 Horas
+
 export async function disconnectWhatsApp(email: string) {
   try {
     const sock = sessions[email];
@@ -26,7 +34,7 @@ export async function disconnectWhatsApp(email: string) {
     const sessionDir = path.join(baseAuthDir, safeEmailFolder);
 
     if (sock) {
-      sock.ev.removeAllListeners(); // FEATURE: Limpeza total de eventos para não deixar rastos
+      sock.ev.removeAllListeners();
       try { await sock.logout(); } catch (e) {}
       try { sock.ws.close(); } catch (e) {}
       delete sessions[email];
@@ -46,12 +54,11 @@ export async function disconnectWhatsApp(email: string) {
 
 export async function startWhatsApp(email: string, res: Response | null) {
   try {
-    // 🛑 FEATURE: O MATA-ZUMBIS (Evita o loop de bots duplicados na memória)
     if (sessions[email]) {
         console.log(`🧹 Limpando processo antigo do bot para: ${email}`);
-        sessions[email].ev.removeAllListeners(); // Para de ouvir mensagens e eventos antigos
-        try { sessions[email].ws.close(); } catch(e) {} // Força a desconexão bruta do socket antigo
-        delete sessions[email]; // Liberta a memória RAM
+        sessions[email].ev.removeAllListeners();
+        try { sessions[email].ws.close(); } catch(e) {}
+        delete sessions[email];
     }
 
     const baseAuthDir = path.join(__dirname, '..', '..', 'auth_info_baileys');
@@ -80,10 +87,9 @@ export async function startWhatsApp(email: string, res: Response | null) {
       version,
       auth: state,
       printQRInTerminal: false,
-      logger: pino({ level: 'silent' }), // Continua silencioso para não poluir
+      logger: pino({ level: 'silent' }),
       browser: Browsers.macOS('Desktop'),
       markOnlineOnConnect: true,
-      // FEATURE: Tempos de espera ajustados para o bot ser mais tolerante a quedas curtas de internet
       connectTimeoutMs: 60000,
       keepAliveIntervalMs: 10000
     });
@@ -108,32 +114,20 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
-      
       if (qr && res && !res.headersSent) {
         const qrCodeImage = await qrcode.toDataURL(qr);
         res.status(200).json({ qrCode: qrCodeImage });
       }
-      
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-        console.log(`⚠️ Conexão fechada para ${email}. Código de erro: ${statusCode}`);
-        
-        // Limpamos os listeners do socket que acabou de cair para que ele não dispare duplamente
         if (sessions[email]) {
             sessions[email].ev.removeAllListeners();
             delete sessions[email];
         }
-
         if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 440 || statusCode === 403) {
-          console.log(`🛑 Erro fatal (${statusCode}). Limpando sessão e abortando reconexão para: ${email}`);
-          
           await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
           if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-          
-          console.log(`🧹 Sessão corrompida destruída. O utilizador deve ler um novo QR Code.`);
-        } 
-        else {
-          console.log(`🔄 Agendando reconexão para ${email} em 5 segundos...`);
+        } else {
           setTimeout(() => startWhatsApp(email, null), 5000);
         }
       } else if (connection === 'open') {
@@ -144,50 +138,80 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
     sock.ev.on('messages.upsert', async (m) => {
       const msg = m.messages[0];
-      
       if (!msg.message || msg.key.fromMe) return;
 
       const remoteJid = msg.key.remoteJid;
-      if (!remoteJid) return;
-
-      const isGroup = remoteJid.endsWith('@g.us');
-      if (isGroup) return;
+      if (!remoteJid || remoteJid.endsWith('@g.us')) return;
 
       const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
       if (!textMessage) return;
+
+      const now = Date.now();
+      const cacheKey = `${email}:${remoteJid}`; // Isolamento total por Loja e Cliente
 
       try {
         const { data: p } = await supabase.from('profiles').select('*').eq('email', email).single();
         if (!p || !p.has_paid || !p.is_ai_enabled) return;
 
+        // --- 🧠 LÓGICA DE GESTÃO DE CONTEXTO ---
+        if (memoryCache[cacheKey]) {
+            const timeSinceLastMsg = now - memoryCache[cacheKey].lastUpdate;
+            // Reset por tempo (24h)
+            if (timeSinceLastMsg > SESSION_EXPIRATION) {
+                memoryCache[cacheKey] = { lastUpdate: now, messages: [] };
+            }
+        } else {
+            memoryCache[cacheKey] = { lastUpdate: now, messages: [] };
+        }
+
+        memoryCache[cacheKey].lastUpdate = now;
+        memoryCache[cacheKey].messages.push({ role: 'user', content: textMessage });
+
+        const formattedHistory = memoryCache[cacheKey].messages
+            .slice(-10)
+            .map(h => `${h.role === 'user' ? 'Cliente' : 'Lucy'}: ${h.content}`)
+            .join('\n');
+
         const busySlots = await getBusySlots(email, new Date().toISOString());
 
-        const aiResult = await analyzeMessage("", textMessage, true, isGroup, busySlots, {
+        const aiResult = await analyzeMessage(formattedHistory, textMessage, true, false, busySlots, {
             store_name: p.store_name,
             working_hours: p.working_hours,
             service_duration: p.service_duration
         });
 
         if (aiResult.response) {
-          // FEATURE: Escudo contra o erro de crash (Error 428: Connection Closed)
           try {
               await sock.sendMessage(remoteJid, { text: aiResult.response });
+              // Salva resposta da Lucy na RAM para continuidade do diálogo
+              memoryCache[cacheKey].messages.push({ role: 'assistant', content: aiResult.response });
+              
+              if (memoryCache[cacheKey].messages.length > 20) {
+                  memoryCache[cacheKey].messages = memoryCache[cacheKey].messages.slice(-20);
+              }
+
               await supabase.from('profiles').update({ messages_answered: (p.messages_answered || 0) + 1 }).eq('email', email);
           } catch (sendError) {
-              console.error(`❌ Não foi possível enviar a mensagem para ${remoteJid} (O socket já estava fechado)`);
+              console.error(`❌ Erro no envio para ${remoteJid}`);
           }
         }
 
+        // --- 🎯 MISSÃO CUMPRIDA: RESET APÓS AGENDAMENTO ---
         if (aiResult.isScheduling && aiResult.date) {
             const isFree = await checkAvailability(email, aiResult.date, p.service_duration);
             if (isFree) {
                 const clientName = msg.pushName || "Cliente WhatsApp";
                 const clientPhone = remoteJid.split('@')[0];
                 const created = await createEvent(email, clientName, clientPhone, aiResult.date, p.service_duration);
+                
                 if (created) {
                     await supabase.from('profiles').update({ 
                         appointments_count: (p.appointments_count || 0) + 1 
                     }).eq('email', email);
+
+                    // Limpa a memória apenas após o agendamento concluído com sucesso
+                    console.log(`✅ Agendamento finalizado para ${cacheKey}. Resetando contexto.`);
+                    delete memoryCache[cacheKey];
                 }
             }
         }
