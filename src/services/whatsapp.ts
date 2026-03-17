@@ -101,12 +101,19 @@ export async function startWhatsApp(email: string, res: Response | null) {
       }
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        console.log(`⚠️ Conexão fechada para ${email}. Código de erro: ${statusCode}`);
+        
         if (statusCode !== DisconnectReason.loggedOut) {
-          startWhatsApp(email, null);
+          // FEATURE: Delay de 5 segundos antes de tentar reconectar para evitar loop de queda e sobrecarga do servidor
+          console.log(`🔄 Agendando reconexão para ${email} em 5 segundos...`);
+          setTimeout(() => {
+            startWhatsApp(email, null);
+          }, 5000);
         } else {
           await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
           if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
           delete sessions[email];
+          console.log(`🚪 Dispositivo desconectado (logged out) para: ${email}`);
         }
       } else if (connection === 'open') {
         console.log(`✅ [ATIVO] Bot online para: ${email}`);
@@ -117,13 +124,11 @@ export async function startWhatsApp(email: string, res: Response | null) {
     sock.ev.on('messages.upsert', async (m) => {
       const msg = m.messages[0];
       
-      // 1. Validações básicas e prevenção de auto-resposta
       if (!msg.message || msg.key.fromMe) return;
 
       const remoteJid = msg.key.remoteJid;
       if (!remoteJid) return;
 
-      // 2. BLOQUEIO DE GRUPOS: Se o ID contiver '@g.us', interrompe na hora.
       const isGroup = remoteJid.endsWith('@g.us');
       if (isGroup) return;
 
@@ -136,14 +141,12 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
         const busySlots = await getBusySlots(p.id, new Date().toISOString());
 
-        // 3. Chamada para a IA passando o parâmetro isGroup (falso aqui devido ao filtro acima)
         const aiResult = await analyzeMessage("", textMessage, true, isGroup, busySlots, {
             store_name: p.store_name,
             working_hours: p.working_hours,
             service_duration: p.service_duration
         });
 
-        // Só envia se a IA retornou uma resposta (o filtro de palavras-chave está dentro da analyzeMessage)
         if (aiResult.response) {
           await sock.sendMessage(remoteJid, { text: aiResult.response });
           await supabase.from('profiles').update({ messages_answered: (p.messages_answered || 0) + 1 }).eq('email', email);
