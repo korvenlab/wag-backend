@@ -103,17 +103,22 @@ export async function startWhatsApp(email: string, res: Response | null) {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         console.log(`⚠️ Conexão fechada para ${email}. Código de erro: ${statusCode}`);
         
-        if (statusCode !== DisconnectReason.loggedOut) {
-          // FEATURE: Delay de 5 segundos antes de tentar reconectar para evitar loop de queda e sobrecarga do servidor
-          console.log(`🔄 Agendando reconexão para ${email} em 5 segundos...`);
-          setTimeout(() => {
-            startWhatsApp(email, null);
-          }, 5000);
-        } else {
+        // LIMPEZA DE MEMÓRIA: Destrói a sessão fantasma da memória RAM
+        delete sessions[email];
+
+        if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
           await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
           if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-          delete sessions[email];
           console.log(`🚪 Dispositivo desconectado (logged out) para: ${email}`);
+        } 
+        else if (statusCode === 440) {
+          // ERRO 440 (Connection Replaced): Impede o Loop Infinito e deixa a máquina respirar
+          console.log(`🛑 Conflito de Sessão (440). Evitando loop de reconexão imediata.`);
+          setTimeout(() => startWhatsApp(email, null), 15000);
+        }
+        else {
+          console.log(`🔄 Agendando reconexão para ${email} em 5 segundos...`);
+          setTimeout(() => startWhatsApp(email, null), 5000);
         }
       } else if (connection === 'open') {
         console.log(`✅ [ATIVO] Bot online para: ${email}`);
