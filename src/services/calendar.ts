@@ -1,22 +1,21 @@
-// LOGICA DA INTEGRACAO COM O CALENDARIO DO GOOGLE
+// LOGICA DA INTEGRACAO COM O CALENDARIO DO GOOGLE (CORRIGIDA)
 import { google } from 'googleapis';
 import { addMinutes, parseISO, startOfDay, endOfDay } from 'date-fns';
 import { supabase } from '../lib/supabase';
 
 /**
- * Obtém o cliente OAuth e atualiza o banco automaticamente se o token renovar
+ * Obtém o cliente OAuth usando o EMAIL como identificador (Chave mais confiável entre sistemas)
  */
-const getOAuthClient = async (userId: string) => {
-    // 1. Busca as credenciais na tabela 'profiles'
+const getOAuthClient = async (email: string) => {
+    // 1. Mudança Crítica: Buscamos pelo campo 'email' em vez de 'id'
     const { data: profile, error } = await supabase
         .from('profiles')
         .select('googleAuth') 
-        .eq('id', userId)
+        .eq('email', email.toLowerCase()) // Garante que ignore maiúsculas/minúsculas
         .single();
 
-    // Se não houver tokens, retornamos null para não quebrar o fluxo da Lucy
     if (error || !profile || !profile.googleAuth) {
-        console.warn(`⚠️ [CALENDAR] Usuário ${userId} não possui integração configurada na tabela profiles.`);
+        console.warn(`⚠️ [CALENDAR] Usuário ${email} não possui integração ou perfil não encontrado.`);
         return null;
     }
 
@@ -34,9 +33,9 @@ const getOAuthClient = async (userId: string) => {
         expiry_date: googleAuth.expiryDate
     });
 
-    // Listener para salvar novos tokens automaticamente quando o Google renovar o acesso
+    // Listener para atualizar tokens automaticamente (Auto-refresh)
     oauth2Client.on('tokens', async (tokens) => {
-        console.log(`🔄 [CALENDAR] Renovando tokens para o perfil ${userId}...`);
+        console.log(`🔄 [CALENDAR] Renovando tokens para ${email}...`);
         
         const updatedAuth = {
             ...googleAuth,
@@ -48,24 +47,25 @@ const getOAuthClient = async (userId: string) => {
             updatedAuth.refreshToken = tokens.refresh_token;
         }
 
+        // Atualizamos no banco usando o e-mail como referência
         await supabase
             .from('profiles')
             .update({ googleAuth: updatedAuth })
-            .eq('id', userId);
+            .eq('email', email.toLowerCase());
             
-        console.log(`✅ [CALENDAR] Novos tokens persistidos no banco.`);
+        console.log(`✅ [CALENDAR] Tokens renovados com sucesso.`);
     });
 
     return google.calendar({ version: 'v3', auth: oauth2Client });
 };
 
 /**
- * BUSCA TODOS OS HORÁRIOS OCUPADOS DE UM DIA
+ * BUSCA TODOS OS HORÁRIOS OCUPADOS
  */
-export const getBusySlots = async (userId: string, dateIso: string): Promise<string[]> => {
+export const getBusySlots = async (email: string, dateIso: string): Promise<string[]> => {
     try {
-        const calendar = await getOAuthClient(userId);
-        if (!calendar) return []; // Retorna lista vazia se não houver Google conectado
+        const calendar = await getOAuthClient(email);
+        if (!calendar) return [];
 
         const dayStart = startOfDay(parseISO(dateIso));
         const dayEnd = endOfDay(parseISO(dateIso));
@@ -81,15 +81,18 @@ export const getBusySlots = async (userId: string, dateIso: string): Promise<str
         const busy = response.data.calendars?.['primary'].busy || [];
         return busy.map(slot => slot.start as string);
     } catch (error) {
-        console.error(`❌ Erro ao buscar slots ocupados de ${userId}:`, error);
+        console.error(`❌ Erro ao buscar slots de ${email}:`, error);
         return [];
     }
 };
 
-export const checkAvailability = async (userId: string, dateIso: string, durationMin: number = 30): Promise<boolean> => {
+/**
+ * CHECA DISPONIBILIDADE
+ */
+export const checkAvailability = async (email: string, dateIso: string, durationMin: number = 30): Promise<boolean> => {
     try {
-        const calendar = await getOAuthClient(userId);
-        if (!calendar) return true; // Se não tem agenda, assume disponível para não travar a Lucy
+        const calendar = await getOAuthClient(email);
+        if (!calendar) return true; 
 
         const start = parseISO(dateIso);
         const end = addMinutes(start, durationMin);
@@ -105,20 +108,23 @@ export const checkAvailability = async (userId: string, dateIso: string, duratio
         const busySlots = response.data.calendars?.['primary'].busy;
         return !busySlots || busySlots.length === 0;
     } catch (error) {
-        console.error(`❌ Erro ao checar agenda de ${userId}:`, error);
+        console.error(`❌ Erro na agenda de ${email}:`, error);
         return true; 
     }
 };
 
+/**
+ * CRIA O EVENTO
+ */
 export const createEvent = async (
-    userId: string, 
+    email: string, 
     clientName: string, 
     clientPhone: string, 
     dateIso: string,
     durationMin: number = 30 
 ): Promise<boolean> => {
     try {
-        const calendar = await getOAuthClient(userId);
+        const calendar = await getOAuthClient(email);
         if (!calendar) return false;
 
         const start = parseISO(dateIso);
@@ -134,10 +140,10 @@ export const createEvent = async (
             }
         });
         
-        console.log(`✅ Evento criado na agenda de ${userId}`);
+        console.log(`✅ Evento criado com sucesso para ${email}`);
         return true;
     } catch (error) {
-        console.error(`❌ Erro ao criar evento para ${userId}:`, error);
+        console.error(`❌ Erro ao criar evento para ${email}:`, error);
         return false;
     }
 };
