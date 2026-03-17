@@ -30,28 +30,10 @@ const supabase = createClient(
 app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeRoutes);
 
 // ==========================================
-// 2. CONFIGURAÇÃO DO CORS
+// 2. CONFIGURAÇÃO DO CORS (BLINDADA)
 // ==========================================
-const allowedOrigins = [
-  'https://wagbot.vercel.app',
-  'https://wagbot-korvenlabcontato-4447s-projects.vercel.app',
-  'https://wag-frontend-korvenlabcontato-4447s-projects.vercel.app',
-  'http://localhost:5173',
-  'http://localhost:3000'
-];
-
 app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
-    
-    const isAllowed = allowedOrigins.indexOf(origin) !== -1 || origin.includes('vercel.app');
-    
-    if (isAllowed) {
-      callback(null, true);
-    } else {
-      callback(new Error('Bloqueado pelo CORS: Origem não permitida.'));
-    }
-  },
+  origin: true, // FEATURE: Aceita a origem automaticamente (Resolve bloqueios da Vercel)
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'stripe-signature'],
   credentials: true 
@@ -89,13 +71,11 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
       updatedAt: new Date().toISOString()
     };
 
-    // Objeto dinâmico para evitar enviar colunas que não existem (como updated_at)
     const upsertData: any = { 
       email: email.toLowerCase().trim(),
       googleAuth: googleAuthData
     };
 
-    // Se a Vercel mandar o ID do usuário logado, nós salvamos para evitar o erro de "null id"
     if (userId) {
       upsertData.id = userId;
     }
@@ -138,7 +118,6 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
       return res.status(400).send("Erro: E-mail não pôde ser verificado.");
     }
 
-    // Upsert limpo, sem colunas inexistentes
     await supabase
       .from('profiles')
       .upsert({ 
@@ -180,9 +159,6 @@ app.post('/api/settings/ai', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-// ------------------------------------------
-// ROTA CORRIGIDA: BUSCA OU CRIA O PERFIL
-// ------------------------------------------
 app.get('/api/user/profile', async (req: Request, res: Response) => {
   const email = req.query.email as string;
   if (!email) return res.status(400).json({ error: 'Email necessário' });
@@ -190,24 +166,21 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
   const cleanEmail = email.toLowerCase().trim();
 
   try {
-    // 1. Tenta buscar o perfil usando maybeSingle()
     const { data: existingProfile, error: fetchError } = await supabase
       .from('profiles')
       .select('*')
       .eq('email', cleanEmail)
-      .maybeSingle(); // Impede o erro 406 (Not Acceptable)
+      .maybeSingle(); 
 
     if (fetchError) {
       console.error("❌ Erro ao buscar perfil:", fetchError.message);
       return res.status(500).json({ error: 'Erro no banco de dados' });
     }
 
-    // 2. Se o perfil existir, retorna os dados normalmente
     if (existingProfile) {
       return res.json(existingProfile);
     }
 
-    // 3. SE NÃO EXISTIR: Cria o perfil padrão agora mesmo
     console.log(`⚠️ Perfil de ${cleanEmail} não encontrado. Criando novo...`);
     
     const newProfileData = {
@@ -227,7 +200,6 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
 
     if (insertError) {
       console.error("❌ Erro ao criar perfil padrão:", insertError.message);
-      // Retorna dados falsos/padrão para não quebrar o Frontend
       return res.json(newProfileData);
     }
 
@@ -257,13 +229,21 @@ app.post('/api/whatsapp/disconnect', async (req: Request, res: Response) => {
 });
 
 // ==========================================
-// 6. BOOT
+// 6. BOOT & SISTEMA ANTI-CRASH
 // ==========================================
 app.get('/ping', (req, res) => res.send('pong'));
 app.get('/', (req, res) => res.send('WBOT Backend Online!'));
 
-// A porta agora é estritamente um número para evitar o erro de Overload
 app.listen(port, '0.0.0.0', () => {
   console.log(`🚀 Servidor rodando na porta ${port}`);
   autoReconnectAll();
+});
+
+// FEATURE: Escudo Anti-Crash. Impede que o servidor desligue por causa de erros assíncronos no Baileys.
+process.on('uncaughtException', (err) => {
+  console.error('🛡️ [Anti-Crash] Erro Crítico Não Capturado:', err.message);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('🛡️ [Anti-Crash] Rejeição de Promessa Não Tratada:', reason);
 });
