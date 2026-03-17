@@ -26,7 +26,9 @@ export async function disconnectWhatsApp(email: string) {
     const sessionDir = path.join(baseAuthDir, safeEmailFolder);
 
     if (sock) {
-      await sock.logout();
+      sock.ev.removeAllListeners(); // FEATURE: Limpeza total de eventos para não deixar rastos
+      try { await sock.logout(); } catch (e) {}
+      try { sock.ws.close(); } catch (e) {}
       delete sessions[email];
     }
 
@@ -44,6 +46,14 @@ export async function disconnectWhatsApp(email: string) {
 
 export async function startWhatsApp(email: string, res: Response | null) {
   try {
+    // 🛑 FEATURE: O MATA-ZUMBIS (Evita o loop de bots duplicados na memória)
+    if (sessions[email]) {
+        console.log(`🧹 Limpando processo antigo do bot para: ${email}`);
+        sessions[email].ev.removeAllListeners(); // Para de ouvir mensagens e eventos antigos
+        try { sessions[email].ws.close(); } catch(e) {} // Força a desconexão bruta do socket antigo
+        delete sessions[email]; // Liberta a memória RAM
+    }
+
     const baseAuthDir = path.join(__dirname, '..', '..', 'auth_info_baileys');
     const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
     const sessionDir = path.join(baseAuthDir, safeEmailFolder);
@@ -70,9 +80,12 @@ export async function startWhatsApp(email: string, res: Response | null) {
       version,
       auth: state,
       printQRInTerminal: false,
-      logger: pino({ level: 'silent' }),
+      logger: pino({ level: 'silent' }), // Continua silencioso para não poluir
       browser: Browsers.macOS('Desktop'),
-      markOnlineOnConnect: true
+      markOnlineOnConnect: true,
+      // FEATURE: Tempos de espera ajustados para o bot ser mais tolerante a quedas curtas de internet
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 10000
     });
 
     sessions[email] = sock;
@@ -95,6 +108,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
+      
       if (qr && res && !res.headersSent) {
         const qrCodeImage = await qrcode.toDataURL(qr);
         res.status(200).json({ qrCode: qrCodeImage });
@@ -104,7 +118,11 @@ export async function startWhatsApp(email: string, res: Response | null) {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         console.log(`⚠️ Conexão fechada para ${email}. Código de erro: ${statusCode}`);
         
-        delete sessions[email];
+        // Limpamos os listeners do socket que acabou de cair para que ele não dispare duplamente
+        if (sessions[email]) {
+            sessions[email].ev.removeAllListeners();
+            delete sessions[email];
+        }
 
         if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 440 || statusCode === 403) {
           console.log(`🛑 Erro fatal (${statusCode}). Limpando sessão e abortando reconexão para: ${email}`);
@@ -151,8 +169,13 @@ export async function startWhatsApp(email: string, res: Response | null) {
         });
 
         if (aiResult.response) {
-          await sock.sendMessage(remoteJid, { text: aiResult.response });
-          await supabase.from('profiles').update({ messages_answered: (p.messages_answered || 0) + 1 }).eq('email', email);
+          // FEATURE: Escudo contra o erro de crash (Error 428: Connection Closed)
+          try {
+              await sock.sendMessage(remoteJid, { text: aiResult.response });
+              await supabase.from('profiles').update({ messages_answered: (p.messages_answered || 0) + 1 }).eq('email', email);
+          } catch (sendError) {
+              console.error(`❌ Não foi possível enviar a mensagem para ${remoteJid} (O socket já estava fechado)`);
+          }
         }
 
         if (aiResult.isScheduling && aiResult.date) {
