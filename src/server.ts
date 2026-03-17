@@ -63,11 +63,19 @@ app.use(express.json());
 // 3. ROTAS DE INTEGRAÇÃO (GOOGLE AUTH)
 // ==========================================
 
+interface SyncRequestBody {
+  userId?: string;
+  email: string;
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt?: string | number;
+}
+
 app.post('/api/auth/sync', async (req: Request, res: Response) => {
-  const { email, accessToken, refreshToken, expiresAt } = req.body;
+  const { userId, email, accessToken, refreshToken, expiresAt } = req.body as SyncRequestBody;
 
   console.log("-----------------------------------------");
-  console.log("📥 [SYNC] Dados recebidos:", { email, hasAccess: !!accessToken, hasRefresh: !!refreshToken });
+  console.log("📥 [SYNC] Dados recebidos para:", email);
 
   if (!email || !accessToken) {
     return res.status(400).json({ error: 'Dados incompletos.' });
@@ -81,13 +89,20 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
       updatedAt: new Date().toISOString()
     };
 
-    // Usando UPSERT sem a coluna updated_at que não existe no banco
+    // Objeto dinâmico para evitar enviar colunas que não existem (como updated_at)
+    const upsertData: any = { 
+      email: email.toLowerCase().trim(),
+      googleAuth: googleAuthData
+    };
+
+    // Se a Vercel mandar o ID do usuário logado, nós salvamos para evitar o erro de "null id"
+    if (userId) {
+      upsertData.id = userId;
+    }
+
     const { data, error } = await supabase
       .from('profiles')
-      .upsert({ 
-        email: email.toLowerCase().trim(),
-        googleAuth: googleAuthData
-      }, { onConflict: 'email' })
+      .upsert(upsertData, { onConflict: 'email' })
       .select();
 
     if (error) {
@@ -99,103 +114,4 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
     res.status(200).json({ message: 'Sincronizado.', data });
   } catch (error: any) {
     console.error("❌ [SYNC] Erro:", error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/api/auth/google/url', (req: Request, res: Response) => {
-  const { email } = req.query;
-  if (!email) return res.status(400).json({ error: 'Email necessário' });
-  const url = generateAuthUrl(email as string);
-  res.json({ url });
-});
-
-app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
-  const { code, state } = req.query;
-  if (!code) return res.status(400).send('Sem código.');
-
-  try {
-    const tokens = await getTokensFromCode(code as string);
-    const userInfo = await getUserInfo(tokens);
-    const userEmail = (state as string) || userInfo.email;
-
-    if (!userEmail) {
-      return res.status(400).send("Erro: E-mail não pôde ser verificado.");
-    }
-
-    // Usando UPSERT sem a coluna updated_at que não existe no banco
-    await supabase
-      .from('profiles')
-      .upsert({ 
-        email: userEmail.toLowerCase().trim(),
-        googleAuth: {
-          accessToken: tokens.access_token,
-          refreshToken: tokens.refresh_token,
-          expiryDate: tokens.expiry_date,
-          updatedAt: new Date().toISOString()
-        }
-      }, { onConflict: 'email' });
-
-    res.send('<h1>✅ Conectado! Feche esta aba.</h1><script>setTimeout(()=>window.close(),2000)</script>');
-  } catch (error: any) {
-    console.error("❌ [CALLBACK ERROR]:", error.message);
-    res.status(500).send("Erro no callback.");
-  }
-});
-
-// ==========================================
-// 4. CONFIGURAÇÕES DO USUÁRIO
-// ==========================================
-
-app.post('/api/settings/store', async (req: Request, res: Response) => {
-  const { email, storeName } = req.body;
-  await supabase.from('profiles').update({ store_name: storeName }).eq('email', email);
-  res.json({ ok: true });
-});
-
-app.post('/api/settings/hours', async (req: Request, res: Response) => {
-  const { email, workingHours, serviceDuration } = req.body;
-  await supabase.from('profiles').update({ working_hours: workingHours, service_duration: serviceDuration }).eq('email', email);
-  res.json({ ok: true });
-});
-
-app.post('/api/settings/ai', async (req: Request, res: Response) => {
-  const { email, aiEnabled } = req.body;
-  await supabase.from('profiles').update({ is_ai_enabled: aiEnabled }).eq('email', email);
-  res.json({ ok: true });
-});
-
-app.get('/api/user/profile', async (req: Request, res: Response) => {
-  const email = req.query.email as string;
-  const { data, error } = await supabase.from('profiles').select('*').eq('email', email).single();
-  if (error) return res.status(404).json({ error: 'Não encontrado' });
-  res.json(data);
-});
-
-// ==========================================
-// 5. WHATSAPP
-// ==========================================
-
-app.post('/api/whatsapp/qr', async (req: Request, res: Response) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'Email necessário' });
-  startWhatsApp(email, res);
-});
-
-app.post('/api/whatsapp/disconnect', async (req: Request, res: Response) => {
-  const { email } = req.body;
-  await disconnectWhatsApp(email);
-  res.json({ ok: true });
-});
-
-// ==========================================
-// 6. BOOT
-// ==========================================
-app.get('/ping', (req, res) => res.send('pong'));
-app.get('/', (req, res) => res.send('WBOT Backend Online!'));
-
-// A porta agora é estritamente um número para evitar o erro de Overload
-app.listen(port, '0.0.0.0', () => {
-  console.log(`🚀 Servidor rodando na porta ${port}`);
-  autoReconnectAll();
-});
+    res.status(500).json
