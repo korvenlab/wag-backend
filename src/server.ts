@@ -14,7 +14,9 @@ import { startWhatsApp, sessions, autoReconnectAll, disconnectWhatsApp } from '.
 import { getTokensFromCode, getUserInfo, generateAuthUrl } from './services/googleAuth'; 
 
 const app = express();
-const port = process.env.PORT || 3000;
+
+// CORREÇÃO: Forçando a variável port a ser um número, satisfazendo a exigência do app.listen
+const port: number = process.env.PORT ? Number(process.env.PORT) : 3000;
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
@@ -25,9 +27,7 @@ const supabase = createClient(
 // 1. STRIPE E WEBHOOKS
 // ==========================================
 // O webhook do Stripe EXIGE o corpo da requisição "raw" para validar a assinatura
-app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
-// Rotas normais do Stripe
-app.use('/api/stripe', express.json(), stripeRoutes);
+app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeRoutes);
 
 // ==========================================
 // 2. CONFIGURAÇÃO DO CORS
@@ -120,6 +120,11 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
     const userInfo = await getUserInfo(tokens);
     const userEmail = (state as string) || userInfo.email;
 
+    // CORREÇÃO: Verificação de segurança para o TypeScript saber que userEmail não é nulo
+    if (!userEmail) {
+      return res.status(400).send("Erro: E-mail não pôde ser verificado.");
+    }
+
     // Usando UPSERT na rota de callback também
     await supabase
       .from('profiles')
@@ -192,7 +197,7 @@ app.post('/api/whatsapp/disconnect', async (req: Request, res: Response) => {
 app.get('/ping', (req, res) => res.send('pong'));
 app.get('/', (req, res) => res.send('WBOT Backend Online!'));
 
-// Configuração de IP '0.0.0.0' necessária para acesso externo no Render
+// CORREÇÃO: A porta agora é estritamente um número para evitar o erro de Overload
 app.listen(port, '0.0.0.0', () => {
   console.log(`🚀 Servidor rodando na porta ${port}`);
   autoReconnectAll();
