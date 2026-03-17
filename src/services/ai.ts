@@ -6,11 +6,10 @@ dotenv.config();
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite-preview";
 
-// Filtro de relevância permanece o mesmo
 const shouldIgnoreMessage = (message: string): boolean => {
     if (!message) return true;
     const lowerMsg = message.toLowerCase().trim();
-    const schedulingKeywords = ['horário', 'horario', 'agendar', 'marcar', 'vaga', 'disponível', 'disponivel', 'amanhã', 'amanha', 'hoje', 'dia', 'agenda', 'reservar'];
+    const schedulingKeywords = ['horário', 'horario', 'agendar', 'marcar', 'vaga', 'disponível', 'disponivel', 'amanhã', 'amanha', 'hoje', 'dia', 'agenda', 'reservar', 'sessão', 'marcado'];
     const hasKeyword = schedulingKeywords.some(keyword => lowerMsg.includes(keyword));
     const hasNumbers = /\d/.test(lowerMsg);
     return !hasKeyword && !hasNumbers;
@@ -43,37 +42,39 @@ export const analyzeMessage = async (
         const diaAtualNome = diasSemanaMap[brDate.getDay()];
 
         const generationConfig = {
-            temperature: 0.1, // Reduzi para 0.1 para evitar "alucinações" de data
-            maxOutputTokens: 400, 
+            temperature: 0, // Precisão máxima para evitar erros de data
+            maxOutputTokens: 500, 
             responseMimeType: "application/json",
         };
 
         const prompt = `
-        Você é a Lucy, assistente virtual da "${dbRow.store_name}".
-        
-        Sua tarefa é extrair intenções de agendamento baseadas em um diálogo.
+        Você é a Lucy, assistente virtual humanizada da "${dbRow.store_name}".
+        Sua missão é realizar agendamentos baseando-se estritamente no histórico de conversa.
 
-        REGRAS DE MEMÓRIA E CONTEXTO (CRÍTICO):
-        1. ANALISE O HISTÓRICO: Se no histórico o cliente mencionou uma data (ex: "sexta-feira") e agora ele enviou apenas o horário (ex: "9h"), o agendamento DEVE ser para a data mencionada anteriormente, e NÃO para hoje.
-        2. PRIORIDADE: O contexto da conversa anterior dita a data, a menos que o cliente mude explicitamente (ex: "mudei de ideia, quero hoje").
-        3. Se o cliente confirmou um horário sugerido por você na mensagem anterior, mantenha a data exata que você sugeriu.
+        REGRAS DE OURO DE CONTEXTO:
+        1. Se o histórico mostra que o cliente escolheu uma data (ex: "sexta-feira") e na mensagem atual ele disse apenas um horário (ex: "as 10h"), você DEVE calcular a data final para essa sexta-feira específica.
+        2. Nunca assuma que "9h" é hoje se houver uma data diferente pendente no histórico.
+        3. Se o cliente mudar de ideia no histórico, a última data mencionada é a que vale.
+        4. NÃO USE EMOJIS.
 
-        CONTEXTO TEMPORAL:
-        - Hoje é: ${diaAtualNome}, ${dataFormatadaBR} (Horário: ${currentTimeBR})
-        - Horários da loja: ${JSON.stringify(dbRow.working_hours)}
-        - Ocupados: ${busySlots.join(", ")}
+        CONTEXTO DO SISTEMA:
+        - Hoje é: ${diaAtualNome}, ${dataFormatadaBR} às ${currentTimeBR}.
+        - Horários da Loja: ${JSON.stringify(dbRow.working_hours)}
+        - Slots já ocupados: ${busySlots.length > 0 ? busySlots.join(", ") : "Nenhum"}.
+        - Duração: ${dbRow.service_duration} minutos.
 
-        HISTÓRICO DA CONVERSA:
-        ${history}
+        HISTÓRICO RECENTE:
+        ${history || "Início de conversa."}
 
-        MENSAGEM ATUAL DO CLIENTE:
+        MENSAGEM ATUAL:
         "${currentMessage}"
 
-        Responda estritamente em JSON:
+        Responda obrigatoriamente neste formato JSON:
         {
-            "isScheduling": boolean (true apenas se tiver certeza da data e hora),
-            "date": "YYYY-MM-DDTHH:mm:ss" (Calcule com base na data mencionada no histórico ou na mensagem atual),
-            "response": "Sua resposta humanizada e sem emojis"
+            "thinking": "Análise curta do histórico para definir a data correta",
+            "isScheduling": boolean (true se você tem data e hora exatas para marcar),
+            "date": "YYYY-MM-DDTHH:mm:ss" | null,
+            "response": "Sua resposta humanizada para o cliente"
         }`;
 
         const result = await model.generateContent({
@@ -85,12 +86,19 @@ export const analyzeMessage = async (
         let text = response.text().replace(/```json/g, '').replace(/```/g, '').trim();
 
         try {
-            return JSON.parse(text);
+            const parsed = JSON.parse(text);
+            // Retornamos apenas o que o sistema precisa, descartando o "thinking"
+            return {
+                isScheduling: parsed.isScheduling,
+                date: parsed.date,
+                response: parsed.response
+            };
         } catch (e) {
-            return { isScheduling: false, response: "Poderia me confirmar o dia e o horário, por gentileza?" };
+            return { isScheduling: false, response: "Perdão, não entendi bem. Para qual dia e horário deseja marcar?" };
         }
 
     } catch (error: any) {
+        console.error("Erro no processamento da IA:", error);
         return { isScheduling: false, response: null };
     }
 };
