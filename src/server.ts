@@ -159,7 +159,7 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
 });
 
 // ==========================================
-// 4. CONFIGURAÇÕES DO USUÁRIO
+// 4. CONFIGURAÇÕES DO USUÁRIO & PERFIL
 // ==========================================
 
 app.post('/api/settings/store', async (req: Request, res: Response) => {
@@ -180,11 +180,64 @@ app.post('/api/settings/ai', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+// ------------------------------------------
+// ROTA CORRIGIDA: BUSCA OU CRIA O PERFIL
+// ------------------------------------------
 app.get('/api/user/profile', async (req: Request, res: Response) => {
   const email = req.query.email as string;
-  const { data, error } = await supabase.from('profiles').select('*').eq('email', email).single();
-  if (error) return res.status(404).json({ error: 'Não encontrado' });
-  res.json(data);
+  if (!email) return res.status(400).json({ error: 'Email necessário' });
+
+  const cleanEmail = email.toLowerCase().trim();
+
+  try {
+    // 1. Tenta buscar o perfil usando maybeSingle()
+    const { data: existingProfile, error: fetchError } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('email', cleanEmail)
+      .maybeSingle(); // Impede o erro 406 (Not Acceptable)
+
+    if (fetchError) {
+      console.error("❌ Erro ao buscar perfil:", fetchError.message);
+      return res.status(500).json({ error: 'Erro no banco de dados' });
+    }
+
+    // 2. Se o perfil existir, retorna os dados normalmente
+    if (existingProfile) {
+      return res.json(existingProfile);
+    }
+
+    // 3. SE NÃO EXISTIR: Cria o perfil padrão agora mesmo
+    console.log(`⚠️ Perfil de ${cleanEmail} não encontrado. Criando novo...`);
+    
+    const newProfileData = {
+      email: cleanEmail,
+      has_paid: false,
+      is_ai_enabled: false,
+      messages_answered: 0,
+      appointments_count: 0,
+      service_duration: 30
+    };
+
+    const { data: newProfile, error: insertError } = await supabase
+      .from('profiles')
+      .insert([newProfileData])
+      .select('*')
+      .single();
+
+    if (insertError) {
+      console.error("❌ Erro ao criar perfil padrão:", insertError.message);
+      // Retorna dados falsos/padrão para não quebrar o Frontend
+      return res.json(newProfileData);
+    }
+
+    console.log(`✅ Perfil padrão criado para: ${cleanEmail}`);
+    return res.json(newProfile);
+
+  } catch (error: any) {
+    console.error("💥 Erro Inesperado na rota profile:", error.message);
+    return res.status(500).json({ error: 'Erro interno' });
+  }
 });
 
 // ==========================================
