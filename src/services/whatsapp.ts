@@ -144,7 +144,8 @@ export async function startWhatsApp(email: string, res: Response | null) {
         const { data: p } = await supabase.from('profiles').select('*').eq('email', email).single();
         if (!p || !p.has_paid || !p.is_ai_enabled) return;
 
-        const busySlots = await getBusySlots(p.id, new Date().toISOString());
+        // CORREÇÃO: Enviando o email para ler os horários ocupados
+        const busySlots = await getBusySlots(email, new Date().toISOString());
 
         const aiResult = await analyzeMessage("", textMessage, true, isGroup, busySlots, {
             store_name: p.store_name,
@@ -158,11 +159,14 @@ export async function startWhatsApp(email: string, res: Response | null) {
         }
 
         if (aiResult.isScheduling && aiResult.date) {
-            const isFree = await checkAvailability(p.id, aiResult.date, p.service_duration);
+            // CORREÇÃO: Enviando o email para checar disponibilidade
+            const isFree = await checkAvailability(email, aiResult.date, p.service_duration);
             if (isFree) {
                 const clientName = msg.pushName || "Cliente WhatsApp";
                 const clientPhone = remoteJid.split('@')[0];
-                const created = await createEvent(p.id, clientName, clientPhone, aiResult.date, p.service_duration);
+                
+                // CORREÇÃO: Enviando o email para criar o evento
+                const created = await createEvent(email, clientName, clientPhone, aiResult.date, p.service_duration);
                 if (created) {
                     await supabase.from('profiles').update({ 
                         appointments_count: (p.appointments_count || 0) + 1 
