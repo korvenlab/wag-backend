@@ -71,18 +71,11 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
       updatedAt: new Date().toISOString()
     };
 
-    const upsertData: any = { 
-      email: email.toLowerCase().trim(),
-      googleAuth: googleAuthData
-    };
-
-    if (userId) {
-      upsertData.id = userId;
-    }
-
+    // 🛑 FEATURE: Forçamos o UPDATE para garantir a gravação na coluna googleAuth
     const { data, error } = await supabase
       .from('profiles')
-      .upsert(upsertData, { onConflict: 'email' })
+      .update({ googleAuth: googleAuthData })
+      .eq('email', email.toLowerCase().trim())
       .select();
 
     if (error) {
@@ -120,15 +113,14 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
 
     await supabase
       .from('profiles')
-      .upsert({ 
-        email: userEmail.toLowerCase().trim(),
+      .update({ 
         googleAuth: {
           accessToken: tokens.access_token,
           refreshToken: tokens.refresh_token,
           expiryDate: tokens.expiry_date,
           updatedAt: new Date().toISOString()
         }
-      }, { onConflict: 'email' });
+      }).eq('email', userEmail.toLowerCase().trim());
 
     res.send('<h1>✅ Conectado! Feche esta aba.</h1><script>setTimeout(()=>window.close(),2000)</script>');
   } catch (error: any) {
@@ -161,6 +153,8 @@ app.post('/api/settings/ai', async (req: Request, res: Response) => {
 
 app.get('/api/user/profile', async (req: Request, res: Response) => {
   const email = req.query.email as string;
+  const id = req.query.id as string; // FEATURE: Capturando o ID vindo do frontend
+
   if (!email) return res.status(400).json({ error: 'Email necessário' });
 
   const cleanEmail = email.toLowerCase().trim();
@@ -183,7 +177,7 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
 
     console.log(`⚠️ Perfil de ${cleanEmail} não encontrado. Criando novo...`);
     
-    const newProfileData = {
+    const newProfileData: any = {
       email: cleanEmail,
       has_paid: false,
       is_ai_enabled: false,
@@ -191,6 +185,11 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
       appointments_count: 0,
       service_duration: 30
     };
+
+    // FEATURE: Injetamos o ID para evitar o erro "null value in column id violates not-null constraint"
+    if (id) {
+        newProfileData.id = id;
+    }
 
     const { data: newProfile, error: insertError } = await supabase
       .from('profiles')
@@ -200,7 +199,7 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
 
     if (insertError) {
       console.error("❌ Erro ao criar perfil padrão:", insertError.message);
-      return res.json(newProfileData);
+      return res.status(500).json({ error: insertError.message });
     }
 
     console.log(`✅ Perfil padrão criado para: ${cleanEmail}`);
