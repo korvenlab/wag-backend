@@ -26,8 +26,8 @@ const supabase = createClient(
 // ==========================================
 // 1. STRIPE E WEBHOOKS
 // ==========================================
-// O webhook do Stripe EXIGE o corpo da requisição "raw" para validar a assinatura
-app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeRoutes);
+// FEATURE: Rota corrigida para alinhar com o frontend. O express.raw foi movido para o stripe.ts
+app.use('/api/stripe', stripeRoutes);
 
 // ==========================================
 // 2. CONFIGURAÇÃO DO CORS (BLINDADA)
@@ -71,7 +71,7 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
       updatedAt: new Date().toISOString()
     };
 
-    // 🛑 FEATURE: Forçamos o UPDATE para garantir a gravação na coluna googleAuth
+    // FEATURE: Forçamos o UPDATE para garantir a gravação na coluna googleAuth
     const { data, error } = await supabase
       .from('profiles')
       .update({ googleAuth: googleAuthData })
