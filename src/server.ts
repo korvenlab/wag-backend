@@ -24,25 +24,28 @@ const supabase = createClient(
 );
 
 // ==========================================
-// 1. STRIPE E WEBHOOKS
-// ==========================================
-// FEATURE: Rota corrigida para alinhar com o frontend. O express.raw foi movido para o stripe.ts
-app.use('/api/stripe', stripeRoutes);
-
-// ==========================================
-// 2. CONFIGURAÇÃO DO CORS (BLINDADA)
+// 1. CONFIGURAÇÃO DO CORS (O Escudo Global)
+// FEATURE: O CORS DEVE SER A PRIMEIRA COISA A CARREGAR!
 // ==========================================
 app.use(cors({
-  origin: true, // FEATURE: Aceita a origem automaticamente (Resolve bloqueios da Vercel)
+  origin: true, // Aceita a origem automaticamente (Resolve bloqueios da Vercel)
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'stripe-signature'],
   credentials: true 
 }));
 
+// ==========================================
+// 2. STRIPE E WEBHOOKS
+// ==========================================
+app.use('/api/stripe', stripeRoutes);
+
+// ==========================================
+// 3. PARSER JSON (Para o resto da aplicação)
+// ==========================================
 app.use(express.json());
 
 // ==========================================
-// 3. ROTAS DE INTEGRAÇÃO (GOOGLE AUTH)
+// 4. ROTAS DE INTEGRAÇÃO (GOOGLE AUTH)
 // ==========================================
 
 interface SyncRequestBody {
@@ -71,7 +74,6 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
       updatedAt: new Date().toISOString()
     };
 
-    // FEATURE: Forçamos o UPDATE para garantir a gravação na coluna googleAuth
     const { data, error } = await supabase
       .from('profiles')
       .update({ googleAuth: googleAuthData })
@@ -130,7 +132,7 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
 });
 
 // ==========================================
-// 4. CONFIGURAÇÕES DO USUÁRIO & PERFIL
+// 5. CONFIGURAÇÕES DO USUÁRIO & PERFIL
 // ==========================================
 
 app.post('/api/settings/store', async (req: Request, res: Response) => {
@@ -153,7 +155,7 @@ app.post('/api/settings/ai', async (req: Request, res: Response) => {
 
 app.get('/api/user/profile', async (req: Request, res: Response) => {
   const email = req.query.email as string;
-  const id = req.query.id as string; // FEATURE: Capturando o ID vindo do frontend
+  const id = req.query.id as string; 
 
   if (!email) return res.status(400).json({ error: 'Email necessário' });
 
@@ -186,7 +188,6 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
       service_duration: 30
     };
 
-    // FEATURE: Injetamos o ID para evitar o erro "null value in column id violates not-null constraint"
     if (id) {
         newProfileData.id = id;
     }
@@ -212,7 +213,7 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
 });
 
 // ==========================================
-// 5. WHATSAPP
+// 6. WHATSAPP
 // ==========================================
 
 app.post('/api/whatsapp/qr', async (req: Request, res: Response) => {
@@ -228,7 +229,7 @@ app.post('/api/whatsapp/disconnect', async (req: Request, res: Response) => {
 });
 
 // ==========================================
-// 6. BOOT & SISTEMA ANTI-CRASH
+// 7. BOOT & SISTEMA ANTI-CRASH
 // ==========================================
 app.get('/ping', (req, res) => res.send('pong'));
 app.get('/', (req, res) => res.send('WBOT Backend Online!'));
@@ -238,7 +239,6 @@ app.listen(port, '0.0.0.0', () => {
   autoReconnectAll();
 });
 
-// FEATURE: Escudo Anti-Crash. Impede que o servidor desligue por causa de erros assíncronos no Baileys.
 process.on('uncaughtException', (err) => {
   console.error('🛡️ [Anti-Crash] Erro Crítico Não Capturado:', err.message);
 });
