@@ -26,41 +26,91 @@ app.use(cors({
 app.use('/api/stripe', stripeRoutes);
 app.use(express.json());
 
-// --- ROTA DE PERFIL (Apontando para 'profiles') ---
+// --- 1. ROTA DE PERFIL (Busca todos os dados da imagem) ---
 app.get('/api/user/profile', async (req: Request, res: Response) => {
   const { email } = req.query;
   if (!email) return res.status(400).json({ error: 'Email necessário' });
 
   try {
-    console.log(`🔍 Buscando na tabela profiles: [${email}]`);
-
     const { data, error } = await supabase
-      .from('profiles') // Ajustado para o nome correto da sua tabela
+      .from('profiles')
       .select('*')
       .eq('email', String(email).trim())
       .single();
 
-    if (error) {
-      console.error("❌ Erro Supabase:", error.message);
-      return res.status(404).json({ error: 'Perfil não encontrado', details: error.message });
-    }
+    if (error || !data) return res.status(404).json({ error: 'Perfil não encontrado' });
     
-    console.log("✅ Perfil carregado com sucesso!");
     res.json(data);
   } catch (err) {
-    console.error("🔥 Erro interno:", err);
-    res.status(500).json({ error: 'Erro interno no servidor' });
+    res.status(500).json({ error: 'Erro interno' });
   }
 });
 
-// --- ROTA DE SYNC (Apontando para 'profiles') ---
+// --- 2. ROTA PARA LIGAR/DESLIGAR IA ---
+app.post('/api/settings/ai', async (req: Request, res: Response) => {
+  const { email, is_ai_enabled } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email necessário' });
+
+  try {
+    const { error } = await supabase
+      .from('profiles')
+      .update({ is_ai_enabled }) 
+      .eq('email', email);
+
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao salvar configuração de IA' });
+  }
+});
+
+// --- 3. ROTA PARA SALVAR AGENDA ---
+app.post('/api/settings/hours', async (req: Request, res: Response) => {
+  const { email, workingHours, serviceDuration } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email necessário' });
+
+  try {
+    const { error } = await supabase
+      .from('profiles')
+      .update({ 
+        working_hours: workingHours, 
+        service_duration: serviceDuration 
+      })
+      .eq('email', email);
+
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao salvar agenda' });
+  }
+});
+
+// --- 4. ROTA PARA ATUALIZAR NOME DA LOJA ---
+app.post('/api/settings/store', async (req: Request, res: Response) => {
+  const { email, storeName } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email necessário' });
+
+  try {
+    const { error } = await supabase
+      .from('profiles')
+      .update({ store_name: storeName })
+      .eq('email', email);
+
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao salvar nome da loja' });
+  }
+});
+
+// --- 5. ROTA DE SYNC (Login) ---
 app.post('/api/auth/sync', async (req: Request, res: Response) => {
-  const { email, id } = req.body; 
+  const { email, id } = req.body;
   if (!email || !id) return res.status(400).json({ error: 'Dados insuficientes' });
 
   try {
     const { data, error } = await supabase
-      .from('profiles') // Ajustado para profiles
+      .from('profiles')
       .upsert({ id, email: String(email).trim() }, { onConflict: 'email' })
       .select()
       .single();
@@ -68,31 +118,25 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
     if (error) throw error;
     res.json({ ok: true, user: data });
   } catch (err) {
-    console.error("❌ Erro na sincronização:", err);
-    res.status(500).json({ error: 'Erro ao sincronizar perfil' });
+    res.status(500).json({ error: 'Erro na sincronização' });
   }
 });
 
-app.post('/api/whatsapp/qr', async (req: Request, res: Response) => {
+// --- 6. WHATSAPP ROUTES ---
+app.post('/api/whatsapp/qr', (req, res) => {
   const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'Email necessário' });
   startWhatsApp(email, res);
 });
 
-app.post('/api/whatsapp/disconnect', async (req: Request, res: Response) => {
+app.post('/api/whatsapp/disconnect', async (req, res) => {
   const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'Email necessário' });
   await disconnectWhatsApp(email);
   res.json({ ok: true });
 });
 
 app.get('/ping', (req, res) => res.send('pong'));
-app.get('/', (req, res) => res.send('Wagoo Backend Online! 🚀'));
 
 app.listen(port, '0.0.0.0', () => {
-  console.log(`🚀 Servidor rodando na porta ${port}`);
-  autoReconnectAll().catch(err => console.error("Erro no autoReconnect:", err));
+  console.log(`🚀 Wagoo Online na porta ${port}`);
+  autoReconnectAll().catch(err => console.error(err));
 });
-
-process.on('uncaughtException', (err) => console.error('🛡️ Anti-Crash:', err.message));
-process.on('unhandledRejection', (reason) => console.error('🛡️ Anti-Crash:', reason));
