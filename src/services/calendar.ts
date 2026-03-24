@@ -1,17 +1,16 @@
-// LOGICA DA INTEGRACAO COM O CALENDARIO DO GOOGLE (CORRIGIDA)
+// LOGICA DA INTEGRACAO COM O CALENDARIO DO GOOGLE (ATUALIZADA)
 import { google } from 'googleapis';
 import { addMinutes, parseISO, startOfDay, endOfDay } from 'date-fns';
 import { supabase } from '../lib/supabase';
 
 /**
- * Obtém o cliente OAuth usando o EMAIL como identificador (Chave mais confiável entre sistemas)
+ * Obtém o cliente OAuth usando o EMAIL como identificador
  */
 const getOAuthClient = async (email: string) => {
-    // 1. Mudança Crítica: Buscamos pelo campo 'email' em vez de 'id'
     const { data: profile, error } = await supabase
         .from('profiles')
         .select('googleAuth') 
-        .eq('email', email.toLowerCase()) // Garante que ignore maiúsculas/minúsculas
+        .eq('email', email.toLowerCase())
         .single();
 
     if (error || !profile || !profile.googleAuth) {
@@ -33,26 +32,20 @@ const getOAuthClient = async (email: string) => {
         expiry_date: googleAuth.expiryDate
     });
 
-    // Listener para atualizar tokens automaticamente (Auto-refresh)
     oauth2Client.on('tokens', async (tokens) => {
         console.log(`🔄 [CALENDAR] Renovando tokens para ${email}...`);
-        
         const updatedAuth = {
             ...googleAuth,
             accessToken: tokens.access_token || googleAuth.accessToken,
             expiryDate: tokens.expiry_date || googleAuth.expiryDate,
         };
-
         if (tokens.refresh_token) {
             updatedAuth.refreshToken = tokens.refresh_token;
         }
-
-        // Atualizamos no banco usando o e-mail como referência
         await supabase
             .from('profiles')
             .update({ googleAuth: updatedAuth })
             .eq('email', email.toLowerCase());
-            
         console.log(`✅ [CALENDAR] Tokens renovados com sucesso.`);
     });
 
@@ -83,6 +76,54 @@ export const getBusySlots = async (email: string, dateIso: string): Promise<stri
     } catch (error) {
         console.error(`❌ Erro ao buscar slots de ${email}:`, error);
         return [];
+    }
+};
+
+/**
+ * BUSCA UM EVENTO FUTURO PELO TELEFONE DO CLIENTE
+ * FEATURE: Permite cancelamento sem depender da memória RAM do bot.
+ */
+export const findEventByPhone = async (email: string, phone: string): Promise<any | null> => {
+    try {
+        const calendar = await getOAuthClient(email);
+        if (!calendar) return null;
+
+        const now = new Date().toISOString();
+        const response = await calendar.events.list({
+            calendarId: 'primary',
+            timeMin: now, // Apenas eventos futuros
+            q: phone,     // Busca o telefone na descrição do evento
+            singleEvents: true,
+            orderBy: 'startTime',
+            maxResults: 1
+        });
+
+        const events = response.data.items || [];
+        return events.length > 0 ? events[0] : null;
+    } catch (error) {
+        console.error(`❌ Erro ao buscar evento para o telefone ${phone}:`, error);
+        return null;
+    }
+};
+
+/**
+ * DELETA UM EVENTO NO CALENDÁRIO
+ */
+export const deleteEvent = async (email: string, eventId: string): Promise<boolean> => {
+    try {
+        const calendar = await getOAuthClient(email);
+        if (!calendar) return false;
+
+        await calendar.events.delete({
+            calendarId: 'primary',
+            eventId: eventId
+        });
+        
+        console.log(`🗑️ Evento ${eventId} deletado com sucesso para ${email}`);
+        return true;
+    } catch (error) {
+        console.error(`❌ Erro ao deletar evento ${eventId}:`, error);
+        return false;
     }
 };
 
