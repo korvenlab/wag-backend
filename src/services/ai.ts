@@ -59,10 +59,10 @@ export const analyzeMessage = async (
         Sua missão é realizar e gerenciar agendamentos baseando-se no histórico.
 
         REGRAS DE OURO:
-        1. IDENTIFICAÇÃO: No início do atendimento, peça educadamente o NOME COMPLETO do cliente. Não conclua agendamentos sem o nome.
-        2. CANCELAMENTO: Se o cliente quiser cancelar ou desmarcar um horário, identifique essa intenção e retorne isCancelling como true.
-        3. CONTEXTO: Se o cliente escolher um dia e depois apenas o horário, calcule a data correta.
-        4. NÃO USE EMOJIS e seja direta, mas gentil.
+        1. AGENDAMENTO: NÃO peça o nome do cliente em nenhuma hipótese. Foque apenas em confirmar a DATA e o HORÁRIO desejado.
+        2. CANCELAMENTO: Se o cliente quiser cancelar ou desmarcar, identifique a intenção e retorne isCancelling como true imediatamente. NÃO peça nome ou documentos para isso.
+        3. CONTEXTO: Use o histórico para calcular datas relativas (ex: se o cliente disse "amanhã" em uma mensagem e "às 10h" na outra).
+        4. TOM DE VOZ: Seja direta, gentil e NÃO use emojis.
 
         CONTEXTO DO SISTEMA:
         - Hoje é: ${diaAtualNome}, ${dataFormatadaBR} às ${currentTimeBR}.
@@ -78,10 +78,9 @@ export const analyzeMessage = async (
 
         Responda obrigatoriamente neste formato JSON:
         {
-            "thinking": "Análise do que o cliente quer e se ele deseja cancelar ou agendar",
-            "isScheduling": boolean (true apenas se tiver DATA, HORA e NOME confirmados para um NOVO agendamento),
-            "isCancelling": boolean (true se o cliente expressar desejo de cancelar ou desmarcar),
-            "clientName": "Nome extraído do texto" | null,
+            "thinking": "Análise rápida da intenção do cliente",
+            "isScheduling": boolean (true apenas se tiver DATA e HORA confirmadas),
+            "isCancelling": boolean (true se o cliente quiser cancelar/desmarcar),
             "date": "YYYY-MM-DDTHH:mm:ss" | null,
             "response": "Sua resposta humanizada para o cliente"
         }`;
@@ -99,12 +98,11 @@ export const analyzeMessage = async (
             return {
                 isScheduling: parsed.isScheduling,
                 isCancelling: parsed.isCancelling || false,
-                clientName: parsed.clientName,
                 date: parsed.date,
                 response: parsed.response
             };
         } catch (e) {
-            return { isScheduling: false, isCancelling: false, response: "Perdão, não entendi bem. Como posso te ajudar com seu agendamento?" };
+            return { isScheduling: false, isCancelling: false, response: "Para qual dia e horário você deseja marcar?" };
         }
 
     } catch (error: any) {
