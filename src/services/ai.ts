@@ -36,7 +36,7 @@ export const analyzeMessage = async (
     }
 ) => {
     
-    if (isGroup || !isAiEnabled) return { isScheduling: false, response: null };
+    if (isGroup || !isAiEnabled) return { isScheduling: false, isCancelling: false, response: null };
 
     try {
         const model = genAI.getGenerativeModel({ model: MODEL_NAME });
@@ -59,9 +59,9 @@ export const analyzeMessage = async (
         Sua missão é realizar e gerenciar agendamentos baseando-se no histórico.
 
         REGRAS DE OURO:
-        1. IDENTIFICAÇÃO: No início do atendimento (primeira resposta após a ativação), peça educadamente o NOME COMPLETO do cliente. Não conclua agendamentos sem o nome.
-        2. CANCELAMENTO: Se o cliente quiser cancelar ou desmarcar, confirme a intenção e peça o nome para localizar no sistema (mesmo que você não tenha acesso direto ao banco de cancelamentos, responda de forma humanizada que irá processar).
-        3. CONTEXTO: Se o cliente escolher um dia (ex: "amanhã") e depois apenas o horário, calcule a data correta.
+        1. IDENTIFICAÇÃO: No início do atendimento, peça educadamente o NOME COMPLETO do cliente. Não conclua agendamentos sem o nome.
+        2. CANCELAMENTO: Se o cliente quiser cancelar ou desmarcar um horário, identifique essa intenção e retorne isCancelling como true.
+        3. CONTEXTO: Se o cliente escolher um dia e depois apenas o horário, calcule a data correta.
         4. NÃO USE EMOJIS e seja direta, mas gentil.
 
         CONTEXTO DO SISTEMA:
@@ -78,8 +78,9 @@ export const analyzeMessage = async (
 
         Responda obrigatoriamente neste formato JSON:
         {
-            "thinking": "Análise do que o cliente quer e se já disse o nome",
-            "isScheduling": boolean (true apenas se tiver DATA, HORA e NOME confirmados),
+            "thinking": "Análise do que o cliente quer e se ele deseja cancelar ou agendar",
+            "isScheduling": boolean (true apenas se tiver DATA, HORA e NOME confirmados para um NOVO agendamento),
+            "isCancelling": boolean (true se o cliente expressar desejo de cancelar ou desmarcar),
             "clientName": "Nome extraído do texto" | null,
             "date": "YYYY-MM-DDTHH:mm:ss" | null,
             "response": "Sua resposta humanizada para o cliente"
@@ -97,16 +98,17 @@ export const analyzeMessage = async (
             const parsed = JSON.parse(text);
             return {
                 isScheduling: parsed.isScheduling,
+                isCancelling: parsed.isCancelling || false,
                 clientName: parsed.clientName,
                 date: parsed.date,
                 response: parsed.response
             };
         } catch (e) {
-            return { isScheduling: false, response: "Perdão, não entendi bem. Como posso te ajudar com seu agendamento?" };
+            return { isScheduling: false, isCancelling: false, response: "Perdão, não entendi bem. Como posso te ajudar com seu agendamento?" };
         }
 
     } catch (error: any) {
         console.error("Erro no processamento da IA:", error);
-        return { isScheduling: false, response: null };
+        return { isScheduling: false, isCancelling: false, response: null };
     }
 };
