@@ -12,8 +12,8 @@ import qrcode from 'qrcode';
 import { Response } from 'express';
 import { createClient } from '@supabase/supabase-js';
 
-import { analyzeMessage } from './ai';
-import { checkAvailability, createEvent, getBusySlots } from './calendar';
+import { analyzeMessage, hasSchedulingIntent } from './ai';
+import { checkAvailability, createEvent, getBusySlots, findEventByPhone, deleteEvent } from './calendar';
 
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 export const sessions: Record<string, any> = {};
@@ -28,7 +28,7 @@ interface ChatContext {
 }
 
 const memoryCache: Record<string, ChatContext> = {};
-const SESSION_EXPIRATION = 10 * 60 * 60 * 1000; // 10 Horas (Conforme solicitado)
+const SESSION_EXPIRATION = 10 * 60 * 60 * 1000; // 10 Horas
 const MAX_HISTORY = 14; // Garante as últimas 7 mensagens do cliente + 7 da Lucy
 
 export async function disconnectWhatsApp(email: string) {
@@ -155,18 +155,26 @@ export async function startWhatsApp(email: string, res: Response | null) {
         const { data: p } = await supabase.from('profiles').select('*').eq('email', email).single();
         if (!p || !p.has_paid || !p.is_ai_enabled) return;
 
-        // --- 🧠 GESTÃO DE MEMÓRIA ATUALIZADA ---
-        if (!memoryCache[cacheKey] || (now - memoryCache[cacheKey].lastUpdate > SESSION_EXPIRATION)) {
-            console.log(`🧹 Limpando contexto antigo (10h) ou criando novo para ${cacheKey}`);
+        // --- 🚪 PORTÃO DE ENTRADA & ATIVAÇÃO INTELIGENTE ---
+        const sessionExists = !!memoryCache[cacheKey];
+        const isExpired = sessionExists && (now - memoryCache[cacheKey].lastUpdate > SESSION_EXPIRATION);
+        const activeSession = sessionExists && !isExpired;
+
+        // FEATURE: Ignora "Oi" sem intenção se não houver atendimento ativo para economizar API
+        if (!activeSession && !hasSchedulingIntent(textMessage)) {
+            return; 
+        }
+
+        // --- 🧠 GESTÃO DE MEMÓRIA ---
+        if (!activeSession) {
+            console.log(`🎯 [ATIVADO] Intenção detectada para ${cacheKey}.`);
             memoryCache[cacheKey] = { lastUpdate: now, messages: [] };
         }
 
         memoryCache[cacheKey].lastUpdate = now;
         memoryCache[cacheKey].messages.push({ role: 'user', content: textMessage });
 
-        // Seleciona as últimas 14 mensagens (7 do cliente + 7 da Lucy)
         const currentHistory = memoryCache[cacheKey].messages.slice(-MAX_HISTORY);
-
         const formattedHistory = currentHistory
             .map(h => `${h.role === 'user' ? 'Cliente' : 'Lucy'}: ${h.content}`)
             .join('\n');
@@ -179,12 +187,36 @@ export async function startWhatsApp(email: string, res: Response | null) {
             service_duration: p.service_duration
         });
 
+        // --- 🗑️ LÓGICA DE CANCELAMENTO REAL (GOOGLE CALENDAR) ---
+        if (aiResult.isCancelling) {
+            const clientPhone = remoteJid.split('@')[0];
+            const event = await findEventByPhone(email, clientPhone);
+
+            if (event) {
+                const success = await deleteEvent(email, event.id);
+                if (success) {
+                    const eventDate = new Date(event.start.dateTime).toLocaleString('pt-BR');
+                    await sock.sendMessage(remoteJid, { 
+                        text: `Perfeito. Localizei seu agendamento para ${eventDate} e ele já foi cancelado conforme solicitado.` 
+                    });
+                    console.log(`🗑️ Resetando memória após cancelamento: ${cacheKey}`);
+                    delete memoryCache[cacheKey]; // Mata a memória após concluir a missão
+                    return;
+                }
+            } else {
+                await sock.sendMessage(remoteJid, { 
+                    text: "Não encontrei nenhum agendamento futuro vinculado ao seu número para realizar o cancelamento automático." 
+                });
+                return;
+            }
+        }
+
+        // --- 💬 RESPOSTA DA IA ---
         if (aiResult.response) {
           try {
               await sock.sendMessage(remoteJid, { text: aiResult.response });
               memoryCache[cacheKey].messages.push({ role: 'assistant', content: aiResult.response });
               
-              // Mantém o array da memória limpo
               if (memoryCache[cacheKey].messages.length > MAX_HISTORY) {
                   memoryCache[cacheKey].messages = memoryCache[cacheKey].messages.slice(-MAX_HISTORY);
               }
@@ -195,11 +227,12 @@ export async function startWhatsApp(email: string, res: Response | null) {
           }
         }
 
-        // --- 🎯 RESET PÓS-AGENDAMENTO ---
+        // --- 🎯 FINALIZAÇÃO PÓS-AGENDAMENTO ---
         if (aiResult.isScheduling && aiResult.date) {
             const isFree = await checkAvailability(email, aiResult.date, p.service_duration);
             if (isFree) {
-                const clientName = msg.pushName || "Cliente WhatsApp";
+                // FEATURE: Prioriza o nome capturado pela IA no chat
+                const clientName = aiResult.clientName || msg.pushName || "Cliente WhatsApp";
                 const clientPhone = remoteJid.split('@')[0];
                 const created = await createEvent(email, clientName, clientPhone, aiResult.date, p.service_duration);
                 
@@ -209,7 +242,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
                     }).eq('email', email);
 
                     console.log(`✅ Agendamento concluído. Resetando memória de ${cacheKey}.`);
-                    delete memoryCache[cacheKey];
+                    delete memoryCache[cacheKey]; // Limpa a memória para não responder "Obrigado"
                 }
             }
         }
