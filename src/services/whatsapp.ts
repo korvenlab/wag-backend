@@ -18,6 +18,10 @@ import { checkAvailability, createEvent, getBusySlots, findEventByPhone, deleteE
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 export const sessions: Record<string, any> = {};
 
+/**
+ * 🧠 MEMÓRIA RAM VOLÁTIL (SaaS Ready)
+ * Configurada para 10h de inatividade e histórico de 7 trocas completas.
+ */
 interface ChatContext {
   lastUpdate: number;
   messages: { role: 'user' | 'assistant', content: string }[];
@@ -222,8 +226,8 @@ export async function startWhatsApp(email: string, res: Response | null) {
         if (aiResult.isScheduling && aiResult.date) {
             const isFree = await checkAvailability(email, aiResult.date, p.service_duration);
             if (isFree) {
-                // MODIFICAÇÃO: Priorizamos o PushName já que não pedimos mais o nome no chat
-                const clientName = msg.pushName || aiResult.clientName || "Cliente WhatsApp";
+                // MODIFICAÇÃO: Removido aiResult.clientName para corrigir erro TS2339
+                const clientName = msg.pushName || "Cliente WhatsApp";
                 const clientPhone = remoteJid.split('@')[0];
                 const created = await createEvent(email, clientName, clientPhone, aiResult.date, p.service_duration);
                 
