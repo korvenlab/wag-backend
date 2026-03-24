@@ -47,8 +47,7 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
   }
 });
 
-// --- 2. ROTAS DE AUTENTICAÇÃO GOOGLE (RESTAURADAS) ---
-// FEATURE: Gera a URL para o usuário clicar e autorizar a agenda
+// --- 2. ROTAS DE AUTENTICAÇÃO GOOGLE (OAUTH DIRETO) ---
 app.get('/api/auth/google/url', (req: Request, res: Response) => {
   const { email } = req.query;
   if (!email) return res.status(400).json({ error: 'Email necessário' });
@@ -56,16 +55,15 @@ app.get('/api/auth/google/url', (req: Request, res: Response) => {
   res.json({ url });
 });
 
-// FEATURE: Recebe o código do Google e salva os tokens no Supabase
 app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
   const { code, state } = req.query;
   if (!code) return res.status(400).send('Sem código de autorização.');
 
   try {
     const tokens = await getTokensFromCode(code as string);
-    const userEmail = (state as string); // O 'state' carrega o e-mail do lojista
+    const userEmail = (state as string);
 
-    const { error } = await supabase
+    await supabase
       .from('profiles')
       .update({ 
         googleAuth: {
@@ -76,11 +74,8 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
         }
       }).eq('email', userEmail.toLowerCase().trim());
 
-    if (error) throw error;
-
-    res.send('<h1>✅ Agenda Conectada!</h1><p>Pode fechar esta janela.</p><script>setTimeout(()=>window.close(),2500)</script>');
+    res.send('<h1>✅ Agenda Conectada!</h1><script>setTimeout(()=>window.close(),2500)</script>');
   } catch (error: any) {
-    console.error("❌ Erro no Callback Google:", error.message);
     res.status(500).send("Erro ao vincular conta Google.");
   }
 });
@@ -104,21 +99,37 @@ app.post('/api/settings/store', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-// --- 4. AUTH SYNC (Login inicial) ---
+// --- 4. AUTH SYNC (Login inicial com salvamento de Tokens) ---
+// FEATURE: Agora recebe e estrutura o objeto googleAuth completo vindo do Frontend
 app.post('/api/auth/sync', async (req: Request, res: Response) => {
-  const { email, id } = req.body;
-  if (!email || !id) return res.status(400).json({ error: 'Dados insuficientes' });
+  const { id, email, accessToken, refreshToken, expiresAt } = req.body;
+  
+  if (!email || !id) return res.status(400).json({ error: 'ID e Email são obrigatórios' });
 
   try {
+    // Montagem do objeto JSONB para a coluna googleAuth
+    const googleAuthData = accessToken ? {
+      updatedAt: new Date().toISOString(),
+      expiryDate: expiresAt ? Number(expiresAt) * 1000 : null,
+      accessToken,
+      refreshToken: refreshToken || null
+    } : undefined;
+
     const { data, error } = await supabase
       .from('profiles')
-      .upsert({ id, email: String(email).trim() }, { onConflict: 'email' })
+      .upsert({ 
+        id, 
+        email: String(email).trim().toLowerCase(),
+        // Se houver googleAuthData, ele atualiza; se não houver, mantém o que está lá
+        ...(googleAuthData && { googleAuth: googleAuthData })
+      }, { onConflict: 'email' })
       .select()
       .single();
 
     if (error) throw error;
     res.json({ ok: true, user: data });
-  } catch (err) {
+  } catch (err: any) {
+    console.error("❌ Erro na sincronização:", err.message);
     res.status(500).json({ error: 'Erro na sincronização' });
   }
 });
