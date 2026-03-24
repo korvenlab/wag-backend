@@ -20,11 +20,16 @@ export const sessions: Record<string, any> = {};
 
 /**
  * 🧠 MEMÓRIA RAM VOLÁTIL (SaaS Ready)
- * Armazena o contexto das conversas sem lotar o banco de dados.
- * Chave: "email_do_lojista:jid_do_cliente"
+ * Configurada para 10h de inatividade e histórico de 7 trocas completas.
  */
-const memoryCache: Record<string, { lastUpdate: number, messages: { role: string, content: string }[] }> = {};
-const SESSION_EXPIRATION = 24 * 60 * 60 * 1000; // 24 Horas
+interface ChatContext {
+  lastUpdate: number;
+  messages: { role: 'user' | 'assistant', content: string }[];
+}
+
+const memoryCache: Record<string, ChatContext> = {};
+const SESSION_EXPIRATION = 10 * 60 * 60 * 1000; // 10 Horas (Conforme solicitado)
+const MAX_HISTORY = 14; // Garante as últimas 7 mensagens do cliente + 7 da Lucy
 
 export async function disconnectWhatsApp(email: string) {
   try {
@@ -55,7 +60,6 @@ export async function disconnectWhatsApp(email: string) {
 export async function startWhatsApp(email: string, res: Response | null) {
   try {
     if (sessions[email]) {
-        console.log(`🧹 Limpando processo antigo do bot para: ${email}`);
         sessions[email].ev.removeAllListeners();
         try { sessions[email].ws.close(); } catch(e) {}
         delete sessions[email];
@@ -76,7 +80,6 @@ export async function startWhatsApp(email: string, res: Response | null) {
     const credsFilePath = path.join(sessionDir, 'creds.json');
 
     if (!fs.existsSync(credsFilePath) && profile?.whatsapp_session) {
-      console.log(`📥 [Supabase] Restaurando credenciais para: ${email}`);
       fs.writeFileSync(credsFilePath, JSON.stringify(profile.whatsapp_session));
     }
 
@@ -107,7 +110,6 @@ export async function startWhatsApp(email: string, res: Response | null) {
           }
         }
       } catch (parseError) {
-        console.error(`⚠️ Erro ao processar credenciais de ${email}:`, parseError);
         if (fs.existsSync(credsFilePath)) fs.unlinkSync(credsFilePath);
       }
     });
@@ -147,28 +149,25 @@ export async function startWhatsApp(email: string, res: Response | null) {
       if (!textMessage) return;
 
       const now = Date.now();
-      const cacheKey = `${email}:${remoteJid}`; // Isolamento total por Loja e Cliente
+      const cacheKey = `${email}:${remoteJid}`; 
 
       try {
         const { data: p } = await supabase.from('profiles').select('*').eq('email', email).single();
         if (!p || !p.has_paid || !p.is_ai_enabled) return;
 
-        // --- 🧠 LÓGICA DE GESTÃO DE CONTEXTO ---
-        if (memoryCache[cacheKey]) {
-            const timeSinceLastMsg = now - memoryCache[cacheKey].lastUpdate;
-            // Reset por tempo (24h)
-            if (timeSinceLastMsg > SESSION_EXPIRATION) {
-                memoryCache[cacheKey] = { lastUpdate: now, messages: [] };
-            }
-        } else {
+        // --- 🧠 GESTÃO DE MEMÓRIA ATUALIZADA ---
+        if (!memoryCache[cacheKey] || (now - memoryCache[cacheKey].lastUpdate > SESSION_EXPIRATION)) {
+            console.log(`🧹 Limpando contexto antigo (10h) ou criando novo para ${cacheKey}`);
             memoryCache[cacheKey] = { lastUpdate: now, messages: [] };
         }
 
         memoryCache[cacheKey].lastUpdate = now;
         memoryCache[cacheKey].messages.push({ role: 'user', content: textMessage });
 
-        const formattedHistory = memoryCache[cacheKey].messages
-            .slice(-10)
+        // Seleciona as últimas 14 mensagens (7 do cliente + 7 da Lucy)
+        const currentHistory = memoryCache[cacheKey].messages.slice(-MAX_HISTORY);
+
+        const formattedHistory = currentHistory
             .map(h => `${h.role === 'user' ? 'Cliente' : 'Lucy'}: ${h.content}`)
             .join('\n');
 
@@ -183,11 +182,11 @@ export async function startWhatsApp(email: string, res: Response | null) {
         if (aiResult.response) {
           try {
               await sock.sendMessage(remoteJid, { text: aiResult.response });
-              // Salva resposta da Lucy na RAM para continuidade do diálogo
               memoryCache[cacheKey].messages.push({ role: 'assistant', content: aiResult.response });
               
-              if (memoryCache[cacheKey].messages.length > 20) {
-                  memoryCache[cacheKey].messages = memoryCache[cacheKey].messages.slice(-20);
+              // Mantém o array da memória limpo
+              if (memoryCache[cacheKey].messages.length > MAX_HISTORY) {
+                  memoryCache[cacheKey].messages = memoryCache[cacheKey].messages.slice(-MAX_HISTORY);
               }
 
               await supabase.from('profiles').update({ messages_answered: (p.messages_answered || 0) + 1 }).eq('email', email);
@@ -196,7 +195,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
           }
         }
 
-        // --- 🎯 MISSÃO CUMPRIDA: RESET APÓS AGENDAMENTO ---
+        // --- 🎯 RESET PÓS-AGENDAMENTO ---
         if (aiResult.isScheduling && aiResult.date) {
             const isFree = await checkAvailability(email, aiResult.date, p.service_duration);
             if (isFree) {
@@ -209,8 +208,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
                         appointments_count: (p.appointments_count || 0) + 1 
                     }).eq('email', email);
 
-                    // Limpa a memória apenas após o agendamento concluído com sucesso
-                    console.log(`✅ Agendamento finalizado para ${cacheKey}. Resetando contexto.`);
+                    console.log(`✅ Agendamento concluído. Resetando memória de ${cacheKey}.`);
                     delete memoryCache[cacheKey];
                 }
             }
