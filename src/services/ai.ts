@@ -6,13 +6,21 @@ dotenv.config();
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite-preview";
 
-const shouldIgnoreMessage = (message: string): boolean => {
-    if (!message) return true;
+/**
+ * 🚪 PORTÃO DE ENTRADA (Economia de API)
+ * Verifica se a mensagem inicial tem intenção de agendamento ou cancelamento.
+ */
+export const hasSchedulingIntent = (message: string): boolean => {
+    if (!message) return false;
     const lowerMsg = message.toLowerCase().trim();
-    const schedulingKeywords = ['horário', 'horario', 'agendar', 'marcar', 'vaga', 'disponível', 'disponivel', 'amanhã', 'amanha', 'hoje', 'dia', 'agenda', 'reservar', 'sessão', 'marcado'];
-    const hasKeyword = schedulingKeywords.some(keyword => lowerMsg.includes(keyword));
+    const keywords = [
+        'horário', 'horario', 'agendar', 'marcar', 'vaga', 'disponível', 
+        'disponivel', 'amanhã', 'amanha', 'hoje', 'agenda', 'reservar', 
+        'sessão', 'marcado', 'cancelar', 'desmarcar', 'mudar', 'trocar'
+    ];
+    const hasKeyword = keywords.some(keyword => lowerMsg.includes(keyword));
     const hasNumbers = /\d/.test(lowerMsg);
-    return !hasKeyword && !hasNumbers;
+    return hasKeyword || hasNumbers;
 };
 
 export const analyzeMessage = async (
@@ -29,7 +37,6 @@ export const analyzeMessage = async (
 ) => {
     
     if (isGroup || !isAiEnabled) return { isScheduling: false, response: null };
-    if (shouldIgnoreMessage(currentMessage)) return { isScheduling: false, response: null };
 
     try {
         const model = genAI.getGenerativeModel({ model: MODEL_NAME });
@@ -42,25 +49,25 @@ export const analyzeMessage = async (
         const diaAtualNome = diasSemanaMap[brDate.getDay()];
 
         const generationConfig = {
-            temperature: 0, // Precisão máxima para evitar erros de data
+            temperature: 0, 
             maxOutputTokens: 500, 
             responseMimeType: "application/json",
         };
 
         const prompt = `
         Você é a Lucy, assistente virtual humanizada da "${dbRow.store_name}".
-        Sua missão é realizar agendamentos baseando-se estritamente no histórico de conversa.
+        Sua missão é realizar e gerenciar agendamentos baseando-se no histórico.
 
-        REGRAS DE OURO DE CONTEXTO:
-        1. Se o histórico mostra que o cliente escolheu uma data (ex: "sexta-feira") e na mensagem atual ele disse apenas um horário (ex: "as 10h"), você DEVE calcular a data final para essa sexta-feira específica.
-        2. Nunca assuma que "9h" é hoje se houver uma data diferente pendente no histórico.
-        3. Se o cliente mudar de ideia no histórico, a última data mencionada é a que vale.
-        4. NÃO USE EMOJIS.
+        REGRAS DE OURO:
+        1. IDENTIFICAÇÃO: No início do atendimento (primeira resposta após a ativação), peça educadamente o NOME COMPLETO do cliente. Não conclua agendamentos sem o nome.
+        2. CANCELAMENTO: Se o cliente quiser cancelar ou desmarcar, confirme a intenção e peça o nome para localizar no sistema (mesmo que você não tenha acesso direto ao banco de cancelamentos, responda de forma humanizada que irá processar).
+        3. CONTEXTO: Se o cliente escolher um dia (ex: "amanhã") e depois apenas o horário, calcule a data correta.
+        4. NÃO USE EMOJIS e seja direta, mas gentil.
 
         CONTEXTO DO SISTEMA:
         - Hoje é: ${diaAtualNome}, ${dataFormatadaBR} às ${currentTimeBR}.
         - Horários da Loja: ${JSON.stringify(dbRow.working_hours)}
-        - Slots já ocupados: ${busySlots.length > 0 ? busySlots.join(", ") : "Nenhum"}.
+        - Slots ocupados: ${busySlots.length > 0 ? busySlots.join(", ") : "Nenhum"}.
         - Duração: ${dbRow.service_duration} minutos.
 
         HISTÓRICO RECENTE:
@@ -71,8 +78,9 @@ export const analyzeMessage = async (
 
         Responda obrigatoriamente neste formato JSON:
         {
-            "thinking": "Análise curta do histórico para definir a data correta",
-            "isScheduling": boolean (true se você tem data e hora exatas para marcar),
+            "thinking": "Análise do que o cliente quer e se já disse o nome",
+            "isScheduling": boolean (true apenas se tiver DATA, HORA e NOME confirmados),
+            "clientName": "Nome extraído do texto" | null,
             "date": "YYYY-MM-DDTHH:mm:ss" | null,
             "response": "Sua resposta humanizada para o cliente"
         }`;
@@ -87,14 +95,14 @@ export const analyzeMessage = async (
 
         try {
             const parsed = JSON.parse(text);
-            // Retornamos apenas o que o sistema precisa, descartando o "thinking"
             return {
                 isScheduling: parsed.isScheduling,
+                clientName: parsed.clientName,
                 date: parsed.date,
                 response: parsed.response
             };
         } catch (e) {
-            return { isScheduling: false, response: "Perdão, não entendi bem. Para qual dia e horário deseja marcar?" };
+            return { isScheduling: false, response: "Perdão, não entendi bem. Como posso te ajudar com seu agendamento?" };
         }
 
     } catch (error: any) {
