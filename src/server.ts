@@ -17,7 +17,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-// 1. Configuração de CORS
+// 1. Configuração de CORS (Essencial para o Frontend conseguir salvar configurações)
 app.use(cors({
   origin: true, 
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -47,16 +47,20 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
   }
 });
 
-// --- 2. ROTAS DE AUTENTICAÇÃO GOOGLE (OAUTH DIRETO) ---
+// --- 2. ROTAS DE AUTENTICAÇÃO GOOGLE (OAUTH CORRIGIDO) ---
 app.get('/api/auth/google/url', (req: Request, res: Response) => {
   const { email } = req.query;
   if (!email) return res.status(400).json({ error: 'Email necessário' });
   
-  // O state passa o email para ser recuperado no callback
+  // O state passa o email para ser recuperado no callback e salvar no perfil correto
   const url = generateAuthUrl(String(email).toLowerCase().trim());
   res.json({ url });
 });
 
+/**
+ * IMPORTANTE: No Google Cloud Console, a URI de redirecionamento deve ser:
+ * https://wag-backend.onrender.com/api/auth/google/callback
+ */
 app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
   const { code, state } = req.query; // 'state' contém o email do usuário
   if (!code) return res.status(400).send('Sem código de autorização.');
@@ -65,7 +69,7 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
     const tokens = await getTokensFromCode(code as string);
     const userEmail = String(state).toLowerCase().trim();
 
-    // Estrutura o objeto JSONB para a coluna googleAuth conforme esperado pela Lucy
+    // Estrutura o objeto JSONB para a coluna googleAuth exatamente como os serviços de calendário esperam
     const googleAuthData = {
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token,
@@ -82,23 +86,26 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
 
     res.send(`
       <div style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-        <h1 style="color: #10b981;">✅ Agenda Conectada!</h1>
-        <p>A Lucy agora tem acesso ao seu calendário. Você já pode fechar esta janela.</p>
+        <h1 style="color: #10b981;">✅ Agenda Conectada com Sucesso!</h1>
+        <p>A Lucy já pode acessar seu calendário. Esta janela fechará automaticamente.</p>
         <script>setTimeout(() => window.close(), 3000)</script>
       </div>
     `);
   } catch (error: any) {
     console.error("❌ Erro no Callback Google:", error.message);
-    res.status(500).send("Erro ao vincular conta Google. Tente novamente no painel.");
+    res.status(500).send("Erro ao vincular conta Google. Verifique se o GOOGLE_CLIENT_SECRET está correto no Render.");
   }
 });
 
 // --- 3. CONFIGURAÇÕES (IA, Agenda e Loja) ---
 app.post('/api/settings/ai', async (req: Request, res: Response) => {
-  const { email, is_ai_enabled } = req.body;
+  // Verificação dupla para aceitar 'aiEnabled' (frontend) ou 'is_ai_enabled' (banco)
+  const { email, aiEnabled, is_ai_enabled } = req.body;
   const userEmail = String(email).toLowerCase().trim();
+  const valueToSave = aiEnabled !== undefined ? aiEnabled : is_ai_enabled;
   
-  await supabase.from('profiles').update({ is_ai_enabled }).eq('email', userEmail);
+  const { error } = await supabase.from('profiles').update({ is_ai_enabled: valueToSave }).eq('email', userEmail);
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
 
@@ -106,10 +113,11 @@ app.post('/api/settings/hours', async (req: Request, res: Response) => {
   const { email, workingHours, serviceDuration } = req.body;
   const userEmail = String(email).toLowerCase().trim();
 
-  await supabase.from('profiles')
+  const { error } = await supabase.from('profiles')
     .update({ working_hours: workingHours, service_duration: serviceDuration })
     .eq('email', userEmail);
     
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
 
@@ -117,11 +125,12 @@ app.post('/api/settings/store', async (req: Request, res: Response) => {
   const { email, storeName } = req.body;
   const userEmail = String(email).toLowerCase().trim();
 
-  await supabase.from('profiles').update({ store_name: storeName }).eq('email', userEmail);
+  const { error } = await supabase.from('profiles').update({ store_name: storeName }).eq('email', userEmail);
+  if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
 
-// --- 4. AUTH SYNC (Login inicial com proteção de Refresh Token) ---
+// --- 4. AUTH SYNC (Proteção de Refresh Token no Login) ---
 app.post('/api/auth/sync', async (req: Request, res: Response) => {
   const { id, email, accessToken, refreshToken, expiresAt } = req.body;
   
@@ -129,7 +138,7 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
   const userEmail = String(email).trim().toLowerCase();
 
   try {
-    // 🔍 Busca perfil atual para não perder o refreshToken se o Google não enviar de novo
+    // 🔍 Busca o perfil existente para não apagar o refreshToken antigo (o Google só manda o refresh uma vez)
     const { data: currentProfile } = await supabase
       .from('profiles')
       .select('googleAuth')
@@ -140,7 +149,7 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
       updatedAt: new Date().toISOString(),
       expiryDate: expiresAt ? Number(expiresAt) * 1000 : (currentProfile?.googleAuth?.expiryDate || null),
       accessToken,
-      // Preserva o refreshToken antigo se o novo vier vazio (comum em logins subsequentes)
+      // Se o login atual não trouxer refreshToken, mantém o que já estava salvo no banco
       refreshToken: refreshToken || currentProfile?.googleAuth?.refreshToken || null
     } : undefined;
 
