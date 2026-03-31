@@ -1,5 +1,13 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from 'dotenv';
+import dayjs from 'dayjs';
+import timezone from 'dayjs/plugin/timezone';
+import utc from 'dayjs/plugin/utc';
+
+// Configuração do DayJS para o Brasil
+dayjs.extend(utc);
+dayjs.extend(timezone);
+dayjs.tz.setDefault("America/Sao_Paulo");
 
 dotenv.config();
 
@@ -9,11 +17,7 @@ const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite-preview";
 export const hasSchedulingIntent = (message: string): boolean => {
     if (!message) return false;
     const lowerMsg = message.toLowerCase().trim();
-    const keywords = [
-        'horário', 'horario', 'agendar', 'marcar', 'vaga', 'disponível', 
-        'disponivel', 'amanhã', 'amanha', 'hoje', 'agenda', 'reservar', 
-        'sessão', 'marcado', 'cancelar', 'desmarcar', 'mudar', 'trocar'
-    ];
+    const keywords = ['horário', 'horario', 'agendar', 'marcar', 'vaga', 'disponível', 'disponivel', 'amanhã', 'amanha', 'hoje', 'agenda', 'reservar', 'sessão', 'marcado', 'cancelar', 'desmarcar', 'mudar', 'trocar'];
     return keywords.some(keyword => lowerMsg.includes(keyword)) || /\d/.test(lowerMsg);
 };
 
@@ -35,13 +39,11 @@ export const analyzeMessage = async (
     try {
         const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
-        const date = new Date();
-        // Garantindo que o servidor pegue a data exata de SP
-        const brDate = new Date(date.toLocaleString("en-US", {timeZone: "America/Sao_Paulo"}));
-        const currentTimeBR = brDate.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-        const dataFormatadaBR = brDate.toLocaleDateString('pt-BR');
-        const diasSemanaMap = ["Domingo", "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado"];
-        const diaAtualNome = diasSemanaMap[brDate.getDay()];
+        // Data atual exata no Brasil usando DayJS
+        const agoraBR = dayjs().tz("America/Sao_Paulo");
+        const currentTimeBR = agoraBR.format('HH:mm');
+        const dataFormatadaBR = agoraBR.format('DD/MM/YYYY');
+        const diaAtualNome = agoraBR.format('dddd'); // Retorna o nome em português se configurado, ou use o map abaixo
 
         const generationConfig = {
             temperature: 0, 
@@ -50,36 +52,30 @@ export const analyzeMessage = async (
         };
 
         const prompt = `
-        Você é a Lucy, assistente virtual da "${dbRow.store_name}".
-        Sua missão é realizar agendamentos com precisão absoluta.
+        Você é a Lucy, assistente da "${dbRow.store_name}".
+        Extraia a intenção de agendamento.
 
-        REGRAS CRÍTICAS DE FUSO HORÁRIO E DATA (GMT-3):
-        1. NÃO CONVERTA PARA UTC: O sistema já opera no horário de Brasília. Se o cliente pedir "10:00", o valor no JSON deve ser exatamente "T10:00:00". 
-        2. PROIBIDO SUBTRAIR HORAS: Se você retornar "07:00:00" para um pedido de "10:00", o agendamento sairá errado. Mantenha o valor literal pedido pelo cliente.
-        3. FORMATO: "YYYY-MM-DDTHH:mm:ss". Exemplo: Se hoje é dia 15 e ele pede às 14h, use "2026-03-15T14:00:00".
+        REGRAS DE EXTRAÇÃO:
+        - Se o cliente quer marcar, extraia a DATA (YYYY-MM-DD) e a HORA (HH:mm).
+        - NÃO tente converter fusos. Apenas relate o que o cliente pediu.
+        - Hoje é ${diaAtualNome}, ${dataFormatadaBR} às ${currentTimeBR}.
 
-        DISPONIBILIDADE:
-        - Slots ocupados: ${busySlots.join(", ") || "Nenhum"}.
-        - Horários da Loja: ${JSON.stringify(dbRow.working_hours)}
-        - Se o horário pedido estiver ocupado, NÃO confirme. Informe que está cheio e sugira o próximo horário livre dentro dos turnos da loja.
-
-        CONTEXTO ATUAL:
-        - Hoje é: ${diaAtualNome}, ${dataFormatadaBR} às ${currentTimeBR}.
-        - Duração: ${dbRow.service_duration} minutos.
+        OCUPADOS: ${busySlots.join(", ")}
+        HORÁRIOS DA LOJA: ${JSON.stringify(dbRow.working_hours)}
 
         HISTÓRICO:
-        ${history || "Início de conversa."}
+        ${history}
 
-        MENSAGEM DO CLIENTE:
+        MENSAGEM:
         "${currentMessage}"
 
-        Responda obrigatoriamente neste formato JSON:
+        Responda em JSON:
         {
-            "thinking": "Análise da data e hora literal sem conversão de fuso.",
             "isScheduling": boolean,
             "isCancelling": boolean,
-            "date": "YYYY-MM-DDTHH:mm:ss" | null,
-            "response": "Sua resposta humanizada e sem emojis"
+            "extractedDate": "YYYY-MM-DD",
+            "extractedTime": "HH:mm",
+            "response": "Sua resposta humanizada"
         }`;
 
         const result = await model.generateContent({
@@ -88,22 +84,28 @@ export const analyzeMessage = async (
         });
 
         const response = await result.response;
-        let text = response.text().replace(/```json/g, '').replace(/```/g, '').trim();
+        const parsed = JSON.parse(response.text().replace(/```json/g, '').replace(/```/g, '').trim());
 
-        try {
-            const parsed = JSON.parse(text);
-            return {
-                isScheduling: parsed.isScheduling,
-                isCancelling: parsed.isCancelling || false,
-                date: parsed.date,
-                response: parsed.response
-            };
-        } catch (e) {
-            return { isScheduling: false, isCancelling: false, response: "Desculpe, poderia me confirmar novamente o dia e horário?" };
+        let finalIsoDate = null;
+
+        if (parsed.isScheduling && parsed.extractedDate && parsed.extractedTime) {
+            // 🛠️ O PULO DO GATO: Montamos a data usando DayJS travado em SP
+            // Isso evita que o sistema subtraia 3 horas.
+            const rawDate = `${parsed.extractedDate} ${parsed.extractedTime}`;
+            finalIsoDate = dayjs.tz(rawDate, "YYYY-MM-DD HH:mm", "America/Sao_Paulo").format();
+            
+            console.log(`[LUCY] Agendamento solicitado para: ${finalIsoDate}`);
         }
 
+        return {
+            isScheduling: parsed.isScheduling,
+            isCancelling: parsed.isCancelling || false,
+            date: finalIsoDate, // Agora vai com o offset correto (ex: -03:00)
+            response: parsed.response
+        };
+
     } catch (error: any) {
-        console.error("Erro no processamento da IA:", error);
-        return { isScheduling: false, isCancelling: false, response: null };
+        console.error("Erro Lucy AI:", error);
+        return { isScheduling: false, isCancelling: false, response: "Poderia repetir o horário?" };
     }
 };
