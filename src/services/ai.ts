@@ -52,7 +52,7 @@ export const analyzeMessage = async (
         };
 
         const prompt = `
-        Você é a Lucy, assistente da "${dbRow.store_name}".
+        Você é o Wagoo, assistente da "${dbRow.store_name}".
         Extraia a intenção de agendamento.
 
         REGRAS DE EXTRAÇÃO:
