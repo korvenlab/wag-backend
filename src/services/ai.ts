@@ -36,6 +36,7 @@ export const analyzeMessage = async (
         const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
         const date = new Date();
+        // Garantindo que o servidor pegue a data exata de SP
         const brDate = new Date(date.toLocaleString("en-US", {timeZone: "America/Sao_Paulo"}));
         const currentTimeBR = brDate.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
         const dataFormatadaBR = brDate.toLocaleDateString('pt-BR');
@@ -50,20 +51,21 @@ export const analyzeMessage = async (
 
         const prompt = `
         Você é a Lucy, assistente virtual da "${dbRow.store_name}".
-        Sua missão é realizar agendamentos com precisão absoluta e proatividade.
+        Sua missão é realizar agendamentos com precisão absoluta.
 
-        REGRAS DE DISPONIBILIDADE E CONFLITO (CRÍTICO):
-        1. VERIFICAÇÃO DE BUSY SLOTS: Compare o horário que o cliente quer com a lista de "Slots ocupados". Se o horário estiver ocupado ou conflitar com a duração de ${dbRow.service_duration}min de um agendamento existente, você NÃO PODE confirmar.
-        2. PROATIVIDADE EM CONFLITOS: Se o horário estiver ocupado ou fora dos "Horários da Loja", sua resposta DEVE obrigatoriamente:
-           a) Informar educadamente que o horário solicitado já está preenchido ou indisponível.
-           b) Analisar os horários da loja e os slots ocupados para sugerir o PRÓXIMO horário DISPONÍVEL mais próximo para o cliente.
-        3. FUSO HORÁRIO: Use o horário de Brasília (${currentTimeBR}). Se o cliente pede 15:00, a data deve ser exatamente "YYYY-MM-DDT15:00:00". Nunca subtraia 3 horas.
+        REGRAS CRÍTICAS DE FUSO HORÁRIO E DATA (GMT-3):
+        1. NÃO CONVERTA PARA UTC: O sistema já opera no horário de Brasília. Se o cliente pedir "10:00", o valor no JSON deve ser exatamente "T10:00:00". 
+        2. PROIBIDO SUBTRAIR HORAS: Se você retornar "07:00:00" para um pedido de "10:00", o agendamento sairá errado. Mantenha o valor literal pedido pelo cliente.
+        3. FORMATO: "YYYY-MM-DDTHH:mm:ss". Exemplo: Se hoje é dia 15 e ele pede às 14h, use "2026-03-15T14:00:00".
 
-        CONTEXTO DO SISTEMA:
+        DISPONIBILIDADE:
+        - Slots ocupados: ${busySlots.join(", ") || "Nenhum"}.
+        - Horários da Loja: ${JSON.stringify(dbRow.working_hours)}
+        - Se o horário pedido estiver ocupado, NÃO confirme. Informe que está cheio e sugira o próximo horário livre dentro dos turnos da loja.
+
+        CONTEXTO ATUAL:
         - Hoje é: ${diaAtualNome}, ${dataFormatadaBR} às ${currentTimeBR}.
-        - Horários da Loja (Frontend): ${JSON.stringify(dbRow.working_hours)}
-        - Slots ocupados (Google Calendar): ${busySlots.length > 0 ? busySlots.join(", ") : "Nenhum no momento"}.
-        - Duração do Serviço: ${dbRow.service_duration} minutos.
+        - Duração: ${dbRow.service_duration} minutos.
 
         HISTÓRICO:
         ${history || "Início de conversa."}
@@ -73,8 +75,8 @@ export const analyzeMessage = async (
 
         Responda obrigatoriamente neste formato JSON:
         {
-            "thinking": "1. Qual horário foi pedido? 2. Está nos ocupados? 3. Se sim, qual o próximo livre nos horários da loja? 4. Montar resposta negando e oferecendo a nova opção.",
-            "isScheduling": boolean (true apenas se for confirmar um horário que ESTÁ livre e dentro do turno),
+            "thinking": "Análise da data e hora literal sem conversão de fuso.",
+            "isScheduling": boolean,
             "isCancelling": boolean,
             "date": "YYYY-MM-DDTHH:mm:ss" | null,
             "response": "Sua resposta humanizada e sem emojis"
