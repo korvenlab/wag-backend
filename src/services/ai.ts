@@ -6,10 +6,6 @@ dotenv.config();
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite-preview";
 
-/**
- * 🚪 PORTÃO DE ENTRADA (Economia de API)
- * Verifica se a mensagem inicial tem intenção de agendamento ou cancelamento.
- */
 export const hasSchedulingIntent = (message: string): boolean => {
     if (!message) return false;
     const lowerMsg = message.toLowerCase().trim();
@@ -18,9 +14,7 @@ export const hasSchedulingIntent = (message: string): boolean => {
         'disponivel', 'amanhã', 'amanha', 'hoje', 'agenda', 'reservar', 
         'sessão', 'marcado', 'cancelar', 'desmarcar', 'mudar', 'trocar'
     ];
-    const hasKeyword = keywords.some(keyword => lowerMsg.includes(keyword));
-    const hasNumbers = /\d/.test(lowerMsg);
-    return hasKeyword || hasNumbers;
+    return keywords.some(keyword => lowerMsg.includes(keyword)) || /\d/.test(lowerMsg);
 };
 
 export const analyzeMessage = async (
@@ -50,39 +44,40 @@ export const analyzeMessage = async (
 
         const generationConfig = {
             temperature: 0, 
-            maxOutputTokens: 500, 
+            maxOutputTokens: 600, 
             responseMimeType: "application/json",
         };
 
         const prompt = `
-        Você é a Lucy, assistente virtual humanizada da "${dbRow.store_name}".
-        Sua missão é realizar e gerenciar agendamentos baseando-se no histórico.
+        Você é a Lucy, assistente virtual da "${dbRow.store_name}".
+        Sua missão é realizar agendamentos com precisão absoluta e proatividade.
 
-        REGRAS DE OURO:
-        1. AGENDAMENTO: NÃO peça o nome do cliente em nenhuma hipótese. Foque apenas em confirmar a DATA e o HORÁRIO desejado.
-        2. CANCELAMENTO: Se o cliente quiser cancelar ou desmarcar, identifique a intenção e retorne isCancelling como true imediatamente. NÃO peça nome ou documentos para isso.
-        3. CONTEXTO: Use o histórico para calcular datas relativas (ex: se o cliente disse "amanhã" em uma mensagem e "às 10h" na outra).
-        4. TOM DE VOZ: Seja direta, gentil e NÃO use emojis.
+        REGRAS DE DISPONIBILIDADE E CONFLITO (CRÍTICO):
+        1. VERIFICAÇÃO DE BUSY SLOTS: Compare o horário que o cliente quer com a lista de "Slots ocupados". Se o horário estiver ocupado ou conflitar com a duração de ${dbRow.service_duration}min de um agendamento existente, você NÃO PODE confirmar.
+        2. PROATIVIDADE EM CONFLITOS: Se o horário estiver ocupado ou fora dos "Horários da Loja", sua resposta DEVE obrigatoriamente:
+           a) Informar educadamente que o horário solicitado já está preenchido ou indisponível.
+           b) Analisar os horários da loja e os slots ocupados para sugerir o PRÓXIMO horário DISPONÍVEL mais próximo para o cliente.
+        3. FUSO HORÁRIO: Use o horário de Brasília (${currentTimeBR}). Se o cliente pede 15:00, a data deve ser exatamente "YYYY-MM-DDT15:00:00". Nunca subtraia 3 horas.
 
         CONTEXTO DO SISTEMA:
         - Hoje é: ${diaAtualNome}, ${dataFormatadaBR} às ${currentTimeBR}.
-        - Horários da Loja: ${JSON.stringify(dbRow.working_hours)}
-        - Slots ocupados: ${busySlots.length > 0 ? busySlots.join(", ") : "Nenhum"}.
-        - Duração: ${dbRow.service_duration} minutos.
+        - Horários da Loja (Frontend): ${JSON.stringify(dbRow.working_hours)}
+        - Slots ocupados (Google Calendar): ${busySlots.length > 0 ? busySlots.join(", ") : "Nenhum no momento"}.
+        - Duração do Serviço: ${dbRow.service_duration} minutos.
 
-        HISTÓRICO RECENTE:
+        HISTÓRICO:
         ${history || "Início de conversa."}
 
-        MENSAGEM ATUAL:
+        MENSAGEM DO CLIENTE:
         "${currentMessage}"
 
         Responda obrigatoriamente neste formato JSON:
         {
-            "thinking": "Análise rápida da intenção do cliente",
-            "isScheduling": boolean (true apenas se tiver DATA e HORA confirmadas),
-            "isCancelling": boolean (true se o cliente quiser cancelar/desmarcar),
+            "thinking": "1. Qual horário foi pedido? 2. Está nos ocupados? 3. Se sim, qual o próximo livre nos horários da loja? 4. Montar resposta negando e oferecendo a nova opção.",
+            "isScheduling": boolean (true apenas se for confirmar um horário que ESTÁ livre e dentro do turno),
+            "isCancelling": boolean,
             "date": "YYYY-MM-DDTHH:mm:ss" | null,
-            "response": "Sua resposta humanizada para o cliente"
+            "response": "Sua resposta humanizada e sem emojis"
         }`;
 
         const result = await model.generateContent({
@@ -102,7 +97,7 @@ export const analyzeMessage = async (
                 response: parsed.response
             };
         } catch (e) {
-            return { isScheduling: false, isCancelling: false, response: "Para qual dia e horário você deseja marcar?" };
+            return { isScheduling: false, isCancelling: false, response: "Desculpe, poderia me confirmar novamente o dia e horário?" };
         }
 
     } catch (error: any) {
