@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import Stripe from 'stripe';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
+import { pushAdminEvent } from '../services/adminEvents';
 
 dotenv.config();
 const router = express.Router();
@@ -74,6 +75,7 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
           .update({ has_paid: true, is_ai_enabled: true })
           .eq('id', userId);
         console.log(`✅ Pagamento confirmado para o utilizador: ${userId}`);
+        pushAdminEvent('wagoo', 'Pagamento confirmado — assinatura Wagoo ativa', 'online');
       }
       break;
     }
@@ -90,6 +92,7 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
             .update({ has_paid: false, is_ai_enabled: false })
             .eq('id', userId);
           console.log(`🛑 Assinatura cancelada/pendente para o utilizador: ${userId}`);
+          pushAdminEvent('wagoo', 'Assinatura cancelada ou inadimplente', 'degraded');
         }
       }
       break;

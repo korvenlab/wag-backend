@@ -14,6 +14,7 @@ import { createClient } from '@supabase/supabase-js';
 
 import { analyzeMessage, hasSchedulingIntent } from './ai';
 import { checkAvailability, createEvent, getBusySlots, findEventByPhone, deleteEvent } from './calendar';
+import { pushAdminEvent } from './adminEvents';
 
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 export const sessions: Record<string, any> = {};
@@ -50,6 +51,7 @@ export async function disconnectWhatsApp(email: string) {
     }
 
     await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
+    pushAdminEvent('wagoo', 'Sessão WhatsApp encerrada pelo utilizador', 'offline');
     return { success: true };
   } catch (error) {
     console.error('Erro ao desconectar WhatsApp:', error);
@@ -128,12 +130,14 @@ export async function startWhatsApp(email: string, res: Response | null) {
         }
         if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 440 || statusCode === 403) {
           await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
+          pushAdminEvent('wagoo', `Bot WhatsApp desconectado (${email})`, 'offline');
           if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
         } else {
           setTimeout(() => startWhatsApp(email, null), 5000);
         }
       } else if (connection === 'open') {
         console.log(`✅ [ATIVO] Bot online para: ${email}`);
+        pushAdminEvent('wagoo', `Bot WhatsApp conectado (${email})`, 'online');
         if (res && !res.headersSent) res.status(200).json({ message: 'Conectado!' });
       }
     });

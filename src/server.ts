@@ -6,6 +6,8 @@ import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
 
 import stripeRoutes from './routes/stripe';
+import adminDashboardRoutes from './routes/adminDashboard';
+import { pushAdminEvent } from './services/adminEvents';
 import { startWhatsApp, autoReconnectAll, disconnectWhatsApp } from './services/whatsapp';
 import { generateAuthUrl, getTokensFromCode } from './services/googleAuth'; 
 
@@ -21,12 +23,13 @@ const supabase = createClient(
 app.use(cors({
   origin: true, 
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'stripe-signature'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'stripe-signature', 'x-admin-secret'],
   credentials: true 
 }));
 
 app.use('/api/stripe', stripeRoutes);
 app.use(express.json());
+app.use('/api/admin', adminDashboardRoutes);
 
 // --- 1. ROTA DE PERFIL ---
 app.get('/api/user/profile', async (req: Request, res: Response) => {
@@ -189,5 +192,6 @@ app.get('/ping', (req, res) => res.send('pong'));
 
 app.listen(port, '0.0.0.0', () => {
   console.log(`🚀 Wagoo Online na porta ${port}`);
+  pushAdminEvent('core', `API Wagoo inicializada na porta ${port}`, 'online');
   autoReconnectAll().catch(err => console.error("Erro na reconexão automática:", err));
 });
