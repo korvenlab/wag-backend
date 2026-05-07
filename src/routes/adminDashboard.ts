@@ -78,15 +78,36 @@ router.use(requireUpstreamAuth);
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-function parseOrganizationId(req: Request): { ok: true; value: string | null } | { ok: false } {
-  const oid =
+function parseOrganizationFilters(
+  req: Request
+):
+  | { ok: true; organization_id: string | null; organization: string | null }
+  | { ok: false; error: string } {
+  const oidRaw =
     typeof req.query.organization_id === 'string' ? req.query.organization_id.trim() : '';
-  const legacy =
+  const orgRaw =
     typeof req.query.organization === 'string' ? req.query.organization.trim() : '';
-  const candidate = oid || legacy;
-  if (!candidate) return { ok: true, value: null };
-  if (!UUID_RE.test(candidate)) return { ok: false };
-  return { ok: true, value: candidate };
+
+  let organization_id: string | null = null;
+  let organization: string | null = null;
+
+  if (oidRaw) {
+    if (!UUID_RE.test(oidRaw)) return { ok: false, error: 'organization_id deve ser UUID válido.' };
+    organization_id = oidRaw;
+  }
+
+  if (orgRaw) {
+    if (UUID_RE.test(orgRaw)) {
+      if (organization_id && organization_id !== orgRaw) {
+        return { ok: false, error: 'organization e organization_id inconsistentes.' };
+      }
+      if (!organization_id) organization_id = orgRaw;
+    } else {
+      organization = orgRaw;
+    }
+  }
+
+  return { ok: true, organization_id, organization };
 }
 
 function parsePeriodDaysParam(raw: unknown): { ok: true; value: number } | { ok: false } {
@@ -322,7 +343,8 @@ function parseAvendasMetrics(): {
 }
 
 router.get('/dashboard', async (req: Request, res: Response) => {
-  const periodRaw = req.query.period_days ?? req.query.periodDays;
+  try {
+  const periodRaw = req.query.period_days ?? req.query.periodDays ?? req.query.period;
   const chartRaw = req.query.chart_days ?? req.query.chartDays;
 
   const parsedPeriod = parsePeriodDaysParam(periodRaw);
@@ -349,17 +371,12 @@ router.get('/dashboard', async (req: Request, res: Response) => {
   }
   const chart_days = parsedChart.value;
 
-  const parsedOrg = parseOrganizationId(req);
+  const parsedOrg = parseOrganizationFilters(req);
   if (!parsedOrg.ok) {
-    sendApiError(
-      res,
-      400,
-      'VALIDATION_ERROR',
-      'organization_id inválido (UUID esperado).'
-    );
+    sendApiError(res, 400, 'VALIDATION_ERROR', parsedOrg.error);
     return;
   }
-  const organization_id = parsedOrg.value;
+  const { organization_id, organization: organization_label } = parsedOrg;
 
   const now = new Date();
   const nowUnix = Math.floor(now.getTime() / 1000);
@@ -521,6 +538,7 @@ router.get('/dashboard', async (req: Request, res: Response) => {
     gerado_em: nowIso,
     filtros: {
       organization_id,
+      organization: organization_label,
       period_days,
       chart_days,
     },
@@ -571,6 +589,14 @@ router.get('/dashboard', async (req: Request, res: Response) => {
       warnings,
     },
   });
+  } catch (e: unknown) {
+    sendApiError(
+      res,
+      500,
+      'INTERNAL_ERROR',
+      e instanceof Error ? e.message : 'Erro ao montar dashboard.'
+    );
+  }
 });
 
 router.get('/users', async (req: Request, res: Response) => {
