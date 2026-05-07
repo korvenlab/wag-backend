@@ -22,7 +22,8 @@ type ApiErrorCode =
   | 'UNAUTHORIZED'
   | 'VALIDATION_ERROR'
   | 'INTERNAL_ERROR'
-  | 'UNAVAILABLE';
+  | 'UNAVAILABLE'
+  | 'NOT_FOUND';
 
 const JSON_UTF8 = 'application/json; charset=utf-8';
 
@@ -74,6 +75,59 @@ function requireUpstreamAuth(req: Request, res: Response, next: NextFunction): v
 }
 
 router.use(requireUpstreamAuth);
+
+const ADMIN_WINDOW_MS = 60_000;
+const ADMIN_WINDOW_MAX = 120;
+const adminHits = new Map<string, { count: number; resetAt: number }>();
+
+type AdminAuditRow = {
+  actor: string;
+  action: string;
+  target: string;
+  timestamp: string;
+  meta?: Record<string, unknown>;
+};
+
+const adminAudit: AdminAuditRow[] = [];
+const MAX_ADMIN_AUDIT = 500;
+
+function getClientIp(req: Request): string {
+  const xff = req.headers['x-forwarded-for'];
+  const fromHeader = Array.isArray(xff) ? xff[0] : xff;
+  const ip = typeof fromHeader === 'string' ? fromHeader.split(',')[0]?.trim() : undefined;
+  return ip || req.ip || 'unknown';
+}
+
+function getAdminActor(req: Request): string {
+  const actor = req.headers['x-admin-actor'];
+  if (Array.isArray(actor)) return actor[0] || 'admin:unknown';
+  if (typeof actor === 'string' && actor.trim()) return actor.trim();
+  return 'admin:unknown';
+}
+
+function pushAdminAudit(row: AdminAuditRow): void {
+  adminAudit.unshift(row);
+  if (adminAudit.length > MAX_ADMIN_AUDIT) adminAudit.length = MAX_ADMIN_AUDIT;
+}
+
+function adminRateLimit(req: Request, res: Response, next: NextFunction): void {
+  const now = Date.now();
+  const key = getClientIp(req);
+  const prev = adminHits.get(key);
+  if (!prev || now > prev.resetAt) {
+    adminHits.set(key, { count: 1, resetAt: now + ADMIN_WINDOW_MS });
+    next();
+    return;
+  }
+  prev.count += 1;
+  if (prev.count > ADMIN_WINDOW_MAX) {
+    sendApiError(res, 429, 'UNAVAILABLE', 'Rate limit excedido para rotas admin.');
+    return;
+  }
+  next();
+}
+
+router.use(adminRateLimit);
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -259,9 +313,25 @@ async function countSubscriptionsCreatedInRange(
 }
 
 async function fetchAuthUsersAll(): Promise<
-  { id: string; email?: string; last_sign_in_at?: string | null }[]
+  Array<{
+    id: string;
+    email?: string;
+    created_at?: string;
+    last_sign_in_at?: string | null;
+    user_metadata?: Record<string, unknown>;
+    app_metadata?: Record<string, unknown>;
+    banned_until?: string | null;
+  }>
 > {
-  const users: { id: string; email?: string; last_sign_in_at?: string | null }[] = [];
+  const users: Array<{
+    id: string;
+    email?: string;
+    created_at?: string;
+    last_sign_in_at?: string | null;
+    user_metadata?: Record<string, unknown>;
+    app_metadata?: Record<string, unknown>;
+    banned_until?: string | null;
+  }> = [];
   let page = 1;
   const perPage = 1000;
   for (;;) {
@@ -271,7 +341,11 @@ async function fetchAuthUsersAll(): Promise<
     const batch = pageUsers.map((u) => ({
       id: u.id,
       email: u.email ?? undefined,
+      created_at: u.created_at,
       last_sign_in_at: u.last_sign_in_at ?? null,
+      user_metadata: (u.user_metadata || {}) as Record<string, unknown>,
+      app_metadata: (u.app_metadata || {}) as Record<string, unknown>,
+      banned_until: u.banned_until ?? null,
     }));
     users.push(...batch);
     if (batch.length < perPage) break;
@@ -340,6 +414,83 @@ function parseAvendasMetrics(): {
     changeEnv !== undefined && changeEnv !== '' ? Number(changeEnv) : null;
 
   return { volume, changePct, transactionsPerDay, configured };
+}
+
+type AdminUserRow = {
+  id: string;
+  email: string | null;
+  name: string | null;
+  role: string;
+  active: boolean;
+  createdAt: string;
+  lastSignInAt: string | null;
+};
+
+function normalizeAdminUser(
+  authUser: {
+    id: string;
+    email?: string;
+    created_at?: string;
+    last_sign_in_at?: string;
+    user_metadata?: Record<string, unknown>;
+    app_metadata?: Record<string, unknown>;
+    banned_until?: string | null;
+  },
+  profile?: {
+    email?: string | null;
+    store_name?: string | null;
+    role?: string | null;
+    is_active?: boolean | null;
+    deleted_at?: string | null;
+  }
+): AdminUserRow {
+  const role =
+    (profile?.role as string | undefined) ||
+    (authUser.app_metadata?.role as string | undefined) ||
+    (authUser.user_metadata?.role as string | undefined) ||
+    'user';
+
+  const activeFromMeta = authUser.user_metadata?.active;
+  const activeFromProfile = profile?.is_active;
+  const isBanned = !!authUser.banned_until;
+  const deleted = !!profile?.deleted_at || authUser.user_metadata?.deleted === true;
+
+  const active =
+    !isBanned &&
+    !deleted &&
+    (typeof activeFromProfile === 'boolean'
+      ? activeFromProfile
+      : typeof activeFromMeta === 'boolean'
+        ? activeFromMeta
+        : true);
+
+  return {
+    id: authUser.id,
+    email: authUser.email ?? profile?.email ?? null,
+    name:
+      (authUser.user_metadata?.name as string | undefined) ||
+      (profile?.store_name as string | undefined) ||
+      null,
+    role,
+    active,
+    createdAt: authUser.created_at || new Date(0).toISOString(),
+    lastSignInAt: authUser.last_sign_in_at || null,
+  };
+}
+
+async function getUserProfileMap(ids: string[]): Promise<Map<string, Record<string, unknown>>> {
+  const map = new Map<string, Record<string, unknown>>();
+  if (ids.length === 0) return map;
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('id, email, store_name, role, is_active, deleted_at')
+    .in('id', ids);
+  if (error || !data) return map;
+  for (const row of data as unknown as Record<string, unknown>[]) {
+    const id = row.id;
+    if (typeof id === 'string') map.set(id, row);
+  }
+  return map;
 }
 
 router.get('/dashboard', async (req: Request, res: Response) => {
@@ -600,43 +751,208 @@ router.get('/dashboard', async (req: Request, res: Response) => {
 });
 
 router.get('/users', async (req: Request, res: Response) => {
-  const limit = Math.min(Number(req.query.limit) || 200, 500);
-
-  let profiles: {
-    id: string;
-    email: string | null;
-    has_paid: boolean | null;
-    whatsapp_session: unknown;
-    is_ai_enabled: boolean | null;
-  }[] = [];
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+  const search = typeof req.query.search === 'string' ? req.query.search.trim().toLowerCase() : '';
 
   try {
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('id, email, has_paid, whatsapp_session, is_ai_enabled')
-      .order('email', { ascending: true })
-      .limit(limit);
-    if (error) throw error;
-    profiles = data ?? [];
+    const authUsers = await fetchAuthUsersAll();
+    let filtered = authUsers;
+    if (search) {
+      filtered = authUsers.filter((u) => {
+        const email = (u.email || '').toLowerCase();
+        return email.includes(search) || u.id.toLowerCase().includes(search);
+      });
+    }
+
+    const total = filtered.length;
+    const start = (page - 1) * limit;
+    const pageUsers = filtered.slice(start, start + limit);
+    const profileMap = await getUserProfileMap(pageUsers.map((u) => u.id));
+
+    const items = pageUsers.map((u) =>
+      normalizeAdminUser(
+        u as unknown as {
+          id: string;
+          email?: string;
+          created_at?: string;
+          last_sign_in_at?: string;
+          user_metadata?: Record<string, unknown>;
+          app_metadata?: Record<string, unknown>;
+          banned_until?: string | null;
+        },
+        profileMap.get(u.id) as unknown as {
+          email?: string | null;
+          store_name?: string | null;
+          role?: string | null;
+          is_active?: boolean | null;
+          deleted_at?: string | null;
+        }
+      )
+    );
+
+    res.status(200).type(JSON_UTF8).json({
+      ok: true,
+      data: { items, page, limit, total },
+    });
   } catch (e: unknown) {
     sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
+router.get('/users/:id', async (req: Request, res: Response) => {
+  const id = String(req.params.id || '').trim();
+  if (!id) {
+    sendApiError(res, 400, 'VALIDATION_ERROR', 'id é obrigatório.');
     return;
   }
+  try {
+    const { data, error } = await supabase.auth.admin.getUserById(id);
+    if (error || !data?.user) {
+      sendApiError(res, 404, 'NOT_FOUND', 'Usuário não encontrado.');
+      return;
+    }
+    const profileMap = await getUserProfileMap([id]);
+    const user = normalizeAdminUser(
+      data.user as unknown as {
+        id: string;
+        email?: string;
+        created_at?: string;
+        last_sign_in_at?: string;
+        user_metadata?: Record<string, unknown>;
+        app_metadata?: Record<string, unknown>;
+        banned_until?: string | null;
+      },
+      profileMap.get(id) as unknown as {
+        email?: string | null;
+        store_name?: string | null;
+        role?: string | null;
+        is_active?: boolean | null;
+        deleted_at?: string | null;
+      }
+    );
+    res.status(200).type(JSON_UTF8).json({ ok: true, data: user });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
 
-  const rows = profiles.map((p) => ({
-    email: p.email,
-    userId: p.id,
-    paying: !!p.has_paid,
-    aiEnabled: !!p.is_ai_enabled,
-    whatsappConfigured: p.whatsapp_session != null,
-    botOnlineNow: !!(p.email && sessions[p.email]),
-  }));
+router.patch('/users/:id/role', async (req: Request, res: Response) => {
+  const id = String(req.params.id || '').trim();
+  const role = typeof req.body?.role === 'string' ? req.body.role.trim() : '';
+  if (!id || !role) {
+    sendApiError(res, 400, 'VALIDATION_ERROR', 'id e role são obrigatórios.');
+    return;
+  }
+  try {
+    const { error } = await supabase.auth.admin.updateUserById(id, { app_metadata: { role } });
+    if (error) throw error;
+    await supabase.from('profiles').update({ role }).eq('id', id);
+    const actor = getAdminActor(req);
+    pushAdminAudit({
+      actor,
+      action: 'user.role.update',
+      target: id,
+      timestamp: new Date().toISOString(),
+      meta: { role },
+    });
+    pushAdminEvent('core', `Admin atualizou role de ${id}`, 'online');
+    res.status(200).type(JSON_UTF8).json({ ok: true, data: { id, role } });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
 
-  res.status(200).type(JSON_UTF8).json({
-    ok: true,
-    count: rows.length,
-    users: rows,
-  });
+router.patch('/users/:id/status', async (req: Request, res: Response) => {
+  const id = String(req.params.id || '').trim();
+  const active = req.body?.active;
+  if (!id || typeof active !== 'boolean') {
+    sendApiError(res, 400, 'VALIDATION_ERROR', 'id e active(boolean) são obrigatórios.');
+    return;
+  }
+  try {
+    const { error } = await supabase.auth.admin.updateUserById(id, {
+      user_metadata: { active },
+    });
+    if (error) throw error;
+    await supabase.from('profiles').update({ is_active: active, deleted_at: active ? null : new Date().toISOString() }).eq('id', id);
+    const actor = getAdminActor(req);
+    pushAdminAudit({
+      actor,
+      action: 'user.status.update',
+      target: id,
+      timestamp: new Date().toISOString(),
+      meta: { active },
+    });
+    pushAdminEvent('core', `Admin atualizou status de ${id}`, active ? 'online' : 'degraded');
+    res.status(200).type(JSON_UTF8).json({ ok: true, data: { id, active } });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
+router.delete('/users/:id', async (req: Request, res: Response) => {
+  const id = String(req.params.id || '').trim();
+  if (!id) {
+    sendApiError(res, 400, 'VALIDATION_ERROR', 'id é obrigatório.');
+    return;
+  }
+  try {
+    const nowIso = new Date().toISOString();
+    const { error } = await supabase.auth.admin.updateUserById(id, {
+      user_metadata: { active: false, deleted: true, deleted_at: nowIso },
+    });
+    if (error) throw error;
+    await supabase
+      .from('profiles')
+      .update({ is_active: false, deleted_at: nowIso })
+      .eq('id', id);
+    const actor = getAdminActor(req);
+    pushAdminAudit({
+      actor,
+      action: 'user.soft_delete',
+      target: id,
+      timestamp: nowIso,
+    });
+    pushAdminEvent('core', `Admin aplicou soft delete em ${id}`, 'degraded');
+    res.status(200).type(JSON_UTF8).json({ ok: true, data: { id, deleted: true } });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
+router.get('/users/:id/assets', async (req: Request, res: Response) => {
+  const id = String(req.params.id || '').trim();
+  if (!id) {
+    sendApiError(res, 400, 'VALIDATION_ERROR', 'id é obrigatório.');
+    return;
+  }
+  try {
+    // Tenta fonte dedicada; se não existir tabela, faz fallback para vazio.
+    let items: Array<{ id: string; url: string; createdAt: string | null }> = [];
+    const { data, error } = await supabase
+      .from('user_assets')
+      .select('id, url, created_at')
+      .eq('user_id', id)
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    if (!error && data) {
+      items = data.map((x: Record<string, unknown>) => ({
+        id: String(x.id || ''),
+        url: String(x.url || ''),
+        createdAt: x.created_at ? String(x.created_at) : null,
+      }));
+    }
+
+    res.status(200).type(JSON_UTF8).json({ ok: true, data: { items } });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
+router.get('/audit', (_req: Request, res: Response) => {
+  res.status(200).type(JSON_UTF8).json({ ok: true, data: { items: adminAudit } });
 });
 
 router.post('/events/test', (req: Request, res: Response) => {
@@ -657,7 +973,7 @@ router.post('/events/test', (req: Request, res: Response) => {
 });
 
 router.use((req: Request, res: Response) => {
-  sendApiError(res, 404, 'VALIDATION_ERROR', 'Endpoint admin não encontrado.');
+  sendApiError(res, 404, 'NOT_FOUND', 'Endpoint admin não encontrado.');
 });
 
 router.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
