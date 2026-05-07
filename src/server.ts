@@ -23,7 +23,14 @@ const supabase = createClient(
 app.use(cors({
   origin: true, 
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'stripe-signature', 'x-admin-secret'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'stripe-signature',
+    'x-admin-secret',
+    'x-api-key',
+    'X-API-Key',
+  ],
   credentials: true 
 }));
 
@@ -190,7 +197,7 @@ app.post('/api/whatsapp/disconnect', async (req, res) => {
 // --- 6. MONITORAMENTO E BOOT ---
 app.get('/ping', (req, res) => res.send('pong'));
 app.get('/health', (_req, res) =>
-  res.status(200).type('application/json').json({ ok: true, status: 'healthy' })
+  res.status(200).type('application/json; charset=utf-8').json({ ok: true })
 );
 
 app.listen(port, '0.0.0.0', () => {

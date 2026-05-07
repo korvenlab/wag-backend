@@ -18,7 +18,13 @@ const supabase: SupabaseClient = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
-type ApiErrorCode = 'UNAUTHORIZED' | 'VALIDATION_ERROR' | 'INTERNAL_ERROR';
+type ApiErrorCode =
+  | 'UNAUTHORIZED'
+  | 'VALIDATION_ERROR'
+  | 'INTERNAL_ERROR'
+  | 'UNAVAILABLE';
+
+const JSON_UTF8 = 'application/json; charset=utf-8';
 
 function sendApiError(
   res: Response,
@@ -26,36 +32,77 @@ function sendApiError(
   code: ApiErrorCode,
   error: string
 ): void {
-  res.status(status).type('application/json').json({ ok: false, error, code });
+  res.status(status).type(JSON_UTF8).json({ ok: false, error, code });
 }
 
-function requireAdmin(req: Request, res: Response, next: NextFunction): void {
-  const configured = process.env.ADMIN_API_SECRET?.trim();
+function getUpstreamSecret(): string {
+  return (process.env.ADMIN_API_SECRET || process.env.API_SECRET || '').trim();
+}
+
+/** Nunca logar o valor retornado (segredo). */
+function extractProvidedSecret(req: Request): string | undefined {
+  const auth = req.headers.authorization;
+  const bearer =
+    typeof auth === 'string' && auth.toLowerCase().startsWith('bearer ')
+      ? auth.slice(7).trim()
+      : undefined;
+  const apiKeyRaw = req.headers['x-api-key'];
+  const apiKey = Array.isArray(apiKeyRaw) ? apiKeyRaw[0]?.trim() : apiKeyRaw?.trim();
+  const legacyRaw = req.headers['x-admin-secret'];
+  const legacy = Array.isArray(legacyRaw) ? legacyRaw[0]?.trim() : legacyRaw?.trim();
+  const pick = bearer || apiKey || legacy;
+  return pick && pick.length > 0 ? pick : undefined;
+}
+
+function requireUpstreamAuth(req: Request, res: Response, next: NextFunction): void {
+  const configured = getUpstreamSecret();
   if (!configured) {
     sendApiError(
       res,
       500,
       'INTERNAL_ERROR',
-      'ADMIN_API_SECRET não configurado no servidor.'
+      'Segredo API não configurado (ADMIN_API_SECRET ou API_SECRET).'
     );
     return;
   }
-  const headerSecret =
-    (req.headers['x-admin-secret'] as string | undefined)?.trim() ||
-    (req.headers.authorization?.startsWith('Bearer ')
-      ? req.headers.authorization.slice(7).trim()
-      : undefined);
-  if (!headerSecret || headerSecret !== configured) {
+  const provided = extractProvidedSecret(req);
+  if (!provided || provided !== configured) {
     sendApiError(res, 401, 'UNAUTHORIZED', 'Não autorizado.');
     return;
   }
   next();
 }
 
-router.use(requireAdmin);
+router.use(requireUpstreamAuth);
 
-function parsePeriodDays(raw: unknown): { ok: true; value: number } | { ok: false } {
-  if (raw === undefined || raw === null || raw === '') return { ok: true, value: 14 };
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function parseOrganizationId(req: Request): { ok: true; value: string | null } | { ok: false } {
+  const oid =
+    typeof req.query.organization_id === 'string' ? req.query.organization_id.trim() : '';
+  const legacy =
+    typeof req.query.organization === 'string' ? req.query.organization.trim() : '';
+  const candidate = oid || legacy;
+  if (!candidate) return { ok: true, value: null };
+  if (!UUID_RE.test(candidate)) return { ok: false };
+  return { ok: true, value: candidate };
+}
+
+function parsePeriodDaysParam(raw: unknown): { ok: true; value: number } | { ok: false } {
+  const v =
+    raw === undefined || raw === null || raw === '' ? 30 : Number(raw);
+  if (!Number.isFinite(v) || !Number.isInteger(v) || v < 1 || v > 366) return { ok: false };
+  return { ok: true, value: v };
+}
+
+function parseChartDaysParam(
+  raw: unknown,
+  periodDays: number
+): { ok: true; value: number } | { ok: false } {
+  if (raw === undefined || raw === null || raw === '') {
+    return { ok: true, value: Math.min(periodDays, 90) };
+  }
   const n = Number(raw);
   if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1 || n > 90) return { ok: false };
   return { ok: true, value: n };
@@ -132,6 +179,26 @@ function bucketByDayBrl(
     map.set(d, (map.get(d) || 0) + (inv.amount_paid || 0) / 100);
   }
   return orderedDates.map((date) => ({ date, amountBrl: map.get(date) || 0 }));
+}
+
+function bucketDailyVolume(
+  rows: { date: string; count: number }[],
+  days: number
+): { data: string; volume: number }[] {
+  const orderedDates: string[] = [];
+  const map = new Map<string, number>();
+  for (let i = 0; i < days; i++) {
+    const d = startOfDay(subDays(new Date(), days - 1 - i));
+    const key = formatISO(d, { representation: 'date' });
+    orderedDates.push(key);
+    map.set(key, 0);
+  }
+  for (const r of rows) {
+    const k = String(r.date).slice(0, 10);
+    if (!map.has(k)) continue;
+    map.set(k, (map.get(k) || 0) + (Number(r.count) || 0));
+  }
+  return orderedDates.map((data) => ({ data, volume: map.get(data) || 0 }));
 }
 
 async function countActiveSubscriptions(client: Stripe): Promise<number> {
@@ -255,25 +322,51 @@ function parseAvendasMetrics(): {
 }
 
 router.get('/dashboard', async (req: Request, res: Response) => {
-  const parsedPeriod = parsePeriodDays(req.query.periodDays);
+  const periodRaw = req.query.period_days ?? req.query.periodDays;
+  const chartRaw = req.query.chart_days ?? req.query.chartDays;
+
+  const parsedPeriod = parsePeriodDaysParam(periodRaw);
   if (!parsedPeriod.ok) {
     sendApiError(
       res,
       400,
       'VALIDATION_ERROR',
-      'periodDays deve ser um inteiro entre 1 e 90.'
+      'period_days deve ser inteiro entre 1 e 366.'
     );
     return;
   }
-  const periodDays = parsedPeriod.value;
-  const organization =
-    typeof req.query.organization === 'string' ? req.query.organization : undefined;
+  const period_days = parsedPeriod.value;
+
+  const parsedChart = parseChartDaysParam(chartRaw, period_days);
+  if (!parsedChart.ok) {
+    sendApiError(
+      res,
+      400,
+      'VALIDATION_ERROR',
+      'chart_days deve ser inteiro entre 1 e 90.'
+    );
+    return;
+  }
+  const chart_days = parsedChart.value;
+
+  const parsedOrg = parseOrganizationId(req);
+  if (!parsedOrg.ok) {
+    sendApiError(
+      res,
+      400,
+      'VALIDATION_ERROR',
+      'organization_id inválido (UUID esperado).'
+    );
+    return;
+  }
+  const organization_id = parsedOrg.value;
 
   const now = new Date();
   const nowUnix = Math.floor(now.getTime() / 1000);
-  const periodStart = Math.floor(subDays(now, periodDays).getTime() / 1000);
-  const prevStart = Math.floor(subDays(now, periodDays * 2).getTime() / 1000);
+  const periodStart = Math.floor(subDays(now, period_days).getTime() / 1000);
+  const prevStart = Math.floor(subDays(now, period_days * 2).getTime() / 1000);
   const prevEnd = periodStart - 1;
+  const chartStartUnix = Math.floor(startOfDay(subDays(now, chart_days - 1)).getTime() / 1000);
 
   const warnings: string[] = [];
 
@@ -318,9 +411,10 @@ router.get('/dashboard', async (req: Request, res: Response) => {
     warnings.push('Stripe não configurado (STRIPE_SECRET_KEY).');
   } else {
     try {
+      const fetchStartUnix = Math.min(prevStart, chartStartUnix);
       const invWindow = await listPaidInvoicesByPaidAtRange(
         stripe,
-        prevStart,
+        fetchStartUnix,
         nowUnix,
         () => warnings.push('Listagem Stripe truncada; totais de receita podem estar incompletos.')
       );
@@ -332,9 +426,13 @@ router.get('/dashboard', async (req: Request, res: Response) => {
         const t = inv.status_transitions?.paid_at ?? inv.created;
         return t >= prevStart && t <= prevEnd;
       });
+      const invChart = invWindow.filter((inv) => {
+        const t = inv.status_transitions?.paid_at ?? inv.created;
+        return t >= chartStartUnix && t <= nowUnix;
+      });
       revenueCurrentPeriod = sumInvoiceAmountBrl(invCurrent);
       revenuePrevPeriod = sumInvoiceAmountBrl(invPrev);
-      revenuePerDay = bucketByDayBrl(invCurrent, periodDays);
+      revenuePerDay = bucketByDayBrl(invChart, chart_days);
       activeSubscriptions = await countActiveSubscriptions(stripe);
       newSubsCurrent = await countSubscriptionsCreatedInRange(stripe, periodStart, nowUnix);
       newSubsPrev = await countSubscriptionsCreatedInRange(stripe, prevStart, prevEnd);
@@ -344,6 +442,7 @@ router.get('/dashboard', async (req: Request, res: Response) => {
   }
 
   const avendas = parseAvendasMetrics();
+  const volumePorDia2 = bucketDailyVolume(avendas.transactionsPerDay, chart_days);
 
   const coreOk = await healthSupabase();
   const wagooStatus: AdminEventStatus =
@@ -379,79 +478,99 @@ router.get('/dashboard', async (req: Request, res: Response) => {
   const nowIso = new Date().toISOString();
   const eventos = getAdminEvents(80).map((e) => ({
     id: e.id,
-    app: e.app === '2avendas' ? 'core' : e.app,
+    app: e.app,
     status: e.status,
     message: e.message,
     timestamp: e.timestamp,
   }));
 
-  res
-    .status(200)
-    .type('application/json')
-    .json({
-      ok: true,
-      gerado_em: nowIso,
-      filtros: {
-        periodDays,
-        ...(organization ? { organization } : {}),
-      },
+  const kpis = {
+    receita_total: {
+      valor: revenueCurrentPeriod,
+      delta_pct: pctChange(revenueCurrentPeriod, revenuePrevPeriod) ?? 0,
+    },
+    assinaturas_ativas_wagoo: {
+      valor: activeSubscriptions,
+      delta_pct: pctChange(newSubsCurrent, newSubsPrev) ?? 0,
+    },
+    volume_vendas_2avendas: {
+      valor: avendas.volume,
+      delta_pct: avendas.changePct ?? 0,
+    },
+    uptime_medio: {
+      valor: Math.round(averageUptimePct * 100) / 100,
+      delta_pct: 0,
+    },
+  };
+
+  const ui = {
+    sidebar_itens: [
+      { label: 'Visão Geral', href: '/', icon: 'layout-dashboard' },
+      { label: 'Wagoo', href: '/wagoo', icon: 'message-circle' },
+      { label: '2AVENDAS', href: '/2avendas', icon: 'shopping-cart' },
+      { label: 'Configurações', href: '/settings', icon: 'settings' },
+    ],
+    topbar: {
+      title: 'Korven Dashboard',
+      subtitle: 'Upstream: Wagoo',
+    },
+  };
+
+  res.status(200).type(JSON_UTF8).json({
+    ok: true,
+    gerado_em: nowIso,
+    filtros: {
+      organization_id,
+      period_days,
+      chart_days,
+    },
+    kpis,
+    wagoo: {
+      receita_por_dia: revenuePerDay.map((d) => ({
+        data: d.date,
+        receita: d.amountBrl,
+      })),
+    },
+    dois_avendas: {
+      volume_por_dia: volumePorDia2,
+    },
+    eventos_recentes: eventos,
+    ui,
+    legacy: {
       kpis: {
-        receita_total: {
-          valor: revenueCurrentPeriod,
-          delta_pct: pctChange(revenueCurrentPeriod, revenuePrevPeriod) ?? 0,
-        },
-        assinaturas_ativas_wagoo: {
-          valor: activeSubscriptions,
-          delta_pct: pctChange(newSubsCurrent, newSubsPrev) ?? 0,
-        },
-        uptime_medio: {
-          valor: Math.round(averageUptimePct * 100) / 100,
-          delta_pct: 0,
+        salesVolume2avendas: {
+          value: avendas.volume,
+          changePct: avendas.changePct,
         },
       },
       wagoo: {
-        receita_por_dia: revenuePerDay.map((d) => ({
-          data: d.date,
-          receita: d.amountBrl,
-        })),
+        activeSubscriptions,
+        registeredProfiles: profilesCount,
+        payingUsersInDb: payingProfiles,
+        whatsappConfiguredProfiles: whatsappConfigured,
+        botSessionsOnline: botOnlineEmails.length,
       },
-      eventos_recentes: eventos,
-      // bloco legado para compatibilidade do painel atual
-      legacy: {
-        kpis: {
-          salesVolume2avendas: {
-            value: avendas.volume,
-            changePct: avendas.changePct,
-          },
-        },
-        wagoo: {
-          activeSubscriptions,
-          registeredProfiles: profilesCount,
-          payingUsersInDb: payingProfiles,
-          whatsappConfiguredProfiles: whatsappConfigured,
-          botSessionsOnline: botOnlineEmails.length,
-        },
-        sales2avendas: {
-          volume: avendas.volume,
-          changePct: avendas.changePct,
-          transactionsPerDay: avendas.transactionsPerDay,
-          configured: avendas.configured,
-        },
-        users: {
-          totalAuthUsers: authUsers.length,
-          totalProfiles: profilesCount,
-          payingCount: payingProfiles,
-          botOnlineEmails,
-          recentSignIns,
-        },
-        appsHealth: [
-          { app: 'wagoo' as const, status: wagooStatus },
-          { app: 'core' as const, status: coreStatus },
-          { app: '2avendas' as const, status: avendasHealth },
-        ],
-        warnings,
+      sales2avendas: {
+        volume: avendas.volume,
+        changePct: avendas.changePct,
+        transactionsPerDay: avendas.transactionsPerDay,
+        configured: avendas.configured,
       },
-    });
+      users: {
+        totalAuthUsers: authUsers.length,
+        totalProfiles: profilesCount,
+        payingCount: payingProfiles,
+        botOnlineEmails,
+        recentSignIns,
+      },
+      appsHealth: [
+        { app: 'wagoo' as const, status: wagooStatus },
+        { app: 'core' as const, status: coreStatus },
+        { app: '2avendas' as const, status: avendasHealth },
+      ],
+      warnings,
+    },
+  });
 });
 
 router.get('/users', async (req: Request, res: Response) => {
@@ -487,7 +606,8 @@ router.get('/users', async (req: Request, res: Response) => {
     botOnlineNow: !!(p.email && sessions[p.email]),
   }));
 
-  res.status(200).type('application/json').json({
+  res.status(200).type(JSON_UTF8).json({
+    ok: true,
     count: rows.length,
     users: rows,
   });
@@ -507,7 +627,7 @@ router.post('/events/test', (req: Request, res: Response) => {
   const st =
     status === 'online' || status === 'degraded' || status === 'offline' ? status : 'online';
   pushAdminEvent(ap, message, st);
-  res.status(200).type('application/json').json({ ok: true });
+  res.status(200).type(JSON_UTF8).json({ ok: true });
 });
 
 router.use((req: Request, res: Response) => {
