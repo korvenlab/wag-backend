@@ -18,10 +18,26 @@ const supabase: SupabaseClient = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
 
+type ApiErrorCode = 'UNAUTHORIZED' | 'VALIDATION_ERROR' | 'INTERNAL_ERROR';
+
+function sendApiError(
+  res: Response,
+  status: number,
+  code: ApiErrorCode,
+  error: string
+): void {
+  res.status(status).type('application/json').json({ ok: false, error, code });
+}
+
 function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   const configured = process.env.ADMIN_API_SECRET?.trim();
   if (!configured) {
-    res.status(503).json({ error: 'ADMIN_API_SECRET não configurado no servidor.' });
+    sendApiError(
+      res,
+      500,
+      'INTERNAL_ERROR',
+      'ADMIN_API_SECRET não configurado no servidor.'
+    );
     return;
   }
   const headerSecret =
@@ -30,7 +46,7 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
       ? req.headers.authorization.slice(7).trim()
       : undefined);
   if (!headerSecret || headerSecret !== configured) {
-    res.status(401).json({ error: 'Não autorizado.' });
+    sendApiError(res, 401, 'UNAUTHORIZED', 'Não autorizado.');
     return;
   }
   next();
@@ -38,14 +54,11 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
 
 router.use(requireAdmin);
 
-function parsePeriodDays(raw: unknown): number {
-  if (typeof raw === 'string' && /^\d+d$/i.test(raw.trim())) {
-    const n = Number.parseInt(raw.trim().slice(0, -1), 10);
-    if (Number.isFinite(n) && n >= 1) return Math.min(n, 90);
-  }
+function parsePeriodDays(raw: unknown): { ok: true; value: number } | { ok: false } {
+  if (raw === undefined || raw === null || raw === '') return { ok: true, value: 14 };
   const n = Number(raw);
-  if (!Number.isFinite(n) || n < 1) return 14;
-  return Math.min(Math.floor(n), 90);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1 || n > 90) return { ok: false };
+  return { ok: true, value: n };
 }
 
 function pctChange(current: number, previous: number): number | null {
@@ -242,9 +255,19 @@ function parseAvendasMetrics(): {
 }
 
 router.get('/dashboard', async (req: Request, res: Response) => {
-  const periodDays = parsePeriodDays(req.query.periodDays ?? req.query.period);
+  const parsedPeriod = parsePeriodDays(req.query.periodDays);
+  if (!parsedPeriod.ok) {
+    sendApiError(
+      res,
+      400,
+      'VALIDATION_ERROR',
+      'periodDays deve ser um inteiro entre 1 e 90.'
+    );
+    return;
+  }
+  const periodDays = parsedPeriod.value;
   const organization =
-    typeof req.query.organization === 'string' ? req.query.organization : null;
+    typeof req.query.organization === 'string' ? req.query.organization : undefined;
 
   const now = new Date();
   const nowUnix = Math.floor(now.getTime() / 1000);
@@ -353,54 +376,82 @@ router.get('/dashboard', async (req: Request, res: Response) => {
       lastSignInAt: u.last_sign_in_at ?? null,
     }));
 
-  res.json({
-    generatedAt: new Date().toISOString(),
-    organization,
-    periodDays,
-    kpis: {
-      totalRevenueBrl: {
-        value: revenueCurrentPeriod,
-        changePct: pctChange(revenueCurrentPeriod, revenuePrevPeriod),
+  const nowIso = new Date().toISOString();
+  const eventos = getAdminEvents(80).map((e) => ({
+    id: e.id,
+    app: e.app === '2avendas' ? 'core' : e.app,
+    status: e.status,
+    message: e.message,
+    timestamp: e.timestamp,
+  }));
+
+  res
+    .status(200)
+    .type('application/json')
+    .json({
+      ok: true,
+      gerado_em: nowIso,
+      filtros: {
+        periodDays,
+        ...(organization ? { organization } : {}),
       },
-      wagooActiveSubscriptions: {
-        value: activeSubscriptions,
-        changePct: pctChange(newSubsCurrent, newSubsPrev),
+      kpis: {
+        receita_total: {
+          valor: revenueCurrentPeriod,
+          delta_pct: pctChange(revenueCurrentPeriod, revenuePrevPeriod) ?? 0,
+        },
+        assinaturas_ativas_wagoo: {
+          valor: activeSubscriptions,
+          delta_pct: pctChange(newSubsCurrent, newSubsPrev) ?? 0,
+        },
+        uptime_medio: {
+          valor: Math.round(averageUptimePct * 100) / 100,
+          delta_pct: 0,
+        },
       },
-      salesVolume2avendas: {
-        value: avendas.volume,
-        changePct: avendas.changePct,
+      wagoo: {
+        receita_por_dia: revenuePerDay.map((d) => ({
+          data: d.date,
+          receita: d.amountBrl,
+        })),
       },
-      averageUptimePct: { value: Math.round(averageUptimePct * 100) / 100 },
-    },
-    wagoo: {
-      activeSubscriptions,
-      revenuePerDay,
-      registeredProfiles: profilesCount,
-      payingUsersInDb: payingProfiles,
-      whatsappConfiguredProfiles: whatsappConfigured,
-      botSessionsOnline: botOnlineEmails.length,
-    },
-    sales2avendas: {
-      volume: avendas.volume,
-      changePct: avendas.changePct,
-      transactionsPerDay: avendas.transactionsPerDay,
-      configured: avendas.configured,
-    },
-    users: {
-      totalAuthUsers: authUsers.length,
-      totalProfiles: profilesCount,
-      payingCount: payingProfiles,
-      botOnlineEmails,
-      recentSignIns,
-    },
-    appsHealth: [
-      { app: 'wagoo' as const, status: wagooStatus },
-      { app: 'core' as const, status: coreStatus },
-      { app: '2avendas' as const, status: avendasHealth },
-    ],
-    recentEvents: getAdminEvents(80),
-    warnings,
-  });
+      eventos_recentes: eventos,
+      // bloco legado para compatibilidade do painel atual
+      legacy: {
+        kpis: {
+          salesVolume2avendas: {
+            value: avendas.volume,
+            changePct: avendas.changePct,
+          },
+        },
+        wagoo: {
+          activeSubscriptions,
+          registeredProfiles: profilesCount,
+          payingUsersInDb: payingProfiles,
+          whatsappConfiguredProfiles: whatsappConfigured,
+          botSessionsOnline: botOnlineEmails.length,
+        },
+        sales2avendas: {
+          volume: avendas.volume,
+          changePct: avendas.changePct,
+          transactionsPerDay: avendas.transactionsPerDay,
+          configured: avendas.configured,
+        },
+        users: {
+          totalAuthUsers: authUsers.length,
+          totalProfiles: profilesCount,
+          payingCount: payingProfiles,
+          botOnlineEmails,
+          recentSignIns,
+        },
+        appsHealth: [
+          { app: 'wagoo' as const, status: wagooStatus },
+          { app: 'core' as const, status: coreStatus },
+          { app: '2avendas' as const, status: avendasHealth },
+        ],
+        warnings,
+      },
+    });
 });
 
 router.get('/users', async (req: Request, res: Response) => {
@@ -423,7 +474,7 @@ router.get('/users', async (req: Request, res: Response) => {
     if (error) throw error;
     profiles = data ?? [];
   } catch (e: unknown) {
-    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
     return;
   }
 
@@ -436,7 +487,7 @@ router.get('/users', async (req: Request, res: Response) => {
     botOnlineNow: !!(p.email && sessions[p.email]),
   }));
 
-  res.json({
+  res.status(200).type('application/json').json({
     count: rows.length,
     users: rows,
   });
@@ -449,14 +500,23 @@ router.post('/events/test', (req: Request, res: Response) => {
     status?: AdminEventStatus;
   };
   if (!message || typeof message !== 'string') {
-    res.status(400).json({ error: 'message é obrigatório.' });
+    sendApiError(res, 400, 'VALIDATION_ERROR', 'message é obrigatório.');
     return;
   }
   const ap = app === 'wagoo' || app === '2avendas' || app === 'core' ? app : 'core';
   const st =
     status === 'online' || status === 'degraded' || status === 'offline' ? status : 'online';
   pushAdminEvent(ap, message, st);
-  res.json({ ok: true });
+  res.status(200).type('application/json').json({ ok: true });
+});
+
+router.use((req: Request, res: Response) => {
+  sendApiError(res, 404, 'VALIDATION_ERROR', 'Endpoint admin não encontrado.');
+});
+
+router.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  const message = err instanceof Error ? err.message : 'Erro interno';
+  sendApiError(res, 500, 'INTERNAL_ERROR', message);
 });
 
 export default router;

@@ -189,6 +189,9 @@ app.post('/api/whatsapp/disconnect', async (req, res) => {
 
 // --- 6. MONITORAMENTO E BOOT ---
 app.get('/ping', (req, res) => res.send('pong'));
+app.get('/health', (_req, res) =>
+  res.status(200).type('application/json').json({ ok: true, status: 'healthy' })
+);
 
 app.listen(port, '0.0.0.0', () => {
   console.log(`🚀 Wagoo Online na porta ${port}`);
