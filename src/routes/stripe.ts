@@ -83,9 +83,17 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
   switch (event.type) {
     case 'checkout.session.completed': {
       const session = event.data.object as Stripe.Checkout.Session;
-      const userId = session.client_reference_id;
+      let userId = session.client_reference_id ?? null;
+      /** Fallback: metadata na Subscription quando client_reference_id falha em retries. */
+      if (!userId && typeof session.subscription === 'string') {
+        try {
+          const sub = await stripe.subscriptions.retrieve(session.subscription);
+          userId = sub.metadata?.supabase_user_id ?? null;
+        } catch (e) {
+          console.error('[stripe webhook] checkout.session.completed retrieve subscription:', e);
+        }
+      }
       if (userId) {
-        // Ao pagar, marca como pago e JÁ LIGA o botão da IA automaticamente
         await supabase
           .from('profiles')
           .update({ has_paid: true, is_ai_enabled: true })
@@ -96,20 +104,63 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
       break;
     }
 
-    case 'customer.subscription.deleted':
+    /** Antes só checkout marcava pago; assinatura `active` sem esse evento deixava Korven em “não pago”. */
     case 'customer.subscription.updated': {
       const sub = event.data.object as Stripe.Subscription;
-      if (sub.status === 'canceled' || sub.status === 'unpaid') {
-        const userId = sub.metadata.supabase_user_id;
-        if (userId) {
-          // SE O PAGAMENTO ACABOU: Desliga o 'has_paid' E o botão 'is_ai_enabled'
+      const userId = sub.metadata?.supabase_user_id;
+      if (!userId) break;
+      if (sub.status === 'active' || sub.status === 'trialing') {
+        await supabase
+          .from('profiles')
+          .update({ has_paid: true, is_ai_enabled: true })
+          .eq('id', userId);
+        console.log(`✅ Assinatura ${sub.status} — has_paid=true: ${userId}`);
+      } else if (
+        sub.status === 'canceled' ||
+        sub.status === 'unpaid' ||
+        sub.status === 'incomplete_expired'
+      ) {
+        await supabase
+          .from('profiles')
+          .update({ has_paid: false, is_ai_enabled: false })
+          .eq('id', userId);
+        console.log(`🛑 Assinatura ${sub.status} — has_paid=false: ${userId}`);
+        pushAdminEvent('wagoo', 'Assinatura cancelada ou inadimplente', 'degraded');
+      }
+      break;
+    }
+
+    case 'customer.subscription.deleted': {
+      const sub = event.data.object as Stripe.Subscription;
+      const userId = sub.metadata?.supabase_user_id;
+      if (userId) {
+        await supabase
+          .from('profiles')
+          .update({ has_paid: false, is_ai_enabled: false })
+          .eq('id', userId);
+        console.log(`🛑 Subscription deleted — has_paid=false: ${userId}`);
+        pushAdminEvent('wagoo', 'Assinatura removida', 'degraded');
+      }
+      break;
+    }
+
+    case 'invoice.payment_succeeded': {
+      const inv = event.data.object as Stripe.Invoice;
+      const subId =
+        typeof inv.subscription === 'string' ? inv.subscription : inv.subscription?.id ?? null;
+      if (!subId) break;
+      try {
+        const sub = await stripe.subscriptions.retrieve(subId);
+        const userId = sub.metadata?.supabase_user_id;
+        if (userId && (sub.status === 'active' || sub.status === 'trialing')) {
           await supabase
             .from('profiles')
-            .update({ has_paid: false, is_ai_enabled: false })
+            .update({ has_paid: true, is_ai_enabled: true })
             .eq('id', userId);
-          console.log(`🛑 Assinatura cancelada/pendente para o utilizador: ${userId}`);
-          pushAdminEvent('wagoo', 'Assinatura cancelada ou inadimplente', 'degraded');
+          console.log(`✅ invoice.payment_succeeded — has_paid=true: ${userId}`);
         }
+      } catch (e) {
+        console.error('[stripe webhook] invoice.payment_succeeded:', e);
       }
       break;
     }
