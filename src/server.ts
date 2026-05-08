@@ -7,6 +7,7 @@ import { createClient } from '@supabase/supabase-js';
 
 import stripeRoutes from './routes/stripe';
 import adminDashboardRoutes from './routes/adminDashboard';
+import feedbackRoutes from './routes/feedback';
 import { pushAdminEvent } from './services/adminEvents';
 import { startWhatsApp, autoReconnectAll, disconnectWhatsApp } from './services/whatsapp';
 import { generateAuthUrl, getTokensFromCode } from './services/googleAuth'; 
@@ -36,6 +37,7 @@ app.use(cors({
 
 app.use('/api/stripe', stripeRoutes);
 app.use(express.json());
+app.use('/feedback', feedbackRoutes);
 app.use('/api/admin', adminDashboardRoutes);
 
 // --- 1. ROTA DE PERFIL ---
