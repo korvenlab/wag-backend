@@ -875,7 +875,10 @@ router.patch('/users/:id/status', async (req: Request, res: Response) => {
       user_metadata: { active },
     });
     if (error) throw error;
-    await supabase.from('profiles').update({ is_active: active, deleted_at: active ? null : new Date().toISOString() }).eq('id', id);
+    /** Desativar só corta acesso (`is_active`); não preenche `deleted_at`. Reativar limpa marcação legada. */
+    const profilePatch: Record<string, unknown> = { is_active: active };
+    if (active) profilePatch.deleted_at = null;
+    await supabase.from('profiles').update(profilePatch).eq('id', id);
     const actor = getAdminActor(req);
     pushAdminAudit({
       actor,
@@ -899,22 +902,16 @@ router.delete('/users/:id', async (req: Request, res: Response) => {
   }
   try {
     const nowIso = new Date().toISOString();
-    const { error } = await supabase.auth.admin.updateUserById(id, {
-      user_metadata: { active: false, deleted: true, deleted_at: nowIso },
-    });
+    const { error } = await supabase.auth.admin.deleteUser(id);
     if (error) throw error;
-    await supabase
-      .from('profiles')
-      .update({ is_active: false, deleted_at: nowIso })
-      .eq('id', id);
     const actor = getAdminActor(req);
     pushAdminAudit({
       actor,
-      action: 'user.soft_delete',
+      action: 'user.account.delete',
       target: id,
       timestamp: nowIso,
     });
-    pushAdminEvent('core', `Admin aplicou soft delete em ${id}`, 'degraded');
+    pushAdminEvent('core', `Admin removeu conta ${id} (auth + dados em cascata)`, 'degraded');
     res.status(200).type(JSON_UTF8).json({ ok: true, data: { id, deleted: true } });
   } catch (e: unknown) {
     sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
