@@ -427,6 +427,37 @@ type AdminUserRow = {
   lastSignInAt: string | null;
 };
 
+/**
+ * Coluna `profiles.has_paid`: tipicamente boolean no Postgres.
+ * Se vier como texto ("TRUE"/"FALSE"), `!!"FALSE"` seria true em JS — normaliza aqui.
+ */
+function profileHasPaidToBoolean(v: unknown): boolean {
+  if (v === true || v === false) return v;
+  if (v === null || v === undefined) return false;
+  if (typeof v === 'number' && Number.isFinite(v)) return v !== 0;
+  if (typeof v === 'string') {
+    const s = v.trim().toLowerCase();
+    if (['true', 't', '1', 'yes'].includes(s)) return true;
+    if (['false', 'f', '0', 'no'].includes(s)) return false;
+  }
+  return false;
+}
+
+/** Body JSON do PATCH has-paid: aceita hasPaid ou has_paid (boolean, número ou string). */
+function parseHasPaidFromRequestBody(body: unknown): boolean | null {
+  if (!body || typeof body !== 'object') return null;
+  const b = body as Record<string, unknown>;
+  const raw = b.hasPaid ?? b.has_paid;
+  if (typeof raw === 'boolean') return raw;
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw !== 0;
+  if (typeof raw === 'string') {
+    const s = raw.trim().toLowerCase();
+    if (['true', 't', '1', 'yes'].includes(s)) return true;
+    if (['false', 'f', '0', 'no'].includes(s)) return false;
+  }
+  return null;
+}
+
 function normalizeAdminUser(
   authUser: {
     id: string;
@@ -443,7 +474,7 @@ function normalizeAdminUser(
     role?: string | null;
     is_active?: boolean | null;
     deleted_at?: string | null;
-    has_paid?: boolean | null;
+    has_paid?: unknown;
   }
 ): AdminUserRow {
   const role =
@@ -466,7 +497,7 @@ function normalizeAdminUser(
         ? activeFromMeta
         : true);
 
-  const hasPaid = !!profile?.has_paid;
+  const hasPaid = profileHasPaidToBoolean(profile?.has_paid);
 
   return {
     id: authUser.id,
@@ -811,7 +842,7 @@ router.get('/users', async (req: Request, res: Response) => {
           role?: string | null;
           is_active?: boolean | null;
           deleted_at?: string | null;
-          has_paid?: boolean | null;
+          has_paid?: unknown;
         }
       )
     );
@@ -854,7 +885,7 @@ router.get('/users/:id', async (req: Request, res: Response) => {
         role?: string | null;
         is_active?: boolean | null;
         deleted_at?: string | null;
-        has_paid?: boolean | null;
+        has_paid?: unknown;
       }
     );
     res.status(200).type(JSON_UTF8).json({ ok: true, data: user });
@@ -866,9 +897,14 @@ router.get('/users/:id', async (req: Request, res: Response) => {
 /** Korven: altera assinatura manual (`has_paid`), espelhando webhook (IA ligada só quando pago). */
 router.patch('/users/:id/has-paid', async (req: Request, res: Response) => {
   const id = String(req.params.id || '').trim();
-  const hasPaid = req.body?.hasPaid;
-  if (!id || typeof hasPaid !== 'boolean') {
-    sendApiError(res, 400, 'VALIDATION_ERROR', 'id e hasPaid (boolean) são obrigatórios.');
+  const hasPaid = parseHasPaidFromRequestBody(req.body);
+  if (!id || hasPaid === null) {
+    sendApiError(
+      res,
+      400,
+      'VALIDATION_ERROR',
+      'id e hasPaid ou has_paid (valor booleano ou equivalente) são obrigatórios.',
+    );
     return;
   }
   try {
