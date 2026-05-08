@@ -422,6 +422,7 @@ type AdminUserRow = {
   name: string | null;
   role: string;
   active: boolean;
+  hasPaid: boolean;
   createdAt: string;
   lastSignInAt: string | null;
 };
@@ -442,6 +443,7 @@ function normalizeAdminUser(
     role?: string | null;
     is_active?: boolean | null;
     deleted_at?: string | null;
+    has_paid?: boolean | null;
   }
 ): AdminUserRow {
   const role =
@@ -464,6 +466,8 @@ function normalizeAdminUser(
         ? activeFromMeta
         : true);
 
+  const hasPaid = !!profile?.has_paid;
+
   return {
     id: authUser.id,
     email: authUser.email ?? profile?.email ?? null,
@@ -473,6 +477,7 @@ function normalizeAdminUser(
       null,
     role,
     active,
+    hasPaid,
     createdAt: authUser.created_at || new Date(0).toISOString(),
     lastSignInAt: authUser.last_sign_in_at || null,
   };
@@ -483,7 +488,7 @@ async function getUserProfileMap(ids: string[]): Promise<Map<string, Record<stri
   if (ids.length === 0) return map;
   const { data, error } = await supabase
     .from('profiles')
-    .select('id, email, store_name, role, is_active, deleted_at')
+    .select('id, email, store_name, role, is_active, deleted_at, has_paid')
     .in('id', ids);
   if (error || !data) return map;
   for (const row of data as unknown as Record<string, unknown>[]) {
@@ -787,6 +792,7 @@ router.get('/users', async (req: Request, res: Response) => {
           role?: string | null;
           is_active?: boolean | null;
           deleted_at?: string | null;
+          has_paid?: boolean | null;
         }
       )
     );
@@ -829,9 +835,46 @@ router.get('/users/:id', async (req: Request, res: Response) => {
         role?: string | null;
         is_active?: boolean | null;
         deleted_at?: string | null;
+        has_paid?: boolean | null;
       }
     );
     res.status(200).type(JSON_UTF8).json({ ok: true, data: user });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
+/** Korven: altera assinatura manual (`has_paid`), espelhando webhook (IA ligada só quando pago). */
+router.patch('/users/:id/has-paid', async (req: Request, res: Response) => {
+  const id = String(req.params.id || '').trim();
+  const hasPaid = req.body?.hasPaid;
+  if (!id || typeof hasPaid !== 'boolean') {
+    sendApiError(res, 400, 'VALIDATION_ERROR', 'id e hasPaid (boolean) são obrigatórios.');
+    return;
+  }
+  try {
+    const { error } = await supabase
+      .from('profiles')
+      .update({
+        has_paid: hasPaid,
+        is_ai_enabled: hasPaid,
+      })
+      .eq('id', id);
+    if (error) throw error;
+    const actor = getAdminActor(req);
+    pushAdminAudit({
+      actor,
+      action: 'user.has_paid.update',
+      target: id,
+      timestamp: new Date().toISOString(),
+      meta: { hasPaid },
+    });
+    pushAdminEvent(
+      'core',
+      `Admin ${hasPaid ? 'marcou como pago' : 'marcou como não pago'} (${id})`,
+      hasPaid ? 'online' : 'degraded',
+    );
+    res.status(200).type(JSON_UTF8).json({ ok: true, data: { id, hasPaid } });
   } catch (e: unknown) {
     sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
   }
