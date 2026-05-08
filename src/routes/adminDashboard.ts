@@ -36,8 +36,14 @@ function sendApiError(
   res.status(status).type(JSON_UTF8).json({ ok: false, error, code });
 }
 
+/** Alinhado a `feedback.ts`: Korven Console usa `WAGOO_METRICS_API_KEY` ↔ `METRICS_API_KEY` aqui. */
 function getUpstreamSecret(): string {
-  return (process.env.ADMIN_API_SECRET || process.env.API_SECRET || '').trim();
+  return (
+    process.env.ADMIN_API_SECRET ||
+    process.env.API_SECRET ||
+    process.env.METRICS_API_KEY ||
+    ''
+  ).trim();
 }
 
 /** Nunca logar o valor retornado (segredo). */
@@ -62,7 +68,7 @@ function requireUpstreamAuth(req: Request, res: Response, next: NextFunction): v
       res,
       500,
       'INTERNAL_ERROR',
-      'Segredo API não configurado (ADMIN_API_SECRET ou API_SECRET).'
+      'Segredo API não configurado (ADMIN_API_SECRET, API_SECRET ou METRICS_API_KEY).'
     );
     return;
   }
@@ -908,14 +914,24 @@ router.patch('/users/:id/has-paid', async (req: Request, res: Response) => {
     return;
   }
   try {
-    const { error } = await supabase
+    const { data: updatedRows, error } = await supabase
       .from('profiles')
       .update({
         has_paid: hasPaid,
         is_ai_enabled: hasPaid,
       })
-      .eq('id', id);
+      .eq('id', id)
+      .select('id, has_paid');
     if (error) throw error;
+    if (!updatedRows?.length) {
+      sendApiError(
+        res,
+        404,
+        'NOT_FOUND',
+        'Nenhuma linha em public.profiles com este id — has_paid não foi alterado (perfil ausente ou id diferente de auth.users.id).',
+      );
+      return;
+    }
     const actor = getAdminActor(req);
     pushAdminAudit({
       actor,
