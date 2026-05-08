@@ -5,6 +5,7 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { subDays, startOfDay, formatISO } from 'date-fns';
 import { sessions } from '../services/whatsapp';
 import { getAdminEvents, pushAdminEvent, AdminApp, AdminEventStatus } from '../services/adminEvents';
+import { setProfileHasPaidByUserId } from '../lib/profileHasPaid';
 
 dotenv.config();
 
@@ -914,24 +915,16 @@ router.patch('/users/:id/has-paid', async (req: Request, res: Response) => {
     return;
   }
   try {
-    const { data: updatedRows, error } = await supabase
-      .from('profiles')
-      .update({
-        has_paid: hasPaid,
-        is_ai_enabled: hasPaid,
-      })
-      .eq('id', id)
-      .select('id, has_paid');
-    if (error) throw error;
-    if (!updatedRows?.length) {
-      sendApiError(
-        res,
-        404,
-        'NOT_FOUND',
-        'Nenhuma linha em public.profiles com este id — has_paid não foi alterado (perfil ausente ou id diferente de auth.users.id).',
-      );
+    const paidResult = await setProfileHasPaidByUserId(supabase, id, hasPaid);
+    if (!paidResult.ok) {
+      const msg = paidResult.error;
+      const low = msg.toLowerCase();
+      const isAuthMissing =
+        low.includes('not found') || low.includes('sem id') || low.includes('user not found');
+      sendApiError(res, isAuthMissing ? 404 : 500, isAuthMissing ? 'NOT_FOUND' : 'INTERNAL_ERROR', msg);
       return;
     }
+
     const actor = getAdminActor(req);
     pushAdminAudit({
       actor,

@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { pushAdminEvent } from '../services/adminEvents';
 import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
+import { setProfileHasPaidByUserId } from '../lib/profileHasPaid';
 
 dotenv.config();
 const router = express.Router();
@@ -94,11 +95,9 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
         }
       }
       if (userId) {
-        await supabase
-          .from('profiles')
-          .update({ has_paid: true, is_ai_enabled: true })
-          .eq('id', userId);
-        console.log(`✅ Pagamento confirmado para o utilizador: ${userId}`);
+        const r = await setProfileHasPaidByUserId(supabase, userId, true);
+        if (!r.ok) console.error('[stripe webhook] checkout.session.completed profiles:', r.error);
+        else console.log(`✅ Pagamento confirmado para o utilizador: ${userId}`);
         pushAdminEvent('wagoo', 'Pagamento confirmado — assinatura Wagoo ativa', 'online');
       }
       break;
@@ -110,21 +109,17 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
       const userId = sub.metadata?.supabase_user_id;
       if (!userId) break;
       if (sub.status === 'active' || sub.status === 'trialing') {
-        await supabase
-          .from('profiles')
-          .update({ has_paid: true, is_ai_enabled: true })
-          .eq('id', userId);
-        console.log(`✅ Assinatura ${sub.status} — has_paid=true: ${userId}`);
+        const r = await setProfileHasPaidByUserId(supabase, userId, true);
+        if (!r.ok) console.error('[stripe webhook] customer.subscription.updated (paid):', r.error);
+        else console.log(`✅ Assinatura ${sub.status} — has_paid=true: ${userId}`);
       } else if (
         sub.status === 'canceled' ||
         sub.status === 'unpaid' ||
         sub.status === 'incomplete_expired'
       ) {
-        await supabase
-          .from('profiles')
-          .update({ has_paid: false, is_ai_enabled: false })
-          .eq('id', userId);
-        console.log(`🛑 Assinatura ${sub.status} — has_paid=false: ${userId}`);
+        const r = await setProfileHasPaidByUserId(supabase, userId, false);
+        if (!r.ok) console.error('[stripe webhook] customer.subscription.updated (unpaid):', r.error);
+        else console.log(`🛑 Assinatura ${sub.status} — has_paid=false: ${userId}`);
         pushAdminEvent('wagoo', 'Assinatura cancelada ou inadimplente', 'degraded');
       }
       break;
@@ -134,11 +129,9 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
       const sub = event.data.object as Stripe.Subscription;
       const userId = sub.metadata?.supabase_user_id;
       if (userId) {
-        await supabase
-          .from('profiles')
-          .update({ has_paid: false, is_ai_enabled: false })
-          .eq('id', userId);
-        console.log(`🛑 Subscription deleted — has_paid=false: ${userId}`);
+        const r = await setProfileHasPaidByUserId(supabase, userId, false);
+        if (!r.ok) console.error('[stripe webhook] customer.subscription.deleted:', r.error);
+        else console.log(`🛑 Subscription deleted — has_paid=false: ${userId}`);
         pushAdminEvent('wagoo', 'Assinatura removida', 'degraded');
       }
       break;
@@ -153,11 +146,9 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
         const sub = await stripe.subscriptions.retrieve(subId);
         const userId = sub.metadata?.supabase_user_id;
         if (userId && (sub.status === 'active' || sub.status === 'trialing')) {
-          await supabase
-            .from('profiles')
-            .update({ has_paid: true, is_ai_enabled: true })
-            .eq('id', userId);
-          console.log(`✅ invoice.payment_succeeded — has_paid=true: ${userId}`);
+          const r = await setProfileHasPaidByUserId(supabase, userId, true);
+          if (!r.ok) console.error('[stripe webhook] invoice.payment_succeeded:', r.error);
+          else console.log(`✅ invoice.payment_succeeded — has_paid=true: ${userId}`);
         }
       } catch (e) {
         console.error('[stripe webhook] invoice.payment_succeeded:', e);

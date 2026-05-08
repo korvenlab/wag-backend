@@ -24,7 +24,7 @@ const supabase = createClient(
 // 1. Configuração de CORS (Essencial para o Frontend conseguir salvar configurações)
 app.use(cors({
   origin: true, 
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: [
     'Content-Type',
     'Authorization',
