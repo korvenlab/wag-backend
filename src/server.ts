@@ -10,7 +10,8 @@ import adminDashboardRoutes from './routes/adminDashboard';
 import feedbackRoutes from './routes/feedback';
 import { pushAdminEvent } from './services/adminEvents';
 import { startWhatsApp, autoReconnectAll, disconnectWhatsApp } from './services/whatsapp';
-import { generateAuthUrl, getTokensFromCode } from './services/googleAuth'; 
+import { generateAuthUrl, getTokensFromCode } from './services/googleAuth';
+import { getUserFromBearerHeader } from './lib/supabaseAuthUser';
 
 const app = express();
 const port: number = process.env.PORT ? Number(process.env.PORT) : 3000;
@@ -40,21 +41,25 @@ app.use(express.json());
 app.use('/feedback', feedbackRoutes);
 app.use('/api/admin', adminDashboardRoutes);
 
-// --- 1. ROTA DE PERFIL ---
+// --- 1. ROTA DE PERFIL (somente dono da sessão — Bearer Supabase) ---
 app.get('/api/user/profile', async (req: Request, res: Response) => {
-  const { email } = req.query;
-  if (!email) return res.status(400).json({ error: 'Email necessário' });
-
   try {
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('*')
-      .eq('email', String(email).trim().toLowerCase())
-      .single();
+    const auth = await getUserFromBearerHeader(supabase, req.headers.authorization);
+    if (!auth.ok) {
+      return res.status(401).json({
+        error:
+          auth.reason === 'missing_token'
+            ? 'Envie Authorization: Bearer com o access_token da sessão.'
+            : 'Sessão inválida ou expirada. Faça login novamente.',
+      });
+    }
 
-    if (error || !data) return res.status(404).json({ error: 'Perfil não encontrado' });
+    const { data, error } = await supabase.from('profiles').select('*').eq('id', auth.user.id).maybeSingle();
+
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: 'Perfil não encontrado' });
     res.json(data);
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: 'Erro interno' });
   }
 });

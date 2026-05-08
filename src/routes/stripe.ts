@@ -3,6 +3,7 @@ import Stripe from 'stripe';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { pushAdminEvent } from '../services/adminEvents';
+import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 
 dotenv.config();
 const router = express.Router();
@@ -22,10 +23,25 @@ const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SE
 // ==========================================
 router.post('/create-checkout-session', express.json(), async (req: Request, res: Response) => {
   try {
+    const auth = await getUserFromBearerHeader(supabase, req.headers.authorization);
+    if (!auth.ok) {
+      return res.status(401).json({
+        error:
+          auth.reason === 'missing_token'
+            ? 'Faça login e envie Authorization: Bearer (access_token).'
+            : 'Sessão inválida ou expirada.',
+      });
+    }
+
     const { email, userId } = req.body;
-    
+
     if (!email || !userId) {
        return res.status(400).json({ error: "Email e userId são obrigatórios." });
+    }
+
+    const emailNorm = String(email).trim().toLowerCase();
+    if (auth.user.id !== userId || auth.user.email?.toLowerCase() !== emailNorm) {
+      return res.status(403).json({ error: 'Os dados não coincidem com o usuário logado.' });
     }
 
     const priceId = process.env.STRIPE_PRICE_ID?.trim();
@@ -35,10 +51,10 @@ router.post('/create-checkout-session', express.json(), async (req: Request, res
       payment_method_types: ['card'],
       line_items: [{ price: priceId, quantity: 1 }],
       mode: 'subscription',
-      customer_email: email,
+      customer_email: emailNorm,
       client_reference_id: userId,
-      success_url: `${frontendUrl}/dashboard?success=true`,
-      cancel_url: `${frontendUrl}/pricing`,
+      success_url: `${frontendUrl}/dashboard?checkout=success`,
+      cancel_url: `${frontendUrl}/?checkout=canceled#precos`,
       subscription_data: { metadata: { supabase_user_id: userId } },
     });
     res.json({ url: session.url });
