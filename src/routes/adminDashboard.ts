@@ -7,7 +7,12 @@ import { subDays, startOfDay, formatISO } from 'date-fns';
 import { sessions } from '../services/whatsapp';
 import { getAdminEvents, pushAdminEvent, AdminApp, AdminEventStatus } from '../services/adminEvents';
 import { setProfileHasPaidByUserId } from '../lib/profileHasPaid';
-import { isComplimentaryAccessActive, profileHasWagooAccess, rowHasPaidTrue } from '../lib/profileAccess';
+import {
+  complimentaryUntilToMillis,
+  isComplimentaryAccessActive,
+  profileHasWagooAccess,
+  rowHasPaidTrue,
+} from '../lib/profileAccess';
 import { supabase } from '../lib/supabase';
 
 dotenv.config();
@@ -579,7 +584,7 @@ function normalizeAdminUser(
     is_active?: boolean | null;
     deleted_at?: string | null;
     has_paid?: unknown;
-    complimentary_access_until?: string | null;
+    complimentary_access_until?: unknown;
   }
 ): AdminUserRowCore {
   const role =
@@ -603,10 +608,14 @@ function normalizeAdminUser(
         : true);
 
   const hasPaid = rowHasPaidTrue(profile?.has_paid);
+  const untilRaw = profile?.complimentary_access_until;
   const hasAccess = profileHasWagooAccess({
     has_paid: profile?.has_paid,
-    complimentary_access_until: profile?.complimentary_access_until ?? undefined,
+    complimentary_access_until: untilRaw,
   });
+  const untilMs = complimentaryUntilToMillis(untilRaw);
+  const complimentaryIso =
+    untilMs != null && Number.isFinite(untilMs) ? new Date(untilMs).toISOString() : null;
 
   return {
     id: authUser.id,
@@ -619,7 +628,7 @@ function normalizeAdminUser(
     active,
     hasPaid,
     hasAccess,
-    complimentary_access_until: profile?.complimentary_access_until ?? null,
+    complimentary_access_until: complimentaryIso ?? (typeof untilRaw === 'string' ? untilRaw.trim() || null : null),
     createdAt: authUser.created_at || new Date(0).toISOString(),
     lastSignInAt: authUser.last_sign_in_at || null,
   };
@@ -661,7 +670,7 @@ function buildWagooAdminUserRow(
         is_active?: boolean | null;
         deleted_at?: string | null;
         has_paid?: unknown;
-        complimentary_access_until?: string | null;
+        complimentary_access_until?: unknown;
       }
     | undefined;
   const base = normalizeAdminUser(authUser, profile);
@@ -684,25 +693,42 @@ function buildWagooAdminUserRow(
   };
 }
 
+const PROFILE_ADMIN_SELECT =
+  'id, email, store_name, role, is_active, deleted_at, has_paid, complimentary_access_until';
+
 async function getUserProfileMap(ids: string[]): Promise<Map<string, Record<string, unknown>>> {
   const map = new Map<string, Record<string, unknown>>();
   if (ids.length === 0) return map;
   const idsNorm = [...new Set(ids.map((id) => normalizeAuthUserId(id)))];
-  const { data, error } = await supabase
-    .from('profiles')
-    .select('id, email, store_name, role, is_active, deleted_at, has_paid, complimentary_access_until')
-    .in('id', idsNorm);
-  if (error || !data) return map;
-  for (const row of data as unknown as Record<string, unknown>[]) {
-    const rawId = row.id;
-    const key =
-      typeof rawId === 'string'
-        ? normalizeAuthUserId(rawId)
-        : rawId != null
-          ? normalizeAuthUserId(String(rawId))
-          : '';
-    if (key) map.set(key, row);
+  const { data, error } = await supabase.from('profiles').select(PROFILE_ADMIN_SELECT).in('id', idsNorm);
+  if (data) {
+    for (const row of data as unknown as Record<string, unknown>[]) {
+      const rawId = row.id;
+      const key =
+        typeof rawId === 'string'
+          ? normalizeAuthUserId(rawId)
+          : rawId != null
+            ? normalizeAuthUserId(String(rawId))
+            : '';
+      if (key) map.set(key, row);
+    }
   }
+  const missing = idsNorm.filter((id) => !map.has(id));
+  if (!missing.length) return map;
+  /** `.in()` por vezes omite linhas (URL longa, tipos, etc.); garante lookup por id como o `/api/user/profile`. */
+  await Promise.all(
+    missing.map(async (id) => {
+      const { data: one, error: e2 } = await supabase
+        .from('profiles')
+        .select(PROFILE_ADMIN_SELECT)
+        .eq('id', id)
+        .maybeSingle();
+      if (!e2 && one) {
+        const row = one as Record<string, unknown>;
+        map.set(id, row);
+      }
+    }),
+  );
   return map;
 }
 

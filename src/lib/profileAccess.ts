@@ -5,17 +5,36 @@
 export type ProfileAccessRow = {
   /** Valor cru de `profiles.has_paid` (boolean, texto manual, bigint, etc.). */
   has_paid?: unknown;
-  complimentary_access_until?: string | null;
+  /** Valor cru da coluna (ISO, epoch segundos/ms, etc.). */
+  complimentary_access_until?: unknown;
 };
+
+/** Epoch em segundos (PostgREST / JSON às vezes devolve número ~1e9–1e10). */
+function epochNumberToMillis(n: number): number {
+  if (!Number.isFinite(n) || n <= 0) return NaN;
+  if (n < 10_000_000_000) return Math.round(n * 1000);
+  return Math.round(n);
+}
 
 /** Converte `complimentary_access_until` vindo do PostgREST / cliente (string, Date, ms) em epoch ms ou null. */
 export function complimentaryUntilToMillis(until: unknown): number | null {
   if (until === null || until === undefined) return null;
   if (typeof until === 'string') {
-    const t = new Date(until.trim()).getTime();
-    return Number.isFinite(t) ? t : null;
+    const s = until.trim();
+    if (!s) return null;
+    const fromIso = new Date(s).getTime();
+    if (Number.isFinite(fromIso)) return fromIso;
+    const n = Number(s);
+    if (Number.isFinite(n) && n > 0) {
+      const ms = epochNumberToMillis(n);
+      return Number.isFinite(ms) ? ms : null;
+    }
+    return null;
   }
-  if (typeof until === 'number' && Number.isFinite(until) && until > 1e12) return until;
+  if (typeof until === 'number' && Number.isFinite(until) && until > 0) {
+    const ms = epochNumberToMillis(until);
+    return Number.isFinite(ms) ? ms : null;
+  }
   if (until instanceof Date) {
     const t = until.getTime();
     return Number.isFinite(t) ? t : null;
@@ -51,5 +70,5 @@ export function rowHasPaidTrue(v: unknown): boolean {
 export function profileHasWagooAccess(row: ProfileAccessRow | null | undefined): boolean {
   if (!row) return false;
   if (rowHasPaidTrue(row.has_paid)) return true;
-  return isComplimentaryAccessActive(row.complimentary_access_until ?? undefined);
+  return isComplimentaryAccessActive(row.complimentary_access_until);
 }
