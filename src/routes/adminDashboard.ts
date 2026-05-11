@@ -7,7 +7,7 @@ import { subDays, startOfDay, formatISO } from 'date-fns';
 import { sessions } from '../services/whatsapp';
 import { getAdminEvents, pushAdminEvent, AdminApp, AdminEventStatus } from '../services/adminEvents';
 import { setProfileHasPaidByUserId } from '../lib/profileHasPaid';
-import { profileHasWagooAccess, rowHasPaidTrue } from '../lib/profileAccess';
+import { isComplimentaryAccessActive, profileHasWagooAccess, rowHasPaidTrue } from '../lib/profileAccess';
 
 dotenv.config();
 
@@ -435,11 +435,71 @@ type AdminUserRow = {
   /** Acesso efetivo Wagoo (Stripe ou cortesia). */
   hasAccess: boolean;
   complimentary_access_until?: string | null;
-  /** True se existir resgate em `wagoo_promo_redemptions` (link / convite). */
+  /** True se existir linha em `wagoo_promo_redemptions` (já resgatou algum link alguma vez). */
   complimentaryViaLink?: boolean;
+  /** Origem dos canais que **hoje** concedem acesso (resumo para a tabela Korven). */
+  accessOriginSummary: string;
+  /** Texto longo para tooltip: Stripe vs link vs base. */
+  accessOriginDetail: string;
   createdAt: string;
   lastSignInAt: string | null;
 };
+
+type AdminUserRowCore = Omit<
+  AdminUserRow,
+  'complimentaryViaLink' | 'accessOriginSummary' | 'accessOriginDetail'
+>;
+
+/** Explica canais que habilitam acesso (has_paid, cortesia por link, cortesia na base). */
+function buildWagooAccessOriginPT(input: {
+  hasAccess: boolean;
+  hasPaid: boolean;
+  complimentaryActive: boolean;
+  hasPromoRedemption: boolean;
+}): { accessOriginSummary: string; accessOriginDetail: string } {
+  const { hasAccess, hasPaid, complimentaryActive, hasPromoRedemption } = input;
+
+  if (!hasAccess) {
+    return {
+      accessOriginSummary: 'Sem acesso',
+      accessOriginDetail:
+        'Nenhum canal activo: profiles.has_paid inactivo e complimentary_access_until vazio ou já expirado.',
+    };
+  }
+
+  const parts: string[] = [];
+  if (hasPaid) parts.push('Assinatura (has_paid)');
+  if (complimentaryActive) {
+    parts.push(hasPromoRedemption ? 'Cortesia (link)' : 'Cortesia (base de dados)');
+  }
+
+  let accessOriginSummary = '—';
+  if (parts.length === 2) accessOriginSummary = 'Assinatura + cortesia';
+  else if (parts.length === 1) accessOriginSummary = parts[0]!;
+
+  const detailBits: string[] = [];
+  if (hasPaid) {
+    detailBits.push(
+      'Canal assinatura: profiles.has_paid activo (Stripe via webhook ou alteração directa no Postgres — não distinguimos aqui).',
+    );
+  }
+  if (complimentaryActive) {
+    if (hasPromoRedemption) {
+      detailBits.push(
+        'Canal cortesia: prazo activo em profiles.complimentary_access_until com resgate registado em wagoo_promo_redemptions (link / convite).',
+      );
+    } else {
+      detailBits.push(
+        'Canal cortesia: prazo activo em profiles.complimentary_access_until sem resgate de link (console Korven «Ajustar cortesia» ou SQL na base).',
+      );
+    }
+  }
+  if (!detailBits.length) {
+    detailBits.push('Acesso activo; verifique profiles.has_paid e complimentary_access_until.');
+  }
+
+  return { accessOriginSummary, accessOriginDetail: detailBits.join(' ') };
+}
 
 /** Body JSON do PATCH has-paid: aceita hasPaid ou has_paid (boolean, número ou string). */
 function parseHasPaidFromRequestBody(body: unknown): boolean | null {
@@ -475,7 +535,7 @@ function normalizeAdminUser(
     has_paid?: unknown;
     complimentary_access_until?: string | null;
   }
-): AdminUserRow {
+): AdminUserRowCore {
   const role =
     (profile?.role as string | undefined) ||
     (authUser.app_metadata?.role as string | undefined) ||
@@ -558,7 +618,21 @@ async function buildWagooAdminUserRow(
       }
     | undefined;
   const base = normalizeAdminUser(authUser, profile);
-  return { ...base, complimentaryViaLink: promoUserIds.has(authUser.id) };
+  const hasPromoRedemption = promoUserIds.has(authUser.id);
+  const complimentaryActive = isComplimentaryAccessActive(base.complimentary_access_until ?? undefined);
+  const { accessOriginSummary, accessOriginDetail } = buildWagooAccessOriginPT({
+    hasAccess: base.hasAccess,
+    hasPaid: base.hasPaid,
+    complimentaryActive,
+    hasPromoRedemption,
+  });
+
+  return {
+    ...base,
+    complimentaryViaLink: hasPromoRedemption,
+    accessOriginSummary,
+    accessOriginDetail,
+  };
 }
 
 async function getUserProfileMap(ids: string[]): Promise<Map<string, Record<string, unknown>>> {
