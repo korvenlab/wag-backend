@@ -8,10 +8,24 @@ export type ProfileAccessRow = {
   complimentary_access_until?: string | null;
 };
 
-export function isComplimentaryAccessActive(until: string | null | undefined): boolean {
-  if (!until || typeof until !== 'string') return false;
-  const t = new Date(until).getTime();
-  return Number.isFinite(t) && t > Date.now();
+/** Converte `complimentary_access_until` vindo do PostgREST / cliente (string, Date, ms) em epoch ms ou null. */
+export function complimentaryUntilToMillis(until: unknown): number | null {
+  if (until === null || until === undefined) return null;
+  if (typeof until === 'string') {
+    const t = new Date(until.trim()).getTime();
+    return Number.isFinite(t) ? t : null;
+  }
+  if (typeof until === 'number' && Number.isFinite(until) && until > 1e12) return until;
+  if (until instanceof Date) {
+    const t = until.getTime();
+    return Number.isFinite(t) ? t : null;
+  }
+  return null;
+}
+
+export function isComplimentaryAccessActive(until: string | null | undefined | unknown): boolean {
+  const ms = complimentaryUntilToMillis(until);
+  return ms != null && ms > Date.now();
 }
 
 /** Normaliza `has_paid` vindo do Postgres / edições manuais (texto, bigint, etc.). */

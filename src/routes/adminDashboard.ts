@@ -363,6 +363,19 @@ async function fetchAuthUsersAll(): Promise<
   return users;
 }
 
+/** Auth e `profiles.id` devem coincidir; normaliza para evitar falha de lookup por casing. */
+function normalizeAuthUserId(id: string): string {
+  return String(id || '').trim().toLowerCase();
+}
+
+function profileRowForUser(
+  profileMap: Map<string, Record<string, unknown>>,
+  authUserId: string,
+): Record<string, unknown> | undefined {
+  const key = normalizeAuthUserId(authUserId);
+  return profileMap.get(key) ?? profileMap.get(authUserId.trim());
+}
+
 async function healthSupabase(): Promise<boolean> {
   const { error } = await supabase.from('profiles').select('id', { head: true, count: 'exact' }).limit(1);
   return !error;
@@ -582,13 +595,14 @@ function normalizeAdminUser(
 async function getUserIdsWithPromoRedemption(userIds: string[]): Promise<Set<string>> {
   const out = new Set<string>();
   if (!userIds.length) return out;
+  const idsNorm = [...new Set(userIds.map((id) => normalizeAuthUserId(id)))];
   const { data, error } = await supabase
     .from('wagoo_promo_redemptions')
     .select('user_id')
-    .in('user_id', userIds);
+    .in('user_id', idsNorm);
   if (error || !data) return out;
   for (const row of data as { user_id?: string }[]) {
-    if (typeof row.user_id === 'string') out.add(row.user_id);
+    if (typeof row.user_id === 'string') out.add(normalizeAuthUserId(row.user_id));
   }
   return out;
 }
@@ -606,7 +620,7 @@ async function buildWagooAdminUserRow(
   profileMap: Map<string, Record<string, unknown>>,
   promoUserIds: Set<string>,
 ): AdminUserRow {
-  const profile = profileMap.get(authUser.id) as
+  const profile = profileRowForUser(profileMap, authUser.id) as
     | {
         email?: string | null;
         store_name?: string | null;
@@ -618,7 +632,7 @@ async function buildWagooAdminUserRow(
       }
     | undefined;
   const base = normalizeAdminUser(authUser, profile);
-  const hasPromoRedemption = promoUserIds.has(authUser.id);
+  const hasPromoRedemption = promoUserIds.has(normalizeAuthUserId(authUser.id));
   const complimentaryActive = isComplimentaryAccessActive(base.complimentary_access_until ?? undefined);
   const { accessOriginSummary, accessOriginDetail } = buildWagooAccessOriginPT({
     hasAccess: base.hasAccess,
@@ -638,14 +652,21 @@ async function buildWagooAdminUserRow(
 async function getUserProfileMap(ids: string[]): Promise<Map<string, Record<string, unknown>>> {
   const map = new Map<string, Record<string, unknown>>();
   if (ids.length === 0) return map;
+  const idsNorm = [...new Set(ids.map((id) => normalizeAuthUserId(id)))];
   const { data, error } = await supabase
     .from('profiles')
     .select('id, email, store_name, role, is_active, deleted_at, has_paid, complimentary_access_until')
-    .in('id', ids);
+    .in('id', idsNorm);
   if (error || !data) return map;
   for (const row of data as unknown as Record<string, unknown>[]) {
-    const id = row.id;
-    if (typeof id === 'string') map.set(id, row);
+    const rawId = row.id;
+    const key =
+      typeof rawId === 'string'
+        ? normalizeAuthUserId(rawId)
+        : rawId != null
+          ? normalizeAuthUserId(String(rawId))
+          : '';
+    if (key) map.set(key, row);
   }
   return map;
 }
