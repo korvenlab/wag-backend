@@ -65,7 +65,7 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
     res.json({
       ...row,
       has_access: profileHasWagooAccess({
-        has_paid: row.has_paid as boolean | undefined,
+        has_paid: row.has_paid,
         complimentary_access_until: row.complimentary_access_until as string | undefined,
       }),
     });

@@ -7,7 +7,7 @@ import { subDays, startOfDay, formatISO } from 'date-fns';
 import { sessions } from '../services/whatsapp';
 import { getAdminEvents, pushAdminEvent, AdminApp, AdminEventStatus } from '../services/adminEvents';
 import { setProfileHasPaidByUserId } from '../lib/profileHasPaid';
-import { profileHasWagooAccess } from '../lib/profileAccess';
+import { profileHasWagooAccess, rowHasPaidTrue } from '../lib/profileAccess';
 
 dotenv.config();
 
@@ -441,22 +441,6 @@ type AdminUserRow = {
   lastSignInAt: string | null;
 };
 
-/**
- * Coluna `profiles.has_paid`: tipicamente boolean no Postgres.
- * Se vier como texto ("TRUE"/"FALSE"), `!!"FALSE"` seria true em JS — normaliza aqui.
- */
-function profileHasPaidToBoolean(v: unknown): boolean {
-  if (v === true || v === false) return v;
-  if (v === null || v === undefined) return false;
-  if (typeof v === 'number' && Number.isFinite(v)) return v !== 0;
-  if (typeof v === 'string') {
-    const s = v.trim().toLowerCase();
-    if (['true', 't', '1', 'yes'].includes(s)) return true;
-    if (['false', 'f', '0', 'no'].includes(s)) return false;
-  }
-  return false;
-}
-
 /** Body JSON do PATCH has-paid: aceita hasPaid ou has_paid (boolean, número ou string). */
 function parseHasPaidFromRequestBody(body: unknown): boolean | null {
   if (!body || typeof body !== 'object') return null;
@@ -512,9 +496,9 @@ function normalizeAdminUser(
         ? activeFromMeta
         : true);
 
-  const hasPaid = profileHasPaidToBoolean(profile?.has_paid);
+  const hasPaid = rowHasPaidTrue(profile?.has_paid);
   const hasAccess = profileHasWagooAccess({
-    has_paid: hasPaid,
+    has_paid: profile?.has_paid,
     complimentary_access_until: profile?.complimentary_access_until ?? undefined,
   });
 
@@ -1029,7 +1013,7 @@ router.patch('/users/:id/complimentary-access', async (req: Request, res: Respon
       .maybeSingle();
     if (profErr) throw new Error(profErr.message);
 
-    const hasPaid = profileHasPaidToBoolean((prof as { has_paid?: unknown } | null)?.has_paid);
+    const hasPaid = rowHasPaidTrue((prof as { has_paid?: unknown } | null)?.has_paid);
     let newUntil: string | null;
 
     if (preset === 'none') {
