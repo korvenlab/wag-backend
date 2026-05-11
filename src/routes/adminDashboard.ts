@@ -1204,6 +1204,33 @@ router.patch('/wagoo/promo-links/:id', async (req: Request, res: Response) => {
   }
 });
 
+/** Korven: remove link de cortesia (`wagoo_promo_redemptions` em CASCADE). */
+router.delete('/wagoo/promo-links/:id', async (req: Request, res: Response) => {
+  const id = String(req.params.id || '').trim();
+  if (!id) {
+    sendApiError(res, 400, 'VALIDATION_ERROR', 'id é obrigatório.');
+    return;
+  }
+  try {
+    const { data, error } = await supabase.from('wagoo_promo_links').delete().eq('id', id).select('id').maybeSingle();
+    if (error) throw error;
+    if (!data) {
+      sendApiError(res, 404, 'NOT_FOUND', 'Link não encontrado.');
+      return;
+    }
+    const actor = getAdminActor(req);
+    pushAdminAudit({
+      actor,
+      action: 'wagoo.promo_link.delete',
+      target: id,
+      timestamp: new Date().toISOString(),
+    });
+    res.status(200).type(JSON_UTF8).json({ ok: true, data: { id, deleted: true } });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
 router.get('/audit', (_req: Request, res: Response) => {
   res.status(200).type(JSON_UTF8).json({ ok: true, data: { items: adminAudit } });
 });
