@@ -1,12 +1,29 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { isComplimentaryAccessActive } from './profileAccess';
 
 export type SetProfileHasPaidResult =
   | { ok: true; rows: Array<{ id: string; has_paid: boolean }> }
   | { ok: false; error: string };
 
+async function resolveAiEnabledForHasPaid(
+  supabase: SupabaseClient,
+  userId: string,
+  hasPaid: boolean,
+): Promise<boolean> {
+  if (hasPaid) return true;
+  const { data } = await supabase
+    .from('profiles')
+    .select('complimentary_access_until')
+    .eq('id', userId)
+    .maybeSingle();
+  const until = (data as { complimentary_access_until?: string | null } | null)?.complimentary_access_until;
+  return isComplimentaryAccessActive(until ?? undefined);
+}
+
 /**
  * Atualiza `profiles.has_paid` + `is_ai_enabled` para o UUID de `auth.users`.
  * Se não existir linha em `public.profiles`, faz upsert (caso comum: usuário em Auth sem perfil criado).
+ * Ao revogar Stripe (`has_paid=false`), mantém IA ligada se ainda houver cortesia ativa.
  */
 export async function setProfileHasPaidByUserId(
   supabase: SupabaseClient,
@@ -16,9 +33,11 @@ export async function setProfileHasPaidByUserId(
   const id = String(userId || '').trim();
   if (!id) return { ok: false, error: 'userId vazio' };
 
+  const isAiEnabled = await resolveAiEnabledForHasPaid(supabase, id, hasPaid);
+
   const { data: updated, error: upErr } = await supabase
     .from('profiles')
-    .update({ has_paid: hasPaid, is_ai_enabled: hasPaid })
+    .update({ has_paid: hasPaid, is_ai_enabled: isAiEnabled })
     .eq('id', id)
     .select('id, has_paid');
   if (upErr) return { ok: false, error: upErr.message };
@@ -44,6 +63,9 @@ export async function setProfileHasPaidByUserId(
     is_ai_enabled: hasPaid,
     is_active: true,
   };
+  if (!hasPaid) {
+    row.is_ai_enabled = await resolveAiEnabledForHasPaid(supabase, id, false);
+  }
   if (emailNorm) row.email = emailNorm;
 
   const { data: inserted, error: insErr } = await supabase

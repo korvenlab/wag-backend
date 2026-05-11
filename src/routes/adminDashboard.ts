@@ -1,4 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
+import crypto from 'crypto';
 import dotenv from 'dotenv';
 import Stripe from 'stripe';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
@@ -6,6 +7,7 @@ import { subDays, startOfDay, formatISO } from 'date-fns';
 import { sessions } from '../services/whatsapp';
 import { getAdminEvents, pushAdminEvent, AdminApp, AdminEventStatus } from '../services/adminEvents';
 import { setProfileHasPaidByUserId } from '../lib/profileHasPaid';
+import { profileHasWagooAccess } from '../lib/profileAccess';
 
 dotenv.config();
 
@@ -430,6 +432,9 @@ type AdminUserRow = {
   role: string;
   active: boolean;
   hasPaid: boolean;
+  /** Acesso efetivo Wagoo (Stripe ou cortesia). */
+  hasAccess: boolean;
+  complimentary_access_until?: string | null;
   createdAt: string;
   lastSignInAt: string | null;
 };
@@ -482,6 +487,7 @@ function normalizeAdminUser(
     is_active?: boolean | null;
     deleted_at?: string | null;
     has_paid?: unknown;
+    complimentary_access_until?: string | null;
   }
 ): AdminUserRow {
   const role =
@@ -505,6 +511,10 @@ function normalizeAdminUser(
         : true);
 
   const hasPaid = profileHasPaidToBoolean(profile?.has_paid);
+  const hasAccess = profileHasWagooAccess({
+    has_paid: hasPaid,
+    complimentary_access_until: profile?.complimentary_access_until ?? undefined,
+  });
 
   return {
     id: authUser.id,
@@ -516,6 +526,8 @@ function normalizeAdminUser(
     role,
     active,
     hasPaid,
+    hasAccess,
+    complimentary_access_until: profile?.complimentary_access_until ?? null,
     createdAt: authUser.created_at || new Date(0).toISOString(),
     lastSignInAt: authUser.last_sign_in_at || null,
   };
@@ -526,7 +538,7 @@ async function getUserProfileMap(ids: string[]): Promise<Map<string, Record<stri
   if (ids.length === 0) return map;
   const { data, error } = await supabase
     .from('profiles')
-    .select('id, email, store_name, role, is_active, deleted_at, has_paid')
+    .select('id, email, store_name, role, is_active, deleted_at, has_paid, complimentary_access_until')
     .in('id', ids);
   if (error || !data) return map;
   for (const row of data as unknown as Record<string, unknown>[]) {
@@ -1050,6 +1062,143 @@ router.get('/users/:id/assets', async (req: Request, res: Response) => {
     }
 
     res.status(200).type(JSON_UTF8).json({ ok: true, data: { items } });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
+function generateWagooPromoCode(): string {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  const buf = crypto.randomBytes(16);
+  let out = '';
+  for (let i = 0; i < buf.length; i++) {
+    out += alphabet[buf[i]! % alphabet.length];
+  }
+  return out.slice(0, 12);
+}
+
+function wagooPublicBaseUrl(): string {
+  return (process.env.FRONTEND_URL || 'https://wagoobot.com').replace(/\/+$/, '');
+}
+
+/** Korven: lista links de cortesia Wagoo (`wagoo_promo_links`). */
+router.get('/wagoo/promo-links', async (_req: Request, res: Response) => {
+  try {
+    const { data, error } = await supabase
+      .from('wagoo_promo_links')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    const base = wagooPublicBaseUrl();
+    const items = (data ?? []).map((row: Record<string, unknown>) => {
+      const code = String(row.code || '');
+      return {
+        ...row,
+        signup_url: `${base}/login?wagoo_promo=${encodeURIComponent(code)}`,
+      };
+    });
+    res.status(200).type(JSON_UTF8).json({ ok: true, data: { items } });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
+/** Korven: cria link de cortesia (padrão 60 dias ≈ 2 meses). */
+router.post('/wagoo/promo-links', async (req: Request, res: Response) => {
+  try {
+    const body = req.body as Record<string, unknown>;
+    const label = typeof body.label === 'string' ? body.label.trim().slice(0, 200) : null;
+    let days = 60;
+    if (typeof body.complimentary_days === 'number' && Number.isFinite(body.complimentary_days)) {
+      days = Math.min(730, Math.max(1, Math.round(body.complimentary_days)));
+    }
+    let maxRedemptions: number | null = null;
+    if (body.max_redemptions === null) maxRedemptions = null;
+    else if (typeof body.max_redemptions === 'number' && Number.isFinite(body.max_redemptions)) {
+      maxRedemptions = Math.max(1, Math.round(body.max_redemptions));
+    }
+    let expiresAt: string | null = null;
+    if (typeof body.expires_at === 'string' && body.expires_at.trim()) {
+      const d = new Date(body.expires_at);
+      if (!Number.isNaN(d.getTime())) expiresAt = d.toISOString();
+    }
+
+    let code = generateWagooPromoCode();
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const { data, error } = await supabase
+        .from('wagoo_promo_links')
+        .insert({
+          code,
+          label: label || null,
+          complimentary_days: days,
+          max_redemptions: maxRedemptions,
+          expires_at: expiresAt,
+        })
+        .select('*')
+        .single();
+      if (!error && data) {
+        const base = wagooPublicBaseUrl();
+        const actor = getAdminActor(req);
+        pushAdminAudit({
+          actor,
+          action: 'wagoo.promo_link.create',
+          target: String(data.id),
+          timestamp: new Date().toISOString(),
+          meta: { code: data.code },
+        });
+        return res.status(200).type(JSON_UTF8).json({
+          ok: true,
+          data: {
+            ...data,
+            signup_url: `${base}/login?wagoo_promo=${encodeURIComponent(String(data.code))}`,
+          },
+        });
+      }
+      if (error?.code !== '23505') {
+        throw new Error(error?.message || 'insert failed');
+      }
+      code = generateWagooPromoCode();
+    }
+    sendApiError(res, 500, 'INTERNAL_ERROR', 'Não foi possível gerar código único.');
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
+/** Korven: ativa/desativa link de cortesia. */
+router.patch('/wagoo/promo-links/:id', async (req: Request, res: Response) => {
+  const id = String(req.params.id || '').trim();
+  if (!id) {
+    sendApiError(res, 400, 'VALIDATION_ERROR', 'id é obrigatório.');
+    return;
+  }
+  const active = req.body?.is_active;
+  if (typeof active !== 'boolean') {
+    sendApiError(res, 400, 'VALIDATION_ERROR', 'is_active (boolean) é obrigatório.');
+    return;
+  }
+  try {
+    const { data, error } = await supabase
+      .from('wagoo_promo_links')
+      .update({ is_active: active })
+      .eq('id', id)
+      .select('*')
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) {
+      sendApiError(res, 404, 'NOT_FOUND', 'Link não encontrado.');
+      return;
+    }
+    const actor = getAdminActor(req);
+    pushAdminAudit({
+      actor,
+      action: 'wagoo.promo_link.patch',
+      target: id,
+      timestamp: new Date().toISOString(),
+      meta: { is_active: active },
+    });
+    res.status(200).type(JSON_UTF8).json({ ok: true, data });
   } catch (e: unknown) {
     sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
   }

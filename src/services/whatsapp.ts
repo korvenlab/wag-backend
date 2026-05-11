@@ -15,6 +15,7 @@ import { createClient } from '@supabase/supabase-js';
 import { analyzeMessage, hasSchedulingIntent } from './ai';
 import { checkAvailability, createEvent, getBusySlots, findEventByPhone, deleteEvent } from './calendar';
 import { pushAdminEvent } from './adminEvents';
+import { profileHasWagooAccess } from '../lib/profileAccess';
 
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 export const sessions: Record<string, any> = {};
@@ -157,7 +158,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
       try {
         const { data: p } = await supabase.from('profiles').select('*').eq('email', email).single();
-        if (!p || !p.has_paid || !p.is_ai_enabled) return;
+        if (!p || !profileHasWagooAccess(p as { has_paid?: boolean; complimentary_access_until?: string | null }) || !p.is_ai_enabled) return;
 
         const sessionExists = !!memoryCache[cacheKey];
         const isExpired = sessionExists && (now - memoryCache[cacheKey].lastUpdate > SESSION_EXPIRATION);
@@ -249,6 +250,12 @@ export async function startWhatsApp(email: string, res: Response | null) {
 }
 
 export async function autoReconnectAll() {
-  const { data: profiles } = await supabase.from('profiles').select('email').eq('has_paid', true).eq('is_ai_enabled', true);
-  if (profiles) profiles.forEach(p => startWhatsApp(p.email, null));
+  const { data: profiles } = await supabase
+    .from('profiles')
+    .select('email, has_paid, complimentary_access_until, is_ai_enabled')
+    .eq('is_ai_enabled', true);
+  const eligible = (profiles ?? []).filter((p) =>
+    profileHasWagooAccess(p as { has_paid?: boolean; complimentary_access_until?: string | null }),
+  );
+  eligible.forEach((p) => startWhatsApp(p.email, null));
 }

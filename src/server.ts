@@ -8,6 +8,8 @@ import { createClient } from '@supabase/supabase-js';
 import stripeRoutes from './routes/stripe';
 import adminDashboardRoutes from './routes/adminDashboard';
 import feedbackRoutes from './routes/feedback';
+import promoRoutes from './routes/promo';
+import { profileHasWagooAccess } from './lib/profileAccess';
 import { pushAdminEvent } from './services/adminEvents';
 import { startWhatsApp, autoReconnectAll, disconnectWhatsApp } from './services/whatsapp';
 import { generateAuthUrl, getTokensFromCode } from './services/googleAuth';
@@ -40,6 +42,7 @@ app.use('/api/stripe', stripeRoutes);
 app.use(express.json());
 app.use('/feedback', feedbackRoutes);
 app.use('/api/admin', adminDashboardRoutes);
+app.use('/api/promo', promoRoutes);
 
 // --- 1. ROTA DE PERFIL (somente dono da sessão — Bearer Supabase) ---
 app.get('/api/user/profile', async (req: Request, res: Response) => {
@@ -58,7 +61,14 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
 
     if (error) return res.status(500).json({ error: error.message });
     if (!data) return res.status(404).json({ error: 'Perfil não encontrado' });
-    res.json(data);
+    const row = data as Record<string, unknown>;
+    res.json({
+      ...row,
+      has_access: profileHasWagooAccess({
+        has_paid: row.has_paid as boolean | undefined,
+        complimentary_access_until: row.complimentary_access_until as string | undefined,
+      }),
+    });
   } catch {
     res.status(500).json({ error: 'Erro interno' });
   }
