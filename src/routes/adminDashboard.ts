@@ -696,39 +696,61 @@ function buildWagooAdminUserRow(
 const PROFILE_ADMIN_SELECT =
   'id, email, store_name, role, is_active, deleted_at, has_paid, complimentary_access_until';
 
-async function getUserProfileMap(ids: string[]): Promise<Map<string, Record<string, unknown>>> {
-  const map = new Map<string, Record<string, unknown>>();
-  if (ids.length === 0) return map;
-  const idsNorm = [...new Set(ids.map((id) => normalizeAuthUserId(id)))];
-  const { data, error } = await supabase.from('profiles').select(PROFILE_ADMIN_SELECT).in('id', idsNorm);
-  if (data) {
-    for (const row of data as unknown as Record<string, unknown>[]) {
-      const rawId = row.id;
-      const key =
-        typeof rawId === 'string'
-          ? normalizeAuthUserId(rawId)
-          : rawId != null
-            ? normalizeAuthUserId(String(rawId))
-            : '';
-      if (key) map.set(key, row);
-    }
+type AuthUserLite = { id: string; email?: string };
+
+/**
+ * Carrega `profiles` alinhado ao auth: primeiro por `id` (como `/api/user/profile`), depois por email
+ * só se existir linha cujo `profiles.id` coincide com o usuário do auth — evita anexar perfil de outro
+ * cadastro quando há email duplicado ou falhas do `.in()` em lote.
+ */
+async function fetchProfileForAuthUser(auth: AuthUserLite): Promise<Record<string, unknown> | null> {
+  const idRaw = String(auth.id || '').trim();
+  const idCandidates = [...new Set([idRaw, normalizeAuthUserId(idRaw)])];
+
+  for (const candidate of idCandidates) {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select(PROFILE_ADMIN_SELECT)
+      .eq('id', candidate)
+      .maybeSingle();
+    if (!error && data) return data as Record<string, unknown>;
   }
-  const missing = idsNorm.filter((id) => !map.has(id));
-  if (!missing.length) return map;
-  /** `.in()` por vezes omite linhas (URL longa, tipos, etc.); garante lookup por id como o `/api/user/profile`. */
-  await Promise.all(
-    missing.map(async (id) => {
-      const { data: one, error: e2 } = await supabase
-        .from('profiles')
-        .select(PROFILE_ADMIN_SELECT)
-        .eq('id', id)
-        .maybeSingle();
-      if (!e2 && one) {
-        const row = one as Record<string, unknown>;
-        map.set(id, row);
-      }
-    }),
+
+  const emailNorm = String(auth.email || '')
+    .trim()
+    .toLowerCase();
+  if (!emailNorm) return null;
+
+  const { data: rows, error: e2 } = await supabase
+    .from('profiles')
+    .select(PROFILE_ADMIN_SELECT)
+    .eq('email', emailNorm)
+    .limit(20);
+
+  if (e2 || !rows?.length) return null;
+
+  const idNorm = normalizeAuthUserId(idRaw);
+  const list = rows as Record<string, unknown>[];
+  const match = list.find((r) => normalizeAuthUserId(String(r.id ?? '')) === idNorm);
+  return match ?? null;
+}
+
+async function getUserProfileMapForAuthUsers(
+  users: AuthUserLite[],
+): Promise<Map<string, Record<string, unknown>>> {
+  const map = new Map<string, Record<string, unknown>>();
+  if (!users.length) return map;
+
+  const results = await Promise.all(
+    users.map(async (u) => ({ u, row: await fetchProfileForAuthUser(u) })),
   );
+
+  for (const { u, row } of results) {
+    if (!row) continue;
+    const kn = normalizeAuthUserId(u.id);
+    map.set(kn, row);
+    map.set(String(u.id).trim(), row);
+  }
   return map;
 }
 
@@ -1041,7 +1063,9 @@ router.get('/users', async (req: Request, res: Response) => {
     const total = filtered.length;
     const start = (page - 1) * limit;
     const pageUsers = filtered.slice(start, start + limit);
-    const profileMap = await getUserProfileMap(pageUsers.map((u) => u.id));
+    const profileMap = await getUserProfileMapForAuthUsers(
+      pageUsers.map((u) => ({ id: u.id, email: u.email ?? undefined })),
+    );
     const promoUserIds = await getUserIdsWithPromoRedemption(pageUsers.map((u) => u.id));
 
     const items = pageUsers.map((u) =>
@@ -1081,7 +1105,10 @@ router.get('/users/:id', async (req: Request, res: Response) => {
       sendApiError(res, 404, 'NOT_FOUND', 'Usuário não encontrado.');
       return;
     }
-    const profileMap = await getUserProfileMap([id]);
+    const authRow = data.user as unknown as { id: string; email?: string };
+    const profileMap = await getUserProfileMapForAuthUsers([
+      { id: authRow.id, email: authRow.email },
+    ]);
     const promoUserIds = await getUserIdsWithPromoRedemption([id]);
     const user = buildWagooAdminUserRow(
       data.user as unknown as {
@@ -1237,7 +1264,10 @@ async function handleUserComplimentaryAccess(req: Request, res: Response): Promi
     });
     pushAdminEvent('core', `Admin atualizou cortesia de ${id} (${preset})`, 'online');
 
-    const profileMap = await getUserProfileMap([id]);
+    const authUser = auth.data.user as unknown as { id: string; email?: string };
+    const profileMap = await getUserProfileMapForAuthUsers([
+      { id: authUser.id, email: authUser.email },
+    ]);
     const promoUserIds = await getUserIdsWithPromoRedemption([id]);
     const user = buildWagooAdminUserRow(
       auth.data.user as unknown as {
