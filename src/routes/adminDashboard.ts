@@ -607,7 +607,7 @@ async function getUserIdsWithPromoRedemption(userIds: string[]): Promise<Set<str
   return out;
 }
 
-async function buildWagooAdminUserRow(
+function buildWagooAdminUserRow(
   authUser: {
     id: string;
     email?: string;
@@ -1081,9 +1081,9 @@ function parseComplimentaryPreset(body: unknown): ComplimentaryPreset | null {
   return null;
 }
 
-/** Korven: define cortesia administrativa (`complimentary_access_until`) sem alterar Stripe (`has_paid`). */
-router.patch('/users/:id/complimentary-access', async (req: Request, res: Response) => {
-  const id = String(req.params.id || '').trim();
+/** Korven: define cortesia administrativa (`complimentary_access_until`) sem alterar Stripe (`has_paid`). POST duplicado: alguns proxies bloqueiam PATCH. */
+async function handleUserComplimentaryAccess(req: Request, res: Response): Promise<void> {
+  const id = normalizeAuthUserId(String(req.params.id || ''));
   const preset = parseComplimentaryPreset(req.body);
   if (!id || preset === null) {
     sendApiError(
@@ -1180,7 +1180,10 @@ router.patch('/users/:id/complimentary-access', async (req: Request, res: Respon
   } catch (e: unknown) {
     sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
   }
-});
+}
+
+router.patch('/users/:id/complimentary-access', handleUserComplimentaryAccess);
+router.post('/users/:id/complimentary-access', handleUserComplimentaryAccess);
 
 router.patch('/users/:id/role', async (req: Request, res: Response) => {
   const id = String(req.params.id || '').trim();
