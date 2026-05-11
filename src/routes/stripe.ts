@@ -1,10 +1,10 @@
 import express, { Request, Response } from 'express';
 import Stripe from 'stripe';
 import dotenv from 'dotenv';
-import { createClient } from '@supabase/supabase-js';
 import { pushAdminEvent } from '../services/adminEvents';
 import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 import { setProfileHasPaidByUserId } from '../lib/profileHasPaid';
+import { supabase } from '../lib/supabase';
 
 dotenv.config();
 const router = express.Router();
@@ -16,7 +16,6 @@ if (!stripeKey) {
 }
 
 const stripe = new Stripe(stripeKey, { apiVersion: '2023-10-16' });
-const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
 // ==========================================
 // ROTA 1: CRIAR PAGAMENTO (Exige JSON)

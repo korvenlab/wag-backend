@@ -2,12 +2,13 @@ import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import Stripe from 'stripe';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import { subDays, startOfDay, formatISO } from 'date-fns';
 import { sessions } from '../services/whatsapp';
 import { getAdminEvents, pushAdminEvent, AdminApp, AdminEventStatus } from '../services/adminEvents';
 import { setProfileHasPaidByUserId } from '../lib/profileHasPaid';
 import { isComplimentaryAccessActive, profileHasWagooAccess, rowHasPaidTrue } from '../lib/profileAccess';
+import { supabase } from '../lib/supabase';
 
 dotenv.config();
 
@@ -15,11 +16,6 @@ const router = express.Router();
 
 const stripeKey = process.env.STRIPE_SECRET_KEY || '';
 const stripe = stripeKey ? new Stripe(stripeKey, { apiVersion: '2023-10-16' }) : null;
-
-const supabase: SupabaseClient = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
 
 type ApiErrorCode =
   | 'UNAUTHORIZED'
@@ -482,6 +478,8 @@ type AdminUserRow = {
   hasPaid: boolean;
   /** Acesso efetivo Wagoo (Stripe ou cortesia). */
   hasAccess: boolean;
+  /** Igual a `hasAccess` (JSON snake_case). */
+  has_access: boolean;
   complimentary_access_until?: string | null;
   /** True se existir linha em `wagoo_promo_redemptions` (já resgatou algum link alguma vez). */
   complimentaryViaLink?: boolean;
@@ -495,7 +493,7 @@ type AdminUserRow = {
 
 type AdminUserRowCore = Omit<
   AdminUserRow,
-  'complimentaryViaLink' | 'accessOriginSummary' | 'accessOriginDetail'
+  'complimentaryViaLink' | 'accessOriginSummary' | 'accessOriginDetail' | 'has_access'
 >;
 
 /** Explica canais que habilitam acesso (has_paid, cortesia por link, cortesia na base). */
@@ -678,6 +676,8 @@ function buildWagooAdminUserRow(
 
   return {
     ...base,
+    /** Alias snake_case para proxies / clientes que normalizam chaves JSON. */
+    has_access: base.hasAccess,
     complimentaryViaLink: hasPromoRedemption,
     accessOriginSummary,
     accessOriginDetail,

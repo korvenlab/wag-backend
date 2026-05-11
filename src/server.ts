@@ -3,8 +3,6 @@ dotenv.config();
 
 import express, { Request, Response } from 'express';
 import cors from 'cors';
-import { createClient } from '@supabase/supabase-js';
-
 import stripeRoutes from './routes/stripe';
 import adminDashboardRoutes from './routes/adminDashboard';
 import feedbackRoutes from './routes/feedback';
@@ -14,14 +12,10 @@ import { pushAdminEvent } from './services/adminEvents';
 import { startWhatsApp, autoReconnectAll, disconnectWhatsApp } from './services/whatsapp';
 import { generateAuthUrl, getTokensFromCode } from './services/googleAuth';
 import { getUserFromBearerHeader } from './lib/supabaseAuthUser';
+import { supabase } from './lib/supabase';
 
 const app = express();
 const port: number = process.env.PORT ? Number(process.env.PORT) : 3000;
-
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
 
 // 1. Configuração de CORS (Essencial para o Frontend conseguir salvar configurações)
 app.use(cors({

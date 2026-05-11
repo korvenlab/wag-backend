@@ -1,13 +1,9 @@
 import express, { Request, Response } from 'express';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 import { profileHasWagooAccess } from '../lib/profileAccess';
+import { supabase } from '../lib/supabase';
 
 const router = express.Router();
-const supabase: SupabaseClient = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!,
-);
 
 /**
  * Resgata código guardado no front (ex.: query `?wagoo_promo=` → sessionStorage) após login Google.

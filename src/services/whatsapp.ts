@@ -10,14 +10,12 @@ import fs from 'fs';
 import path from 'path';
 import qrcode from 'qrcode';
 import { Response } from 'express';
-import { createClient } from '@supabase/supabase-js';
 
 import { analyzeMessage, hasSchedulingIntent } from './ai';
 import { checkAvailability, createEvent, getBusySlots, findEventByPhone, deleteEvent } from './calendar';
 import { pushAdminEvent } from './adminEvents';
 import { profileHasWagooAccess } from '../lib/profileAccess';
-
-const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+import { supabase } from '../lib/supabase';
 export const sessions: Record<string, any> = {};
 
 /**

@@ -1,12 +1,7 @@
 import express, { NextFunction, Request, Response } from 'express';
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { supabase } from '../lib/supabase';
 
 const router = express.Router();
-
-const supabase: SupabaseClient = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
 
 type ApiErrorCode =
   | 'UNAUTHORIZED'
