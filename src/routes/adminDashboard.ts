@@ -435,6 +435,8 @@ type AdminUserRow = {
   /** Acesso efetivo Wagoo (Stripe ou cortesia). */
   hasAccess: boolean;
   complimentary_access_until?: string | null;
+  /** True se existir resgate em `wagoo_promo_redemptions` (link / convite). */
+  complimentaryViaLink?: boolean;
   createdAt: string;
   lastSignInAt: string | null;
 };
@@ -531,6 +533,48 @@ function normalizeAdminUser(
     createdAt: authUser.created_at || new Date(0).toISOString(),
     lastSignInAt: authUser.last_sign_in_at || null,
   };
+}
+
+async function getUserIdsWithPromoRedemption(userIds: string[]): Promise<Set<string>> {
+  const out = new Set<string>();
+  if (!userIds.length) return out;
+  const { data, error } = await supabase
+    .from('wagoo_promo_redemptions')
+    .select('user_id')
+    .in('user_id', userIds);
+  if (error || !data) return out;
+  for (const row of data as { user_id?: string }[]) {
+    if (typeof row.user_id === 'string') out.add(row.user_id);
+  }
+  return out;
+}
+
+async function buildWagooAdminUserRow(
+  authUser: {
+    id: string;
+    email?: string;
+    created_at?: string;
+    last_sign_in_at?: string;
+    user_metadata?: Record<string, unknown>;
+    app_metadata?: Record<string, unknown>;
+    banned_until?: string | null;
+  },
+  profileMap: Map<string, Record<string, unknown>>,
+  promoUserIds: Set<string>,
+): AdminUserRow {
+  const profile = profileMap.get(authUser.id) as
+    | {
+        email?: string | null;
+        store_name?: string | null;
+        role?: string | null;
+        is_active?: boolean | null;
+        deleted_at?: string | null;
+        has_paid?: unknown;
+        complimentary_access_until?: string | null;
+      }
+    | undefined;
+  const base = normalizeAdminUser(authUser, profile);
+  return { ...base, complimentaryViaLink: promoUserIds.has(authUser.id) };
 }
 
 async function getUserProfileMap(ids: string[]): Promise<Map<string, Record<string, unknown>>> {
@@ -843,9 +887,10 @@ router.get('/users', async (req: Request, res: Response) => {
     const start = (page - 1) * limit;
     const pageUsers = filtered.slice(start, start + limit);
     const profileMap = await getUserProfileMap(pageUsers.map((u) => u.id));
+    const promoUserIds = await getUserIdsWithPromoRedemption(pageUsers.map((u) => u.id));
 
     const items = pageUsers.map((u) =>
-      normalizeAdminUser(
+      buildWagooAdminUserRow(
         u as unknown as {
           id: string;
           email?: string;
@@ -855,15 +900,9 @@ router.get('/users', async (req: Request, res: Response) => {
           app_metadata?: Record<string, unknown>;
           banned_until?: string | null;
         },
-        profileMap.get(u.id) as unknown as {
-          email?: string | null;
-          store_name?: string | null;
-          role?: string | null;
-          is_active?: boolean | null;
-          deleted_at?: string | null;
-          has_paid?: unknown;
-        }
-      )
+        profileMap,
+        promoUserIds,
+      ),
     );
 
     res.status(200).type(JSON_UTF8).json({
@@ -888,7 +927,8 @@ router.get('/users/:id', async (req: Request, res: Response) => {
       return;
     }
     const profileMap = await getUserProfileMap([id]);
-    const user = normalizeAdminUser(
+    const promoUserIds = await getUserIdsWithPromoRedemption([id]);
+    const user = buildWagooAdminUserRow(
       data.user as unknown as {
         id: string;
         email?: string;
@@ -898,14 +938,8 @@ router.get('/users/:id', async (req: Request, res: Response) => {
         app_metadata?: Record<string, unknown>;
         banned_until?: string | null;
       },
-      profileMap.get(id) as unknown as {
-        email?: string | null;
-        store_name?: string | null;
-        role?: string | null;
-        is_active?: boolean | null;
-        deleted_at?: string | null;
-        has_paid?: unknown;
-      }
+      profileMap,
+      promoUserIds,
     );
     res.status(200).type(JSON_UTF8).json({ ok: true, data: user });
   } catch (e: unknown) {
@@ -951,6 +985,119 @@ router.patch('/users/:id/has-paid', async (req: Request, res: Response) => {
       hasPaid ? 'online' : 'degraded',
     );
     res.status(200).type(JSON_UTF8).json({ ok: true, data: { id, hasPaid } });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
+const COMPLIMENTARY_PRESETS = ['none', '7', '30', '60', '90', '180', '365'] as const;
+type ComplimentaryPreset = (typeof COMPLIMENTARY_PRESETS)[number];
+
+function parseComplimentaryPreset(body: unknown): ComplimentaryPreset | null {
+  if (!body || typeof body !== 'object') return null;
+  const raw = (body as Record<string, unknown>).preset;
+  if (raw === 'none' || raw === null) return 'none';
+  if (typeof raw === 'string' && (COMPLIMENTARY_PRESETS as readonly string[]).includes(raw))
+    return raw as ComplimentaryPreset;
+  return null;
+}
+
+/** Korven: define cortesia administrativa (`complimentary_access_until`) sem alterar Stripe (`has_paid`). */
+router.patch('/users/:id/complimentary-access', async (req: Request, res: Response) => {
+  const id = String(req.params.id || '').trim();
+  const preset = parseComplimentaryPreset(req.body);
+  if (!id || preset === null) {
+    sendApiError(
+      res,
+      400,
+      'VALIDATION_ERROR',
+      'preset obrigatório: none, 7, 30, 60, 90, 180, 365.',
+    );
+    return;
+  }
+  try {
+    const auth = await supabase.auth.admin.getUserById(id);
+    if (!auth.data?.user) {
+      sendApiError(res, 404, 'NOT_FOUND', 'Usuário não encontrado.');
+      return;
+    }
+
+    const { data: prof, error: profErr } = await supabase
+      .from('profiles')
+      .select('has_paid, complimentary_access_until')
+      .eq('id', id)
+      .maybeSingle();
+    if (profErr) throw new Error(profErr.message);
+
+    const hasPaid = profileHasPaidToBoolean((prof as { has_paid?: unknown } | null)?.has_paid);
+    let newUntil: string | null;
+
+    if (preset === 'none') {
+      newUntil = null;
+    } else {
+      const days = Number(preset);
+      const now = Date.now();
+      let base = new Date(now);
+      const cur = (prof as { complimentary_access_until?: string | null } | null)?.complimentary_access_until;
+      if (cur) {
+        const t = new Date(String(cur)).getTime();
+        if (Number.isFinite(t) && t > now) base = new Date(t);
+      }
+      newUntil = new Date(base.getTime() + days * 86_400_000).toISOString();
+    }
+
+    const isAiEnabled = profileHasWagooAccess({
+      has_paid: hasPaid,
+      complimentary_access_until: newUntil ?? undefined,
+    });
+
+    const { data: updatedRows, error: upErr } = await supabase
+      .from('profiles')
+      .update({ complimentary_access_until: newUntil, is_ai_enabled: isAiEnabled })
+      .eq('id', id)
+      .select('id');
+    if (upErr) throw new Error(upErr.message);
+
+    if (!updatedRows?.length) {
+      const emailNorm = auth.data.user.email ? String(auth.data.user.email).trim().toLowerCase() : null;
+      const ins: Record<string, unknown> = {
+        id,
+        complimentary_access_until: newUntil,
+        is_ai_enabled: isAiEnabled,
+        has_paid: false,
+        is_active: true,
+      };
+      if (emailNorm) ins.email = emailNorm;
+      const { error: insErr } = await supabase.from('profiles').upsert(ins, { onConflict: 'id' });
+      if (insErr) throw new Error(insErr.message);
+    }
+
+    const actor = getAdminActor(req);
+    pushAdminAudit({
+      actor,
+      action: 'user.complimentary_access.update',
+      target: id,
+      timestamp: new Date().toISOString(),
+      meta: { preset },
+    });
+    pushAdminEvent('core', `Admin atualizou cortesia de ${id} (${preset})`, 'online');
+
+    const profileMap = await getUserProfileMap([id]);
+    const promoUserIds = await getUserIdsWithPromoRedemption([id]);
+    const user = buildWagooAdminUserRow(
+      auth.data.user as unknown as {
+        id: string;
+        email?: string;
+        created_at?: string;
+        last_sign_in_at?: string;
+        user_metadata?: Record<string, unknown>;
+        app_metadata?: Record<string, unknown>;
+        banned_until?: string | null;
+      },
+      profileMap,
+      promoUserIds,
+    );
+    res.status(200).type(JSON_UTF8).json({ ok: true, data: user });
   } catch (e: unknown) {
     sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
   }
