@@ -396,6 +396,41 @@ async function health2Avendas(): Promise<AdminEventStatus> {
   }
 }
 
+/**
+ * Conta linhas em `profiles` com o mesmo critério do app (`/api/user/profile` → `has_access`):
+ * `has_paid` truthy (Stripe / normalização) OU `complimentary_access_until` ainda no futuro.
+ * Pagina para não depender de limite PostgREST; ordem estável por `id`.
+ */
+async function countProfilesWithWagooAppAccess(client: SupabaseClient): Promise<number> {
+  const pageSize = 1000;
+  let from = 0;
+  let n = 0;
+  for (;;) {
+    const { data, error } = await client
+      .from('profiles')
+      .select('has_paid, complimentary_access_until')
+      .order('id', { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (error) throw error;
+    const rows = data ?? [];
+    if (!rows.length) break;
+    for (const row of rows) {
+      const r = row as { has_paid?: unknown; complimentary_access_until?: string | null };
+      if (
+        profileHasWagooAccess({
+          has_paid: r.has_paid,
+          complimentary_access_until: r.complimentary_access_until ?? undefined,
+        })
+      ) {
+        n += 1;
+      }
+    }
+    if (rows.length < pageSize) break;
+    from += pageSize;
+  }
+  return n;
+}
+
 function parseAvendasMetrics(): {
   volume: number;
   changePct: number | null;
@@ -719,6 +754,7 @@ router.get('/dashboard', async (req: Request, res: Response) => {
   let profilesCount = 0;
   let payingProfiles = 0;
   let whatsappConfigured = 0;
+  let profilesWithAppAccess = 0;
 
   try {
     const { count: totalProfiles, error: e1 } = await supabase
@@ -742,6 +778,14 @@ router.get('/dashboard', async (req: Request, res: Response) => {
     whatsappConfigured = wa ?? 0;
   } catch (e: unknown) {
     warnings.push(`Supabase profiles: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  try {
+    profilesWithAppAccess = await countProfilesWithWagooAppAccess(supabase);
+  } catch (e: unknown) {
+    warnings.push(
+      `Contagem acesso app (profiles): ${e instanceof Error ? e.message : String(e)}`,
+    );
   }
 
   const botOnlineEmails = Object.keys(sessions).sort();
@@ -835,6 +879,11 @@ router.get('/dashboard', async (req: Request, res: Response) => {
       valor: revenueCurrentPeriod,
       delta_pct: pctChange(revenueCurrentPeriod, revenuePrevPeriod) ?? 0,
     },
+    /** Alinhado ao app Wagoo: perfis com `has_paid` OU cortesia (`complimentary_access_until`) activa. */
+    usuarios_acesso_app_wagoo: {
+      valor: profilesWithAppAccess,
+      delta_pct: 0,
+    },
     assinaturas_ativas_wagoo: {
       valor: activeSubscriptions,
       delta_pct: pctChange(newSubsCurrent, newSubsPrev) ?? 0,
@@ -883,20 +932,21 @@ router.get('/dashboard', async (req: Request, res: Response) => {
     },
     eventos_recentes: eventos,
     ui,
-    legacy: {
-      kpis: {
-        salesVolume2avendas: {
-          value: avendas.volume,
-          changePct: avendas.changePct,
+      legacy: {
+        kpis: {
+          salesVolume2avendas: {
+            value: avendas.volume,
+            changePct: avendas.changePct,
+          },
         },
-      },
-      wagoo: {
-        activeSubscriptions,
-        registeredProfiles: profilesCount,
-        payingUsersInDb: payingProfiles,
-        whatsappConfiguredProfiles: whatsappConfigured,
-        botSessionsOnline: botOnlineEmails.length,
-      },
+        wagoo: {
+          activeSubscriptions,
+          profilesWithAppAccess,
+          registeredProfiles: profilesCount,
+          payingUsersInDb: payingProfiles,
+          whatsappConfiguredProfiles: whatsappConfigured,
+          botSessionsOnline: botOnlineEmails.length,
+        },
       sales2avendas: {
         volume: avendas.volume,
         changePct: avendas.changePct,
