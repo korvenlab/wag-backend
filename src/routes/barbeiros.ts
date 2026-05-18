@@ -1,8 +1,13 @@
 import express, { Request, Response } from 'express';
 import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 import { supabase } from '../lib/supabase';
-import { profileHasMultiBarberPlan } from '../lib/profileMultiBarber';
+import { profileSubscriptionTier } from '../lib/profileMultiBarber';
 import { countBarbeirosForUser, listAllBarbeirosForUser } from '../lib/barbeiros';
+import {
+  canManageTeam,
+  getMaxBarbeirosSlots,
+  WAGOO_PLANS,
+} from '../lib/wagooSubscription';
 
 const router = express.Router();
 
@@ -12,24 +17,46 @@ async function requireAuth(req: Request) {
   return getUserFromBearerHeader(supabase, req.headers.authorization);
 }
 
+async function loadTeamContext(userId: string) {
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('subscription_tier, has_paid, multi_barber_plan')
+    .eq('id', userId)
+    .maybeSingle();
+
+  const tier = profileSubscriptionTier(profile);
+  const barbeiros = await listAllBarbeirosForUser(userId);
+  const used = barbeiros.length;
+  const max = getMaxBarbeirosSlots(tier);
+
+  return {
+    tier,
+    barbeiros,
+    used,
+    max,
+    can_manage_team: canManageTeam(tier),
+    can_add_team_member: tier !== null && used < max,
+    plan_label: tier ? WAGOO_PLANS[tier].label : null,
+  };
+}
+
 router.get('/', async (req: Request, res: Response) => {
   const auth = await requireAuth(req);
   if (!auth.ok) {
     return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
   }
 
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('multi_barber_plan')
-    .eq('id', auth.user.id)
-    .maybeSingle();
-
-  const barbeiros = await listAllBarbeirosForUser(auth.user.id);
+  const ctx = await loadTeamContext(auth.user.id);
 
   res.json({
-    multi_barber_plan: profileHasMultiBarberPlan(profile),
-    barbeiros,
-    can_manage_team: profileHasMultiBarberPlan(profile),
+    subscription_tier: ctx.tier,
+    multi_barber_plan: ctx.tier === 'pro' || ctx.tier === 'pro_plus',
+    max_team_users: ctx.max,
+    team_users_used: ctx.used,
+    barbeiros: ctx.barbeiros,
+    can_manage_team: ctx.can_manage_team,
+    can_add_team_member: ctx.can_add_team_member,
+    plan_label: ctx.plan_label,
   });
 });
 
@@ -39,19 +66,23 @@ router.post('/', async (req: Request, res: Response) => {
     return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
   }
 
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('multi_barber_plan')
-    .eq('id', auth.user.id)
-    .maybeSingle();
+  const ctx = await loadTeamContext(auth.user.id);
 
-  const hasPlan = profileHasMultiBarberPlan(profile);
-  const total = await countBarbeirosForUser(auth.user.id);
-
-  if (!hasPlan) {
+  if (!ctx.tier) {
     return res.status(403).json({
       error: 'upgrade_required',
-      message: 'O Plano Multi-Barbeiro é necessário para cadastrar profissionais na equipe.',
+      message: 'Assine um plano Wagoo para cadastrar profissionais na equipe.',
+    });
+  }
+
+  if (ctx.used >= ctx.max) {
+    const planName = ctx.plan_label ?? 'atual';
+    return res.status(403).json({
+      error: 'team_limit_reached',
+      message: `Limite de ${ctx.max} usuário(s) no plano ${planName}. Faça upgrade para adicionar mais profissionais.`,
+      max_team_users: ctx.max,
+      team_users_used: ctx.used,
+      subscription_tier: ctx.tier,
     });
   }
 
@@ -65,10 +96,6 @@ router.post('/', async (req: Request, res: Response) => {
   }
   if (!EMAIL_RE.test(google_calendar_email)) {
     return res.status(400).json({ error: 'Informe um e-mail válido do Google Agenda.' });
-  }
-
-  if (total >= 30) {
-    return res.status(400).json({ error: 'Limite máximo de 30 profissionais atingido.' });
   }
 
   const { data, error } = await supabase
@@ -95,16 +122,12 @@ router.patch('/:id', async (req: Request, res: Response) => {
     return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
   }
 
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('multi_barber_plan')
-    .eq('id', auth.user.id)
-    .maybeSingle();
+  const ctx = await loadTeamContext(auth.user.id);
 
-  if (!profileHasMultiBarberPlan(profile)) {
+  if (!ctx.can_manage_team) {
     return res.status(403).json({
       error: 'upgrade_required',
-      message: 'O Plano Multi-Barbeiro é necessário para editar a equipe.',
+      message: 'Assine um plano Wagoo para editar a equipe.',
     });
   }
 
@@ -151,16 +174,12 @@ router.delete('/:id', async (req: Request, res: Response) => {
     return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
   }
 
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('multi_barber_plan')
-    .eq('id', auth.user.id)
-    .maybeSingle();
+  const ctx = await loadTeamContext(auth.user.id);
 
-  if (!profileHasMultiBarberPlan(profile)) {
+  if (!ctx.can_manage_team) {
     return res.status(403).json({
       error: 'upgrade_required',
-      message: 'O Plano Multi-Barbeiro é necessário para remover profissionais.',
+      message: 'Assine um plano Wagoo para remover profissionais.',
     });
   }
 

@@ -8,8 +8,11 @@ import adminDashboardRoutes from './routes/adminDashboard';
 import feedbackRoutes from './routes/feedback';
 import promoRoutes from './routes/promo';
 import barbeirosRoutes from './routes/barbeiros';
+import calendarRoutes from './routes/calendar';
 import { profileHasWagooAccess } from './lib/profileAccess';
-import { profileHasMultiBarberPlan } from './lib/profileMultiBarber';
+import { profileHasMultiBarberPlan, profileSubscriptionTier } from './lib/profileMultiBarber';
+import { getMaxBarbeirosSlots, WAGOO_PLANS } from './lib/wagooSubscription';
+import { countBarbeirosForUser } from './lib/barbeiros';
 import { pushAdminEvent } from './services/adminEvents';
 import { startWhatsApp, autoReconnectAll, disconnectWhatsApp } from './services/whatsapp';
 import { generateAuthUrl, getTokensFromCode } from './services/googleAuth';
@@ -40,6 +43,7 @@ app.use('/feedback', feedbackRoutes);
 app.use('/api/admin', adminDashboardRoutes);
 app.use('/api/promo', promoRoutes);
 app.use('/api/barbeiros', barbeirosRoutes);
+app.use('/api/calendar', calendarRoutes);
 
 // --- 1. ROTA DE PERFIL (somente dono da sessão — Bearer Supabase) ---
 app.get('/api/user/profile', async (req: Request, res: Response) => {
@@ -59,15 +63,29 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
     if (error) return res.status(500).json({ error: error.message });
     if (!data) return res.status(404).json({ error: 'Perfil não encontrado' });
     const row = data as Record<string, unknown>;
+    const tier = profileSubscriptionTier({
+      subscription_tier: row.subscription_tier,
+      has_paid: row.has_paid,
+      multi_barber_plan: row.multi_barber_plan as boolean | null | undefined,
+    });
+    const maxTeamUsers = getMaxBarbeirosSlots(tier);
+    const teamUsersUsed = await countBarbeirosForUser(auth.user.id);
+
     res.json({
       ...row,
       has_access: profileHasWagooAccess({
         has_paid: row.has_paid,
         complimentary_access_until: row.complimentary_access_until,
       }),
+      subscription_tier: tier,
       multi_barber_plan: profileHasMultiBarberPlan({
+        subscription_tier: row.subscription_tier,
         multi_barber_plan: row.multi_barber_plan as boolean | null | undefined,
+        has_paid: row.has_paid,
       }),
+      max_team_users: maxTeamUsers,
+      team_users_used: teamUsersUsed,
+      plan_label: tier ? WAGOO_PLANS[tier].label : null,
     });
   } catch {
     res.status(500).json({ error: 'Erro interno' });

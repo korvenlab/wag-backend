@@ -20,6 +20,10 @@ export type SchedulingBarberState = {
   selectedBarberName: string | null;
 };
 
+/** Cenário B: mais de um barbeiro activo — exige escolha de profissional. */
+export const isMultiBarberTeam = (activeBarbeiros: ActiveBarbeiroForAi[]): boolean =>
+  activeBarbeiros.length > 1;
+
 export const hasSchedulingIntent = (message: string): boolean => {
     if (!message) return false;
     const lowerMsg = message.toLowerCase().trim();
@@ -56,33 +60,44 @@ export const analyzeMessage = async (
 
     try {
         const model = genAI.getGenerativeModel({ model: MODEL_NAME });
+        const multiBarber = isMultiBarberTeam(activeBarbeiros);
+        const singleBarberName =
+            activeBarbeiros.length === 1 ? activeBarbeiros[0].nome : null;
 
         const agoraBR = dayjs().tz("America/Sao_Paulo");
         const currentTimeBR = agoraBR.format('HH:mm');
         const dataFormatadaBR = agoraBR.format('DD/MM/YYYY');
         const diaAtualNome = agoraBR.format('dddd');
 
-        const teamBlock =
-            activeBarbeiros.length > 0
-                ? `
-        EQUIPE ATIVA (obrigatório escolher antes de confirmar horário):
-        ${activeBarbeiros.map((b) => `- ${b.nome}`).join('\n        ')}
-        Opção extra: "Sem Preferência" (qualquer profissional disponível).
+        const teamBlock = multiBarber
+            ? `
+        CENÁRIO B — MÚLTIPLOS PROFISSIONAIS (${activeBarbeiros.length} activos):
+        Equipe: ${activeBarbeiros.map((b) => b.nome).join(', ')}
+        Opção extra: "Sem Preferência" (qualquer profissional com vaga).
 
-        Estado atual da escolha do cliente:
-        - Profissional já confirmado: ${schedulingState.barberConfirmed ? 'SIM' : 'NÃO'}
-        - Nome escolhido: ${schedulingState.selectedBarberName ?? 'ainda não definido'}
+        Estado da escolha:
+        - Profissional confirmado: ${schedulingState.barberConfirmed ? 'SIM' : 'NÃO'}
+        - Escolha actual: ${schedulingState.selectedBarberName ?? 'ainda não definido'}
 
-        REGRAS DE BARBEIRO:
-        - Na primeira oportunidade de agendamento, apresente os nomes da equipe de forma amigável.
-        - Pergunte explicitamente com qual profissional o cliente quer agendar OU se prefere "Sem Preferência".
-        - NUNCA confirme um horário definitivo (isScheduling=true com data/hora) sem o cliente ter escolhido um profissional da lista ou "Sem Preferência".
-        - Se o cliente mencionar um nome da equipe, preencha barberSelection com o nome exato ou "SEM_PREFERENCIA".
-        - barberConfirmed=true somente quando o cliente escolheu um profissional ou Sem Preferência.
+        REGRAS OBRIGATÓRIAS:
+        1. Ao detectar intenção de agendar, PERGUNTE com qual profissional o cliente quer marcar OU "Sem Preferência".
+        2. Se o cliente não conhecer os profissionais, perguntar quem trabalha na barbearia, ou pedir indicação — LISTE os nomes de forma amigável.
+        3. NUNCA apresente horários definitivos nem confirme marcação (isScheduling com data/hora) ANTES de barberConfirmed=true.
+        4. Só depois da escolha, apresente horários livres (use OCUPADOS filtrados para o profissional escolhido).
+        5. Se o cliente escolheu "Sem Preferência", sugira SEMPRE os horários mais cedo disponíveis (use SUGESTÕES_SEM_PREFERÊNCIA se existir no contexto).
+        6. barberSelection = nome exacto da lista ou "SEM_PREFERENCIA". barberConfirmed=true só após escolha explícita.
         `
-                : `
-        Não há equipe cadastrada — fluxo de um único profissional. barberConfirmed pode ser true quando houver intenção de agendar.
+            : `
+        CENÁRIO A — UM ÚNICO PROFISSIONAL${singleBarberName ? ` (${singleBarberName})` : ''}:
+        - NÃO pergunte preferência de barbeiro, NÃO liste equipe, NÃO mencione "Sem Preferência".
+        - Avance directamente para horários disponíveis e confirmação de data/hora.
+        - barberConfirmed=true quando houver intenção de agendar.
+        - barberSelection deve ser null.
         `;
+
+        const busyContext = multiBarber && !schedulingState.barberConfirmed
+            ? 'Aguardando escolha do profissional — não use horários ocupados para sugerir slots ainda.'
+            : busySlots.join(', ') || 'nenhum';
 
         const generationConfig = {
             temperature: 0,
@@ -92,14 +107,14 @@ export const analyzeMessage = async (
 
         const prompt = `
         Você é o Wagoo, assistente da "${dbRow.store_name}".
-        Extraia a intenção de agendamento e a escolha de profissional quando aplicável.
+        Extraia intenção de agendamento e escolha de profissional conforme o cenário.
 
         REGRAS DE EXTRAÇÃO:
-        - Se o cliente quer marcar, extraia a DATA (YYYY-MM-DD) e a HORA (HH:mm) apenas quando já tiver profissional confirmado (ou sem equipe).
-        - NÃO tente converter fusos. Apenas relate o que o cliente pediu.
+        - Se o cliente quer marcar, extraia DATA (YYYY-MM-DD) e HORA (HH:mm) apenas quando puder confirmar (Cenário A ou B com profissional já escolhido).
         - Hoje é ${diaAtualNome}, ${dataFormatadaBR} às ${currentTimeBR}.
+        - Duração do serviço: ${dbRow.service_duration} minutos.
 
-        OCUPADOS: ${busySlots.join(", ") || "nenhum"}
+        OCUPADOS (contexto de agenda): ${busyContext}
         HORÁRIOS DA LOJA: ${JSON.stringify(dbRow.working_hours)}
         ${teamBlock}
 
@@ -115,9 +130,9 @@ export const analyzeMessage = async (
             "isCancelling": boolean,
             "extractedDate": "YYYY-MM-DD ou null",
             "extractedTime": "HH:mm ou null",
-            "barberSelection": "nome exato do profissional, SEM_PREFERENCIA ou null",
+            "barberSelection": "nome exacto, SEM_PREFERENCIA ou null",
             "barberConfirmed": boolean,
-            "response": "Sua resposta humanizada em português"
+            "response": "Resposta humanizada em português do Brasil"
         }`;
 
         const result = await model.generateContent({
@@ -128,7 +143,6 @@ export const analyzeMessage = async (
         const response = await result.response;
         const parsed = JSON.parse(response.text().replace(/```json/g, '').replace(/```/g, '').trim());
 
-        const hasTeam = activeBarbeiros.length > 0;
         let barberConfirmed = Boolean(parsed.barberConfirmed);
         let barberSelection: string | null =
             typeof parsed.barberSelection === 'string' && parsed.barberSelection.trim()
@@ -150,13 +164,12 @@ export const analyzeMessage = async (
             barberConfirmed = true;
         }
 
-        if (!hasTeam) {
+        if (!multiBarber) {
             barberConfirmed = true;
-            barberSelection = null;
+            barberSelection = singleBarberName;
         }
 
-        const canConfirmSchedule =
-            !hasTeam || barberConfirmed;
+        const canConfirmSchedule = !multiBarber || barberConfirmed;
 
         let finalIsoDate: string | null = null;
         const wantsSchedule = Boolean(parsed.isScheduling);

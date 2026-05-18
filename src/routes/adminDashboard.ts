@@ -7,8 +7,14 @@ import { subDays, startOfDay, formatISO } from 'date-fns';
 import { sessions } from '../services/whatsapp';
 import { getAdminEvents, pushAdminEvent, AdminApp, AdminEventStatus } from '../services/adminEvents';
 import { setProfileHasPaidByUserId } from '../lib/profileHasPaid';
-import { profileHasMultiBarberPlan } from '../lib/profileMultiBarber';
+import { profileHasMultiBarberPlan, profileSubscriptionTier } from '../lib/profileMultiBarber';
 import { setProfileMultiBarberPlanByUserId } from '../lib/setMultiBarberPlan';
+import { setProfileSubscriptionTierByUserId } from '../lib/setSubscriptionTier';
+import {
+  normalizeSubscriptionTier,
+  WAGOO_PLANS,
+  type WagooSubscriptionTier,
+} from '../lib/wagooSubscription';
 import {
   complimentaryUntilToMillis,
   isComplimentaryAccessActive,
@@ -494,7 +500,10 @@ type AdminUserRow = {
   accessOriginSummary: string;
   /** Texto longo para tooltip: Stripe vs link vs base. */
   accessOriginDetail: string;
-  /** Plano add-on Multi-Barbeiro (equipe + IA com triagem). */
+  /** Plano Wagoo: basic | pro | pro_plus */
+  subscriptionTier: WagooSubscriptionTier | null;
+  subscription_tier: WagooSubscriptionTier | null;
+  /** Legado: true se pro ou pro_plus */
   multiBarberPlan: boolean;
   multi_barber_plan: boolean;
   /** Profissionais cadastrados na tabela `barbeiros`. */
@@ -526,19 +535,19 @@ function buildWagooAccessOriginPT(input: {
   }
 
   const parts: string[] = [];
-  if (hasPaid) parts.push('Plano Pro');
+  if (hasPaid) parts.push('Assinatura paga');
   if (complimentaryActive) {
     parts.push(hasPromoRedemption ? 'Cortesia (link)' : 'Cortesia (base de dados)');
   }
 
   let accessOriginSummary = '—';
-  if (parts.length === 2) accessOriginSummary = 'Plano Pro + cortesia';
+  if (parts.length === 2) accessOriginSummary = 'Assinatura + cortesia';
   else if (parts.length === 1) accessOriginSummary = parts[0]!;
 
   const detailBits: string[] = [];
   if (hasPaid) {
     detailBits.push(
-      'Canal Plano Pro: profiles.has_paid activo (Stripe via webhook ou alteração no admin/SQL).',
+      'Canal assinatura: profiles.has_paid + subscription_tier (Stripe ou admin).',
     );
   }
   if (complimentaryActive) {
@@ -574,6 +583,14 @@ function parseHasPaidFromRequestBody(body: unknown): boolean | null {
   return null;
 }
 
+function parseSubscriptionTierFromRequestBody(body: unknown): WagooSubscriptionTier | null | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+  const b = body as Record<string, unknown>;
+  const raw = b.subscriptionTier ?? b.subscription_tier ?? b.planTier ?? b.plan_tier;
+  if (raw === null || raw === 'none' || raw === '') return null;
+  return normalizeSubscriptionTier(raw) ?? undefined;
+}
+
 function parseMultiBarberPlanFromRequestBody(body: unknown): boolean | null {
   if (!body || typeof body !== 'object') return null;
   const b = body as Record<string, unknown>;
@@ -607,6 +624,7 @@ function normalizeAdminUser(
     has_paid?: unknown;
     complimentary_access_until?: unknown;
     multi_barber_plan?: unknown;
+    subscription_tier?: unknown;
   },
   barbeirosCount = 0,
 ): AdminUserRowCore {
@@ -639,8 +657,19 @@ function normalizeAdminUser(
   const untilMs = complimentaryUntilToMillis(untilRaw);
   const complimentaryIso =
     untilMs != null && Number.isFinite(untilMs) ? new Date(untilMs).toISOString() : null;
+  const subscriptionTier = profileSubscriptionTier(
+    profile as {
+      subscription_tier?: unknown;
+      multi_barber_plan?: boolean | null;
+      has_paid?: unknown;
+    } | null,
+  );
   const multiBarberPlan = profileHasMultiBarberPlan(
-    profile as { multi_barber_plan?: boolean | null } | null | undefined,
+    profile as {
+      subscription_tier?: unknown;
+      multi_barber_plan?: boolean | null;
+      has_paid?: unknown;
+    } | null,
   );
 
   return {
@@ -655,6 +684,8 @@ function normalizeAdminUser(
     hasPaid,
     hasAccess,
     complimentary_access_until: complimentaryIso ?? (typeof untilRaw === 'string' ? untilRaw.trim() || null : null),
+    subscriptionTier,
+    subscription_tier: subscriptionTier,
     multiBarberPlan,
     multi_barber_plan: multiBarberPlan,
     barbeirosCount,
@@ -740,7 +771,7 @@ function buildWagooAdminUserRow(
 }
 
 const PROFILE_ADMIN_SELECT =
-  'id, email, store_name, role, is_active, deleted_at, has_paid, complimentary_access_until, multi_barber_plan';
+  'id, email, store_name, role, is_active, deleted_at, has_paid, complimentary_access_until, multi_barber_plan, subscription_tier';
 
 type AuthUserLite = { id: string; email?: string };
 
@@ -1299,6 +1330,74 @@ async function handleUserMultiBarberPlan(req: Request, res: Response): Promise<v
 
 router.patch('/users/:id/multi-barber-plan', handleUserMultiBarberPlan);
 router.post('/users/:id/multi-barber-plan', handleUserMultiBarberPlan);
+
+/** Korven: define plano Wagoo (basic | pro | pro_plus) ou revoga com null/none. */
+async function handleUserSubscriptionTier(req: Request, res: Response): Promise<void> {
+  const id = normalizeAuthUserId(String(req.params.id || ''));
+  const parsed = parseSubscriptionTierFromRequestBody(req.body);
+  if (!id || parsed === undefined) {
+    sendApiError(
+      res,
+      400,
+      'VALIDATION_ERROR',
+      'id e subscriptionTier (basic | pro | pro_plus | none) são obrigatórios.',
+    );
+    return;
+  }
+  try {
+    const auth = await supabase.auth.admin.getUserById(id);
+    if (!auth.data?.user) {
+      sendApiError(res, 404, 'NOT_FOUND', 'Usuário não encontrado.');
+      return;
+    }
+
+    const r = await setProfileSubscriptionTierByUserId(supabase, id, parsed);
+    if (!r.ok) {
+      sendApiError(res, 500, 'INTERNAL_ERROR', r.error);
+      return;
+    }
+
+    const actor = getAdminActor(req);
+    pushAdminAudit({
+      actor,
+      action: 'user.subscription_tier.update',
+      target: id,
+      timestamp: new Date().toISOString(),
+      meta: { subscriptionTier: parsed },
+    });
+    pushAdminEvent(
+      'wagoo',
+      `Admin definiu plano ${parsed ? WAGOO_PLANS[parsed].label : 'nenhum'} (${id})`,
+      parsed ? 'online' : 'degraded',
+    );
+
+    const profileMap = await getUserProfileMapForAuthUsers([
+      { id: auth.data.user.id, email: auth.data.user.email },
+    ]);
+    const promoUserIds = await getUserIdsWithPromoRedemption([id]);
+    const barbeirosCountMap = await getBarbeirosCountByUserIds([id]);
+    const user = buildWagooAdminUserRow(
+      auth.data.user as unknown as {
+        id: string;
+        email?: string;
+        created_at?: string;
+        last_sign_in_at?: string;
+        user_metadata?: Record<string, unknown>;
+        app_metadata?: Record<string, unknown>;
+        banned_until?: string | null;
+      },
+      profileMap,
+      promoUserIds,
+      barbeirosCountMap,
+    );
+    res.status(200).type(JSON_UTF8).json({ ok: true, data: user });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+}
+
+router.patch('/users/:id/subscription-tier', handleUserSubscriptionTier);
+router.post('/users/:id/subscription-tier', handleUserSubscriptionTier);
 
 const COMPLIMENTARY_PRESETS = ['none', '7', '30', '60', '90', '180', '365'] as const;
 type ComplimentaryPreset = (typeof COMPLIMENTARY_PRESETS)[number];

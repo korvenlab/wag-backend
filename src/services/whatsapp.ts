@@ -11,8 +11,16 @@ import path from 'path';
 import qrcode from 'qrcode';
 import { Response } from 'express';
 
-import { analyzeMessage, hasSchedulingIntent } from './ai';
-import { checkAvailability, createEvent, getBusySlots, findEventByPhone, deleteEvent } from './calendar';
+import { analyzeMessage, hasSchedulingIntent, isMultiBarberTeam } from './ai';
+import {
+  checkSchedulingAvailability,
+  createEvent,
+  getSchedulingBusyContext,
+  buildSemPreferenciaHintsForAi,
+  resolveSemPreferenciaBooking,
+  findEventByPhone,
+  deleteEvent,
+} from './calendar';
 import { pushAdminEvent } from './adminEvents';
 import { profileHasWagooAccess } from '../lib/profileAccess';
 import { listActiveBarbeirosForUser, resolveBarberFromSelection } from '../lib/barbeiros';
@@ -185,18 +193,62 @@ export async function startWhatsApp(email: string, res: Response | null) {
         memoryCache[cacheKey].messages.push({ role: 'user', content: textMessage });
 
         const activeBarbeiros = await listActiveBarbeirosForUser(p.id);
-        const schedulingState = memoryCache[cacheKey].scheduling ?? {
-          barberConfirmed: false,
-          selectedBarberName: null,
-          selectedBarberEmail: null,
-        };
+        const multiBarber = isMultiBarberTeam(
+          activeBarbeiros.map((b) => ({ id: b.id, nome: b.nome })),
+        );
+
+        if (!memoryCache[cacheKey].scheduling) {
+          memoryCache[cacheKey].scheduling = {
+            barberConfirmed: false,
+            selectedBarberName: null,
+            selectedBarberEmail: null,
+          };
+        }
+
+        if (!multiBarber && activeBarbeiros.length === 1) {
+          const only = activeBarbeiros[0];
+          memoryCache[cacheKey].scheduling = {
+            barberConfirmed: true,
+            selectedBarberName: only.nome,
+            selectedBarberEmail: only.google_calendar_email,
+          };
+        } else if (!multiBarber && activeBarbeiros.length === 0) {
+          memoryCache[cacheKey].scheduling = {
+            barberConfirmed: true,
+            selectedBarberName: null,
+            selectedBarberEmail: null,
+          };
+        }
+
+        const schedulingState = memoryCache[cacheKey].scheduling!;
 
         const currentHistory = memoryCache[cacheKey].messages.slice(-MAX_HISTORY);
         const formattedHistory = currentHistory
             .map(h => `${h.role === 'user' ? 'Cliente' : 'Wagoo'}: ${h.content}`)
             .join('\n');
 
-        const busySlots = await getBusySlots(email, new Date().toISOString());
+        const schedForBusy = memoryCache[cacheKey].scheduling!;
+        const semPreferencia =
+          schedForBusy.selectedBarberName?.toLowerCase().includes('sem prefer') ?? false;
+        const barberRefs = activeBarbeiros.map((b) => ({
+          nome: b.nome,
+          google_calendar_email: b.google_calendar_email,
+        }));
+        let busySlots = await getSchedulingBusyContext(email, new Date().toISOString(), {
+          multiBarber,
+          barberName: semPreferencia ? null : schedForBusy.selectedBarberName,
+          semPreferencia,
+          activeBarberNames: activeBarbeiros.map((b) => b.nome),
+        });
+        if (multiBarber && semPreferencia && schedForBusy.barberConfirmed) {
+          const hints = await buildSemPreferenciaHintsForAi(
+            email,
+            new Date().toISOString(),
+            p.service_duration ?? 30,
+            barberRefs,
+          );
+          busySlots = [...busySlots, hints];
+        }
 
         const aiResult = await analyzeMessage(
           formattedHistory,
@@ -216,7 +268,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
           },
         );
 
-        if (activeBarbeiros.length > 0 && aiResult.barberConfirmed && aiResult.barberSelection) {
+        if (multiBarber && aiResult.barberConfirmed && aiResult.barberSelection) {
           const resolved = resolveBarberFromSelection(activeBarbeiros, aiResult.barberSelection);
           if (resolved) {
             memoryCache[cacheKey].scheduling = {
@@ -268,15 +320,60 @@ export async function startWhatsApp(email: string, res: Response | null) {
         // --- 🎯 AGENDAMENTO ---
         if (aiResult.isScheduling && aiResult.date) {
             const sched = memoryCache[cacheKey].scheduling;
-            const barberName =
-              activeBarbeiros.length > 0
-                ? sched?.selectedBarberName ?? 'Sem Preferência'
+            const semPref =
+              sched?.selectedBarberName?.toLowerCase().includes('sem prefer') ?? false;
+            const barberName = multiBarber
+              ? sched?.selectedBarberName ?? 'Sem Preferência'
+              : activeBarbeiros.length === 1
+                ? activeBarbeiros[0].nome
                 : undefined;
-            const barberEmail =
-              activeBarbeiros.length > 0 ? sched?.selectedBarberEmail ?? null : null;
+            const barberEmail = multiBarber
+              ? sched?.selectedBarberEmail ?? null
+              : activeBarbeiros.length === 1
+                ? activeBarbeiros[0].google_calendar_email
+                : null;
 
-            const isFree = await checkAvailability(email, aiResult.date, p.service_duration);
-            if (isFree) {
+            let finalBarberName = barberName;
+            let finalBarberEmail = barberEmail;
+
+            if (semPref && multiBarber) {
+              const assigned = await resolveSemPreferenciaBooking(
+                email,
+                aiResult.date,
+                p.service_duration ?? 30,
+                barberRefs,
+              );
+              if (!assigned) {
+                await sock.sendMessage(remoteJid, {
+                  text: 'Esse horário não está disponível. Posso sugerir o próximo horário mais cedo — qual dia prefere?',
+                });
+                return;
+              }
+              finalBarberName = assigned.barberName;
+              finalBarberEmail = assigned.barberEmail;
+            } else {
+              const isFree = await checkSchedulingAvailability(
+                email,
+                aiResult.date,
+                p.service_duration ?? 30,
+                {
+                  multiBarber,
+                  barberName: sched?.selectedBarberName ?? null,
+                  semPreferencia: false,
+                  activeBarberNames: activeBarbeiros.map((b) => b.nome),
+                },
+              );
+              if (!isFree) {
+                await sock.sendMessage(remoteJid, {
+                  text: multiBarber && barberName
+                    ? `Esse horário não está livre para ${barberName}. Posso sugerir outro horário ou outro profissional — o que prefere?`
+                    : 'Esse horário acabou de ser ocupado. Quer tentar outro horário?',
+                });
+                return;
+              }
+            }
+
+            {
                 const clientName = msg.pushName || "Cliente WhatsApp";
                 const clientPhone = remoteJid.split('@')[0];
                 const created = await createEvent(
@@ -285,10 +382,21 @@ export async function startWhatsApp(email: string, res: Response | null) {
                   clientPhone,
                   aiResult.date,
                   p.service_duration,
-                  { barberName, barberEmail },
+                  { barberName: finalBarberName, barberEmail: finalBarberEmail },
                 );
 
                 if (created) {
+                    const confirmDate = new Date(aiResult.date).toLocaleString('pt-BR', {
+                      dateStyle: 'short',
+                      timeStyle: 'short',
+                    });
+                    const profLine =
+                      multiBarber && finalBarberName
+                        ? `\nProfissional: ${finalBarberName}`
+                        : '';
+                    await sock.sendMessage(remoteJid, {
+                      text: `Perfeito! Seu horário está confirmado para ${confirmDate}.${profLine}\nAté lá!`,
+                    });
                     await supabase.from('profiles').update({
                         appointments_count: (p.appointments_count || 0) + 1
                     }).eq('email', email);

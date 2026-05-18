@@ -193,3 +193,322 @@ export const createEvent = async (
         return false;
     }
 };
+
+export type CalendarEventDto = {
+    id: string;
+    summary: string;
+    description: string | null;
+    start: string;
+    end: string;
+    htmlLink: string | null;
+    source: 'wagoo' | 'other';
+    clientName: string | null;
+    clientPhone: string | null;
+    barberName: string | null;
+};
+
+const WAGOO_SUMMARY_RE = /^\[Wagoo\]\s*(.+?)\s*-\s*Barbeiro:\s*(.+)$/i;
+const PHONE_RE = /Telefone:\s*([+\d\s()-]+)/i;
+
+function mapGoogleEvent(ev: {
+    id?: string | null;
+    summary?: string | null;
+    description?: string | null;
+    htmlLink?: string | null;
+    start?: { dateTime?: string | null; date?: string | null };
+    end?: { dateTime?: string | null; date?: string | null };
+}): CalendarEventDto | null {
+    const id = ev.id;
+    const startRaw = ev.start?.dateTime || ev.start?.date;
+    const endRaw = ev.end?.dateTime || ev.end?.date;
+    if (!id || !startRaw || !endRaw) return null;
+
+    const summary = ev.summary?.trim() || 'Sem título';
+    const description = ev.description?.trim() || null;
+    const wagooMatch = summary.match(WAGOO_SUMMARY_RE);
+    const phoneMatch = description?.match(PHONE_RE);
+
+    return {
+        id,
+        summary,
+        description,
+        start: startRaw,
+        end: endRaw,
+        htmlLink: ev.htmlLink ?? null,
+        source: wagooMatch ? 'wagoo' : 'other',
+        clientName: wagooMatch?.[1]?.trim() ?? null,
+        clientPhone: phoneMatch?.[1]?.trim() ?? null,
+        barberName: wagooMatch?.[2]?.trim() ?? null,
+    };
+}
+
+/** Lista eventos do Google Calendar (primary) num intervalo ISO. */
+export const listCalendarEvents = async (
+    email: string,
+    timeMin: string,
+    timeMax: string,
+): Promise<CalendarEventDto[]> => {
+    try {
+        const calendar = await getOAuthClient(email);
+        if (!calendar) return [];
+
+        const response = await calendar.events.list({
+            calendarId: 'primary',
+            timeMin,
+            timeMax,
+            singleEvents: true,
+            orderBy: 'startTime',
+            maxResults: 250,
+        });
+
+        const items = response.data.items || [];
+        return items
+            .map((ev) => mapGoogleEvent(ev))
+            .filter((ev): ev is CalendarEventDto => ev !== null);
+    } catch (error) {
+        console.error(`❌ Erro ao listar eventos de ${email}:`, error);
+        return [];
+    }
+};
+
+function eventWindow(ev: CalendarEventDto): { start: Date; end: Date } {
+    return { start: parseISO(ev.start), end: parseISO(ev.end) };
+}
+
+function rangesOverlap(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): boolean {
+    return aStart < bEnd && bStart < aEnd;
+}
+
+/** Evento bloqueia o barbeiro indicado (agenda master com tags Wagoo). */
+export function eventBlocksBarber(ev: CalendarEventDto, barberName: string): boolean {
+    if (ev.source !== 'wagoo' || !ev.barberName) {
+        return true;
+    }
+    const tag = ev.barberName.toLowerCase();
+    if (tag.includes('sem prefer')) {
+        return true;
+    }
+    return tag === barberName.trim().toLowerCase();
+}
+
+export type SchedulingAvailabilityOptions = {
+    multiBarber: boolean;
+    barberName?: string | null;
+    semPreferencia?: boolean;
+    activeBarberNames?: string[];
+};
+
+/** Horários ocupados para contexto da IA (filtrados por profissional quando aplicável). */
+export async function getSchedulingBusyContext(
+    email: string,
+    dateIso: string,
+    options: SchedulingAvailabilityOptions,
+): Promise<string[]> {
+    const dayStart = startOfDay(parseISO(dateIso));
+    const dayEnd = endOfDay(parseISO(dateIso));
+    const events = await listCalendarEvents(email, dayStart.toISOString(), dayEnd.toISOString());
+
+    if (!options.multiBarber) {
+        return events.map((e) => {
+            const t = parseISO(e.start);
+            return `${t.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`;
+        });
+    }
+
+    if (options.semPreferencia) {
+        return events.map((e) => {
+            const t = parseISO(e.start);
+            const who = e.barberName || 'geral';
+            return `${t.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })} (${who})`;
+        });
+    }
+
+    if (options.barberName) {
+        return events
+            .filter((e) => eventBlocksBarber(e, options.barberName!))
+            .map((e) =>
+                parseISO(e.start).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+            );
+    }
+
+    return events.map((e) =>
+        parseISO(e.start).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+    );
+}
+
+/** Valida se o horário está livre conforme o modo (1 barbeiro / multi / sem preferência). */
+export async function checkSchedulingAvailability(
+    email: string,
+    dateIso: string,
+    durationMin: number,
+    options: SchedulingAvailabilityOptions,
+): Promise<boolean> {
+    try {
+        const slotStart = parseISO(dateIso);
+        const slotEnd = addMinutes(slotStart, durationMin);
+        const events = await listCalendarEvents(
+            email,
+            startOfDay(slotStart).toISOString(),
+            endOfDay(slotStart).toISOString(),
+        );
+
+        const conflicts = (ev: CalendarEventDto) => {
+            const { start, end } = eventWindow(ev);
+            return rangesOverlap(slotStart, slotEnd, start, end);
+        };
+
+        if (!options.multiBarber) {
+            return !events.some((ev) => conflicts(ev));
+        }
+
+        const names = options.activeBarberNames ?? [];
+        if (options.semPreferencia && names.length > 0) {
+            return names.some(
+                (name) => !events.some((ev) => conflicts(ev) && eventBlocksBarber(ev, name)),
+            );
+        }
+
+        if (options.barberName) {
+            return !events.some(
+                (ev) => conflicts(ev) && eventBlocksBarber(ev, options.barberName!),
+            );
+        }
+
+        return checkAvailability(email, dateIso, durationMin);
+    } catch (error) {
+        console.error(`❌ Erro checkSchedulingAvailability:`, error);
+        return true;
+    }
+}
+
+export type BarberSlotRef = { nome: string; google_calendar_email: string };
+
+export type SemPreferenciaAssignment = {
+    barberName: string;
+    barberEmail: string | null;
+};
+
+export function isBarberFreeAtSlot(
+    events: CalendarEventDto[],
+    slotStart: Date,
+    slotEnd: Date,
+    barberName: string,
+): boolean {
+    return !events.some((ev) => {
+        const { start, end } = eventWindow(ev);
+        return (
+            rangesOverlap(slotStart, slotEnd, start, end) && eventBlocksBarber(ev, barberName)
+        );
+    });
+}
+
+/**
+ * Sem Preferência no horário pedido: primeiro profissional livre na ordem da equipe
+ * (lista por nome ascendente = prioridade estável).
+ */
+export function pickBarberForSemPreferenciaSlot(
+    events: CalendarEventDto[],
+    slotStart: Date,
+    durationMin: number,
+    barbers: BarberSlotRef[],
+): SemPreferenciaAssignment | null {
+    const slotEnd = addMinutes(slotStart, durationMin);
+    const ordered = [...barbers].sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+
+    for (const b of ordered) {
+        if (isBarberFreeAtSlot(events, slotStart, slotEnd, b.nome)) {
+            return { barberName: b.nome, barberEmail: b.google_calendar_email };
+        }
+    }
+    return null;
+}
+
+export async function resolveSemPreferenciaBooking(
+    email: string,
+    dateIso: string,
+    durationMin: number,
+    barbers: BarberSlotRef[],
+): Promise<SemPreferenciaAssignment | null> {
+    if (!barbers.length) return null;
+    const slotStart = parseISO(dateIso);
+    const events = await listCalendarEvents(
+        email,
+        startOfDay(slotStart).toISOString(),
+        endOfDay(slotStart).toISOString(),
+    );
+    return pickBarberForSemPreferenciaSlot(events, slotStart, durationMin, barbers);
+}
+
+const DEFAULT_DAY_START_H = 8;
+const DEFAULT_DAY_END_H = 20;
+
+/**
+ * Varre o dia em passos de `durationMin` e devolve os horários livres mais cedo
+ * (qualquer profissional), com o nome de quem ficaria com o slot.
+ */
+export async function findEarliestSemPreferenciaSlots(
+    email: string,
+    dayIso: string,
+    durationMin: number,
+    barbers: BarberSlotRef[],
+    maxSlots: number = 6,
+): Promise<Array<{ label: string; barberName: string }>> {
+    if (!barbers.length) return [];
+
+    const day = startOfDay(parseISO(dayIso));
+    const events = await listCalendarEvents(
+        email,
+        day.toISOString(),
+        endOfDay(day).toISOString(),
+    );
+
+    const now = new Date();
+    const results: Array<{ label: string; barberName: string }> = [];
+
+    for (let h = DEFAULT_DAY_START_H; h < DEFAULT_DAY_END_H && results.length < maxSlots; h++) {
+        for (let m = 0; m < 60 && results.length < maxSlots; m += durationMin) {
+            const slotStart = new Date(day);
+            slotStart.setHours(h, m, 0, 0);
+            if (slotStart <= now) continue;
+
+            const assignment = pickBarberForSemPreferenciaSlot(
+                events,
+                slotStart,
+                durationMin,
+                barbers,
+            );
+            if (assignment) {
+                results.push({
+                    label: slotStart.toLocaleTimeString('pt-BR', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                    }),
+                    barberName: assignment.barberName,
+                });
+            }
+        }
+    }
+
+    return results;
+}
+
+/** Texto para a IA: horários mais cedo com Sem Preferência. */
+export async function buildSemPreferenciaHintsForAi(
+    email: string,
+    referenceDateIso: string,
+    durationMin: number,
+    barbers: BarberSlotRef[],
+): Promise<string> {
+    const slots = await findEarliestSemPreferenciaSlots(
+        email,
+        referenceDateIso,
+        durationMin,
+        barbers,
+        8,
+    );
+    if (!slots.length) {
+        return 'SUGESTÕES_SEM_PREFERÊNCIA: nenhum horário livre encontrado hoje — ofereça outro dia.';
+    }
+    const lines = slots.map((s) => `${s.label} (${s.barberName})`);
+    return `SUGESTÕES_SEM_PREFERÊNCIA (sempre ofereça o mais cedo primeiro): ${lines.join(', ')}`;
+}
