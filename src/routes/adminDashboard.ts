@@ -526,19 +526,19 @@ function buildWagooAccessOriginPT(input: {
   }
 
   const parts: string[] = [];
-  if (hasPaid) parts.push('Assinatura (has_paid)');
+  if (hasPaid) parts.push('Plano Pro');
   if (complimentaryActive) {
     parts.push(hasPromoRedemption ? 'Cortesia (link)' : 'Cortesia (base de dados)');
   }
 
   let accessOriginSummary = '—';
-  if (parts.length === 2) accessOriginSummary = 'Assinatura + cortesia';
+  if (parts.length === 2) accessOriginSummary = 'Plano Pro + cortesia';
   else if (parts.length === 1) accessOriginSummary = parts[0]!;
 
   const detailBits: string[] = [];
   if (hasPaid) {
     detailBits.push(
-      'Canal assinatura: profiles.has_paid activo (Stripe via webhook ou alteração directa no Postgres — não distinguimos aqui).',
+      'Canal Plano Pro: profiles.has_paid activo (Stripe via webhook ou alteração no admin/SQL).',
     );
   }
   if (complimentaryActive) {
