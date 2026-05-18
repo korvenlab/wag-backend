@@ -7,7 +7,9 @@ import stripeRoutes from './routes/stripe';
 import adminDashboardRoutes from './routes/adminDashboard';
 import feedbackRoutes from './routes/feedback';
 import promoRoutes from './routes/promo';
+import barbeirosRoutes from './routes/barbeiros';
 import { profileHasWagooAccess } from './lib/profileAccess';
+import { profileHasMultiBarberPlan } from './lib/profileMultiBarber';
 import { pushAdminEvent } from './services/adminEvents';
 import { startWhatsApp, autoReconnectAll, disconnectWhatsApp } from './services/whatsapp';
 import { generateAuthUrl, getTokensFromCode } from './services/googleAuth';
@@ -37,6 +39,7 @@ app.use(express.json());
 app.use('/feedback', feedbackRoutes);
 app.use('/api/admin', adminDashboardRoutes);
 app.use('/api/promo', promoRoutes);
+app.use('/api/barbeiros', barbeirosRoutes);
 
 // --- 1. ROTA DE PERFIL (somente dono da sessão — Bearer Supabase) ---
 app.get('/api/user/profile', async (req: Request, res: Response) => {
@@ -61,6 +64,9 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
       has_access: profileHasWagooAccess({
         has_paid: row.has_paid,
         complimentary_access_until: row.complimentary_access_until,
+      }),
+      multi_barber_plan: profileHasMultiBarberPlan({
+        multi_barber_plan: row.multi_barber_plan as boolean | null | undefined,
       }),
     });
   } catch {

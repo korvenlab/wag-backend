@@ -15,6 +15,7 @@ import { analyzeMessage, hasSchedulingIntent } from './ai';
 import { checkAvailability, createEvent, getBusySlots, findEventByPhone, deleteEvent } from './calendar';
 import { pushAdminEvent } from './adminEvents';
 import { profileHasWagooAccess } from '../lib/profileAccess';
+import { listActiveBarbeirosForUser, resolveBarberFromSelection } from '../lib/barbeiros';
 import { supabase } from '../lib/supabase';
 export const sessions: Record<string, any> = {};
 
@@ -25,6 +26,11 @@ export const sessions: Record<string, any> = {};
 interface ChatContext {
   lastUpdate: number;
   messages: { role: 'user' | 'assistant', content: string }[];
+  scheduling?: {
+    barberConfirmed: boolean;
+    selectedBarberName: string | null;
+    selectedBarberEmail: string | null;
+  };
 }
 
 const memoryCache: Record<string, ChatContext> = {};
@@ -168,24 +174,58 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
         if (!activeSession) {
             console.log(`🎯 [ATIVADO] Intenção detectada para ${cacheKey}.`);
-            memoryCache[cacheKey] = { lastUpdate: now, messages: [] };
+            memoryCache[cacheKey] = {
+              lastUpdate: now,
+              messages: [],
+              scheduling: { barberConfirmed: false, selectedBarberName: null, selectedBarberEmail: null },
+            };
         }
 
         memoryCache[cacheKey].lastUpdate = now;
         memoryCache[cacheKey].messages.push({ role: 'user', content: textMessage });
 
+        const activeBarbeiros = await listActiveBarbeirosForUser(p.id);
+        const schedulingState = memoryCache[cacheKey].scheduling ?? {
+          barberConfirmed: false,
+          selectedBarberName: null,
+          selectedBarberEmail: null,
+        };
+
         const currentHistory = memoryCache[cacheKey].messages.slice(-MAX_HISTORY);
         const formattedHistory = currentHistory
-            .map(h => `${h.role === 'user' ? 'Cliente' : 'Lucy'}: ${h.content}`)
+            .map(h => `${h.role === 'user' ? 'Cliente' : 'Wagoo'}: ${h.content}`)
             .join('\n');
 
         const busySlots = await getBusySlots(email, new Date().toISOString());
 
-        const aiResult = await analyzeMessage(formattedHistory, textMessage, true, false, busySlots, {
+        const aiResult = await analyzeMessage(
+          formattedHistory,
+          textMessage,
+          true,
+          false,
+          busySlots,
+          {
             store_name: p.store_name,
             working_hours: p.working_hours,
-            service_duration: p.service_duration
-        });
+            service_duration: p.service_duration,
+          },
+          activeBarbeiros.map((b) => ({ id: b.id, nome: b.nome })),
+          {
+            barberConfirmed: schedulingState.barberConfirmed,
+            selectedBarberName: schedulingState.selectedBarberName,
+          },
+        );
+
+        if (activeBarbeiros.length > 0 && aiResult.barberConfirmed && aiResult.barberSelection) {
+          const resolved = resolveBarberFromSelection(activeBarbeiros, aiResult.barberSelection);
+          if (resolved) {
+            memoryCache[cacheKey].scheduling = {
+              barberConfirmed: true,
+              selectedBarberName: resolved.nome,
+              selectedBarberEmail: resolved.email,
+            };
+          }
+        }
 
         // --- 🗑️ CANCELAMENTO ---
         if (aiResult.isCancelling) {
@@ -227,18 +267,32 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
         // --- 🎯 AGENDAMENTO ---
         if (aiResult.isScheduling && aiResult.date) {
+            const sched = memoryCache[cacheKey].scheduling;
+            const barberName =
+              activeBarbeiros.length > 0
+                ? sched?.selectedBarberName ?? 'Sem Preferência'
+                : undefined;
+            const barberEmail =
+              activeBarbeiros.length > 0 ? sched?.selectedBarberEmail ?? null : null;
+
             const isFree = await checkAvailability(email, aiResult.date, p.service_duration);
             if (isFree) {
-                // MODIFICAÇÃO: Removido aiResult.clientName para corrigir erro TS2339
                 const clientName = msg.pushName || "Cliente WhatsApp";
                 const clientPhone = remoteJid.split('@')[0];
-                const created = await createEvent(email, clientName, clientPhone, aiResult.date, p.service_duration);
-                
+                const created = await createEvent(
+                  email,
+                  clientName,
+                  clientPhone,
+                  aiResult.date,
+                  p.service_duration,
+                  { barberName, barberEmail },
+                );
+
                 if (created) {
-                    await supabase.from('profiles').update({ 
-                        appointments_count: (p.appointments_count || 0) + 1 
+                    await supabase.from('profiles').update({
+                        appointments_count: (p.appointments_count || 0) + 1
                     }).eq('email', email);
-                    delete memoryCache[cacheKey]; 
+                    delete memoryCache[cacheKey];
                 }
             }
         }

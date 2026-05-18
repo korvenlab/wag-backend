@@ -1,15 +1,12 @@
-// LOGICA DA INTEGRACAO COM O CALENDARIO DO GOOGLE (ATUALIZADA)
+// Integração Google Calendar — agenda centralizada no usuário master
 import { google } from 'googleapis';
 import { addMinutes, parseISO, startOfDay, endOfDay } from 'date-fns';
 import { supabase } from '../lib/supabase';
 
-/**
- * Obtém o cliente OAuth usando o EMAIL como identificador
- */
 const getOAuthClient = async (email: string) => {
     const { data: profile, error } = await supabase
         .from('profiles')
-        .select('googleAuth') 
+        .select('googleAuth')
         .eq('email', email.toLowerCase())
         .single();
 
@@ -18,7 +15,7 @@ const getOAuthClient = async (email: string) => {
         return null;
     }
 
-    const googleAuth = profile.googleAuth as any;
+    const googleAuth = profile.googleAuth as Record<string, unknown>;
 
     const oauth2Client = new google.auth.OAuth2(
         process.env.GOOGLE_CLIENT_ID,
@@ -27,14 +24,13 @@ const getOAuthClient = async (email: string) => {
     );
 
     oauth2Client.setCredentials({
-        access_token: googleAuth.accessToken,
-        refresh_token: googleAuth.refreshToken,
-        expiry_date: googleAuth.expiryDate
+        access_token: googleAuth.accessToken as string,
+        refresh_token: googleAuth.refreshToken as string,
+        expiry_date: googleAuth.expiryDate as number,
     });
 
     oauth2Client.on('tokens', async (tokens) => {
-        console.log(`🔄 [CALENDAR] Renovando tokens para ${email}...`);
-        const updatedAuth = {
+        const updatedAuth: Record<string, unknown> = {
             ...googleAuth,
             accessToken: tokens.access_token || googleAuth.accessToken,
             expiryDate: tokens.expiry_date || googleAuth.expiryDate,
@@ -46,15 +42,11 @@ const getOAuthClient = async (email: string) => {
             .from('profiles')
             .update({ googleAuth: updatedAuth })
             .eq('email', email.toLowerCase());
-        console.log(`✅ [CALENDAR] Tokens renovados com sucesso.`);
     });
 
     return google.calendar({ version: 'v3', auth: oauth2Client });
 };
 
-/**
- * BUSCA TODOS OS HORÁRIOS OCUPADOS
- */
 export const getBusySlots = async (email: string, dateIso: string): Promise<string[]> => {
     try {
         const calendar = await getOAuthClient(email);
@@ -79,11 +71,7 @@ export const getBusySlots = async (email: string, dateIso: string): Promise<stri
     }
 };
 
-/**
- * BUSCA UM EVENTO FUTURO PELO TELEFONE DO CLIENTE
- * FEATURE: Permite cancelamento sem depender da memória RAM do bot.
- */
-export const findEventByPhone = async (email: string, phone: string): Promise<any | null> => {
+export const findEventByPhone = async (email: string, phone: string): Promise<{ id: string; start: { dateTime: string } } | null> => {
     try {
         const calendar = await getOAuthClient(email);
         if (!calendar) return null;
@@ -91,24 +79,26 @@ export const findEventByPhone = async (email: string, phone: string): Promise<an
         const now = new Date().toISOString();
         const response = await calendar.events.list({
             calendarId: 'primary',
-            timeMin: now, // Apenas eventos futuros
-            q: phone,     // Busca o telefone na descrição do evento
+            timeMin: now,
+            q: phone,
             singleEvents: true,
             orderBy: 'startTime',
             maxResults: 1
         });
 
         const events = response.data.items || [];
-        return events.length > 0 ? events[0] : null;
+        if (!events.length || !events[0].id) return null;
+        const ev = events[0];
+        return {
+            id: ev.id!,
+            start: { dateTime: ev.start?.dateTime || ev.start?.date || '' },
+        };
     } catch (error) {
         console.error(`❌ Erro ao buscar evento para o telefone ${phone}:`, error);
         return null;
     }
 };
 
-/**
- * DELETA UM EVENTO NO CALENDÁRIO
- */
 export const deleteEvent = async (email: string, eventId: string): Promise<boolean> => {
     try {
         const calendar = await getOAuthClient(email);
@@ -118,8 +108,7 @@ export const deleteEvent = async (email: string, eventId: string): Promise<boole
             calendarId: 'primary',
             eventId: eventId
         });
-        
-        console.log(`🗑️ Evento ${eventId} deletado com sucesso para ${email}`);
+
         return true;
     } catch (error) {
         console.error(`❌ Erro ao deletar evento ${eventId}:`, error);
@@ -127,13 +116,10 @@ export const deleteEvent = async (email: string, eventId: string): Promise<boole
     }
 };
 
-/**
- * CHECA DISPONIBILIDADE
- */
 export const checkAvailability = async (email: string, dateIso: string, durationMin: number = 30): Promise<boolean> => {
     try {
         const calendar = await getOAuthClient(email);
-        if (!calendar) return true; 
+        if (!calendar) return true;
 
         const start = parseISO(dateIso);
         const end = addMinutes(start, durationMin);
@@ -150,19 +136,22 @@ export const checkAvailability = async (email: string, dateIso: string, duration
         return !busySlots || busySlots.length === 0;
     } catch (error) {
         console.error(`❌ Erro na agenda de ${email}:`, error);
-        return true; 
+        return true;
     }
 };
 
-/**
- * CRIA O EVENTO
- */
+export type CreateEventOptions = {
+    barberName?: string;
+    barberEmail?: string | null;
+};
+
 export const createEvent = async (
-    email: string, 
-    clientName: string, 
-    clientPhone: string, 
+    email: string,
+    clientName: string,
+    clientPhone: string,
     dateIso: string,
-    durationMin: number = 30 
+    durationMin: number = 30,
+    options: CreateEventOptions = {},
 ): Promise<boolean> => {
     try {
         const calendar = await getOAuthClient(email);
@@ -171,17 +160,33 @@ export const createEvent = async (
         const start = parseISO(dateIso);
         const end = addMinutes(start, durationMin);
 
+        const barberLabel = options.barberName?.trim() || 'Sem Preferência';
+        const summary = `[Wagoo] ${clientName} - Barbeiro: ${barberLabel}`;
+
+        const requestBody: {
+            summary: string;
+            description: string;
+            start: { dateTime: string; timeZone: string };
+            end: { dateTime: string; timeZone: string };
+            attendees?: { email: string }[];
+        } = {
+            summary,
+            description: `Telefone: ${clientPhone}\nAgendado via Wagoo IA.`,
+            start: { dateTime: start.toISOString(), timeZone: 'America/Sao_Paulo' },
+            end: { dateTime: end.toISOString(), timeZone: 'America/Sao_Paulo' },
+        };
+
+        if (options.barberEmail) {
+            requestBody.attendees = [{ email: options.barberEmail }];
+        }
+
         await calendar.events.insert({
             calendarId: 'primary',
-            requestBody: {
-                summary: `Agendamento: ${clientName}`,
-                description: `Telefone: ${clientPhone}\nAgendado via Lucy IA.`,
-                start: { dateTime: start.toISOString(), timeZone: 'America/Sao_Paulo' },
-                end: { dateTime: end.toISOString(), timeZone: 'America/Sao_Paulo' },
-            }
+            sendUpdates: options.barberEmail ? 'all' : 'none',
+            requestBody,
         });
-        
-        console.log(`✅ Evento criado com sucesso para ${email}`);
+
+        console.log(`✅ Evento criado: ${summary}`);
         return true;
     } catch (error) {
         console.error(`❌ Erro ao criar evento para ${email}:`, error);

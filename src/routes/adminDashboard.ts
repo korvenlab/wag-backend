@@ -7,6 +7,8 @@ import { subDays, startOfDay, formatISO } from 'date-fns';
 import { sessions } from '../services/whatsapp';
 import { getAdminEvents, pushAdminEvent, AdminApp, AdminEventStatus } from '../services/adminEvents';
 import { setProfileHasPaidByUserId } from '../lib/profileHasPaid';
+import { profileHasMultiBarberPlan } from '../lib/profileMultiBarber';
+import { setProfileMultiBarberPlanByUserId } from '../lib/setMultiBarberPlan';
 import {
   complimentaryUntilToMillis,
   isComplimentaryAccessActive,
@@ -492,6 +494,11 @@ type AdminUserRow = {
   accessOriginSummary: string;
   /** Texto longo para tooltip: Stripe vs link vs base. */
   accessOriginDetail: string;
+  /** Plano add-on Multi-Barbeiro (equipe + IA com triagem). */
+  multiBarberPlan: boolean;
+  multi_barber_plan: boolean;
+  /** Profissionais cadastrados na tabela `barbeiros`. */
+  barbeirosCount: number;
   createdAt: string;
   lastSignInAt: string | null;
 };
@@ -567,6 +574,20 @@ function parseHasPaidFromRequestBody(body: unknown): boolean | null {
   return null;
 }
 
+function parseMultiBarberPlanFromRequestBody(body: unknown): boolean | null {
+  if (!body || typeof body !== 'object') return null;
+  const b = body as Record<string, unknown>;
+  const raw = b.multiBarberPlan ?? b.multi_barber_plan;
+  if (typeof raw === 'boolean') return raw;
+  if (typeof raw === 'number' && Number.isFinite(raw)) return raw !== 0;
+  if (typeof raw === 'string') {
+    const s = raw.trim().toLowerCase();
+    if (['true', 't', '1', 'yes', 'sim'].includes(s)) return true;
+    if (['false', 'f', '0', 'no', 'nao', 'não'].includes(s)) return false;
+  }
+  return null;
+}
+
 function normalizeAdminUser(
   authUser: {
     id: string;
@@ -585,7 +606,9 @@ function normalizeAdminUser(
     deleted_at?: string | null;
     has_paid?: unknown;
     complimentary_access_until?: unknown;
-  }
+    multi_barber_plan?: unknown;
+  },
+  barbeirosCount = 0,
 ): AdminUserRowCore {
   const role =
     (profile?.role as string | undefined) ||
@@ -616,6 +639,9 @@ function normalizeAdminUser(
   const untilMs = complimentaryUntilToMillis(untilRaw);
   const complimentaryIso =
     untilMs != null && Number.isFinite(untilMs) ? new Date(untilMs).toISOString() : null;
+  const multiBarberPlan = profileHasMultiBarberPlan(
+    profile as { multi_barber_plan?: boolean | null } | null | undefined,
+  );
 
   return {
     id: authUser.id,
@@ -629,9 +655,26 @@ function normalizeAdminUser(
     hasPaid,
     hasAccess,
     complimentary_access_until: complimentaryIso ?? (typeof untilRaw === 'string' ? untilRaw.trim() || null : null),
+    multiBarberPlan,
+    multi_barber_plan: multiBarberPlan,
+    barbeirosCount,
     createdAt: authUser.created_at || new Date(0).toISOString(),
     lastSignInAt: authUser.last_sign_in_at || null,
   };
+}
+
+async function getBarbeirosCountByUserIds(userIds: string[]): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (!userIds.length) return out;
+  const idsNorm = [...new Set(userIds.map((id) => normalizeAuthUserId(id)))];
+  const { data, error } = await supabase.from('barbeiros').select('user_id').in('user_id', idsNorm);
+  if (error || !data) return out;
+  for (const row of data as { user_id?: string }[]) {
+    if (typeof row.user_id !== 'string') continue;
+    const uid = normalizeAuthUserId(row.user_id);
+    out.set(uid, (out.get(uid) ?? 0) + 1);
+  }
+  return out;
 }
 
 async function getUserIdsWithPromoRedemption(userIds: string[]): Promise<Set<string>> {
@@ -661,6 +704,7 @@ function buildWagooAdminUserRow(
   },
   profileMap: Map<string, Record<string, unknown>>,
   promoUserIds: Set<string>,
+  barbeirosCountMap: Map<string, number>,
 ): AdminUserRow {
   const profile = profileRowForUser(profileMap, authUser.id) as
     | {
@@ -671,9 +715,11 @@ function buildWagooAdminUserRow(
         deleted_at?: string | null;
         has_paid?: unknown;
         complimentary_access_until?: unknown;
+        multi_barber_plan?: unknown;
       }
     | undefined;
-  const base = normalizeAdminUser(authUser, profile);
+  const barbeirosCount = barbeirosCountMap.get(normalizeAuthUserId(authUser.id)) ?? 0;
+  const base = normalizeAdminUser(authUser, profile, barbeirosCount);
   const hasPromoRedemption = promoUserIds.has(normalizeAuthUserId(authUser.id));
   const complimentaryActive = isComplimentaryAccessActive(base.complimentary_access_until ?? undefined);
   const { accessOriginSummary, accessOriginDetail } = buildWagooAccessOriginPT({
@@ -694,7 +740,7 @@ function buildWagooAdminUserRow(
 }
 
 const PROFILE_ADMIN_SELECT =
-  'id, email, store_name, role, is_active, deleted_at, has_paid, complimentary_access_until';
+  'id, email, store_name, role, is_active, deleted_at, has_paid, complimentary_access_until, multi_barber_plan';
 
 type AuthUserLite = { id: string; email?: string };
 
@@ -801,6 +847,7 @@ router.get('/dashboard', async (req: Request, res: Response) => {
 
   let profilesCount = 0;
   let payingProfiles = 0;
+  let multiBarberPlanProfiles = 0;
   let whatsappConfigured = 0;
   let profilesWithAppAccess = 0;
 
@@ -817,6 +864,13 @@ router.get('/dashboard', async (req: Request, res: Response) => {
       .eq('has_paid', true);
     if (e2) throw e2;
     payingProfiles = paid ?? 0;
+
+    const { count: multiBarber, error: e2b } = await supabase
+      .from('profiles')
+      .select('id', { count: 'exact', head: true })
+      .eq('multi_barber_plan', true);
+    if (e2b) throw e2b;
+    multiBarberPlanProfiles = multiBarber ?? 0;
 
     const { count: wa, error: e3 } = await supabase
       .from('profiles')
@@ -992,6 +1046,7 @@ router.get('/dashboard', async (req: Request, res: Response) => {
           profilesWithAppAccess,
           registeredProfiles: profilesCount,
           payingUsersInDb: payingProfiles,
+          multiBarberPlanProfiles,
           whatsappConfiguredProfiles: whatsappConfigured,
           botSessionsOnline: botOnlineEmails.length,
         },
@@ -1067,6 +1122,7 @@ router.get('/users', async (req: Request, res: Response) => {
       pageUsers.map((u) => ({ id: u.id, email: u.email ?? undefined })),
     );
     const promoUserIds = await getUserIdsWithPromoRedemption(pageUsers.map((u) => u.id));
+    const barbeirosCountMap = await getBarbeirosCountByUserIds(pageUsers.map((u) => u.id));
 
     const items = pageUsers.map((u) =>
       buildWagooAdminUserRow(
@@ -1081,6 +1137,7 @@ router.get('/users', async (req: Request, res: Response) => {
         },
         profileMap,
         promoUserIds,
+        barbeirosCountMap,
       ),
     );
 
@@ -1110,6 +1167,7 @@ router.get('/users/:id', async (req: Request, res: Response) => {
       { id: authRow.id, email: authRow.email },
     ]);
     const promoUserIds = await getUserIdsWithPromoRedemption([id]);
+    const barbeirosCountMap = await getBarbeirosCountByUserIds([id]);
     const user = buildWagooAdminUserRow(
       data.user as unknown as {
         id: string;
@@ -1122,6 +1180,7 @@ router.get('/users/:id', async (req: Request, res: Response) => {
       },
       profileMap,
       promoUserIds,
+      barbeirosCountMap,
     );
     res.status(200).type(JSON_UTF8).json({ ok: true, data: user });
   } catch (e: unknown) {
@@ -1171,6 +1230,75 @@ router.patch('/users/:id/has-paid', async (req: Request, res: Response) => {
     sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
   }
 });
+
+/** Korven: activa ou revoga o Plano Multi-Barbeiro (`multi_barber_plan`). */
+async function handleUserMultiBarberPlan(req: Request, res: Response): Promise<void> {
+  const id = normalizeAuthUserId(String(req.params.id || ''));
+  const active = parseMultiBarberPlanFromRequestBody(req.body);
+  if (!id || active === null) {
+    sendApiError(
+      res,
+      400,
+      'VALIDATION_ERROR',
+      'id e multiBarberPlan ou multi_barber_plan (booleano) são obrigatórios.',
+    );
+    return;
+  }
+  try {
+    const auth = await supabase.auth.admin.getUserById(id);
+    if (!auth.data?.user) {
+      sendApiError(res, 404, 'NOT_FOUND', 'Usuário não encontrado.');
+      return;
+    }
+
+    const r = await setProfileMultiBarberPlanByUserId(supabase, id, active);
+    if (!r.ok) {
+      sendApiError(res, 500, 'INTERNAL_ERROR', r.error);
+      return;
+    }
+
+    const actor = getAdminActor(req);
+    pushAdminAudit({
+      actor,
+      action: 'user.multi_barber_plan.update',
+      target: id,
+      timestamp: new Date().toISOString(),
+      meta: { active },
+    });
+    pushAdminEvent(
+      'wagoo',
+      `Admin ${active ? 'activou' : 'revogou'} Plano Multi-Barbeiro (${id})`,
+      active ? 'online' : 'degraded',
+    );
+
+    const authUser = auth.data.user as unknown as { id: string; email?: string };
+    const profileMap = await getUserProfileMapForAuthUsers([
+      { id: authUser.id, email: authUser.email },
+    ]);
+    const promoUserIds = await getUserIdsWithPromoRedemption([id]);
+    const barbeirosCountMap = await getBarbeirosCountByUserIds([id]);
+    const user = buildWagooAdminUserRow(
+      auth.data.user as unknown as {
+        id: string;
+        email?: string;
+        created_at?: string;
+        last_sign_in_at?: string;
+        user_metadata?: Record<string, unknown>;
+        app_metadata?: Record<string, unknown>;
+        banned_until?: string | null;
+      },
+      profileMap,
+      promoUserIds,
+      barbeirosCountMap,
+    );
+    res.status(200).type(JSON_UTF8).json({ ok: true, data: user });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+}
+
+router.patch('/users/:id/multi-barber-plan', handleUserMultiBarberPlan);
+router.post('/users/:id/multi-barber-plan', handleUserMultiBarberPlan);
 
 const COMPLIMENTARY_PRESETS = ['none', '7', '30', '60', '90', '180', '365'] as const;
 type ComplimentaryPreset = (typeof COMPLIMENTARY_PRESETS)[number];
@@ -1269,6 +1397,7 @@ async function handleUserComplimentaryAccess(req: Request, res: Response): Promi
       { id: authUser.id, email: authUser.email },
     ]);
     const promoUserIds = await getUserIdsWithPromoRedemption([id]);
+    const barbeirosCountMap = await getBarbeirosCountByUserIds([id]);
     const user = buildWagooAdminUserRow(
       auth.data.user as unknown as {
         id: string;
@@ -1281,6 +1410,7 @@ async function handleUserComplimentaryAccess(req: Request, res: Response): Promi
       },
       profileMap,
       promoUserIds,
+      barbeirosCountMap,
     );
     res.status(200).type(JSON_UTF8).json({ ok: true, data: user });
   } catch (e: unknown) {
