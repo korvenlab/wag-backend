@@ -13,6 +13,7 @@ import { profileHasWagooAccess } from './lib/profileAccess';
 import { profileHasMultiBarberPlan, profileSubscriptionTier } from './lib/profileMultiBarber';
 import { getMaxBarbeirosSlots, WAGOO_PLANS } from './lib/wagooSubscription';
 import { countBarbeirosForUser } from './lib/barbeiros';
+import { syncCalendarShareSlug } from './lib/storeSlug';
 import { pushAdminEvent } from './services/adminEvents';
 import { startWhatsApp, autoReconnectAll, disconnectWhatsApp } from './services/whatsapp';
 import { generateAuthUrl, getTokensFromCode } from './services/googleAuth';
@@ -170,8 +171,19 @@ app.post('/api/settings/store', async (req: Request, res: Response) => {
   const { email, storeName } = req.body;
   const userEmail = String(email).toLowerCase().trim();
 
+  const { data: existing } = await supabase
+    .from('profiles')
+    .select('id, calendar_share_token')
+    .eq('email', userEmail)
+    .maybeSingle();
+
   const { error } = await supabase.from('profiles').update({ store_name: storeName }).eq('email', userEmail);
   if (error) return res.status(500).json({ error: error.message });
+
+  if (existing?.id && existing.calendar_share_token) {
+    await syncCalendarShareSlug(supabase, existing.id, storeName, null);
+  }
+
   res.json({ ok: true });
 });
 
