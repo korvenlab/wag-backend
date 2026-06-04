@@ -104,7 +104,7 @@ async function callGemini(prompt: string, modelName: string): Promise<AiJsonPayl
     model: modelName,
     generationConfig: {
       temperature: 0,
-      maxOutputTokens: 1024,
+      maxOutputTokens: 512,
       responseMimeType: 'application/json',
     },
   });
@@ -171,7 +171,7 @@ export const analyzeMessage = async (
         return {
             isScheduling: false,
             isCancelling: false,
-            response: 'No momento não consigo processar mensagens. A equipa técnica foi alertada.',
+            response: 'No momento não consigo processar mensagens. A equipa foi avisada.',
             date: null,
             barberSelection: null,
             barberConfirmed: false,
@@ -194,43 +194,50 @@ export const analyzeMessage = async (
             ? `
         CENÁRIO B — MÚLTIPLOS PROFISSIONAIS (${activeBarbeiros.length} activos):
         Equipe: ${activeBarbeiros.map((b) => b.nome).join(', ')}
-        Opção extra: "Sem Preferência" (qualquer profissional com vaga).
+        Opção extra: "Sem Preferência".
 
-        Estado da escolha:
-        - Profissional confirmado: ${schedulingState.barberConfirmed ? 'SIM' : 'NÃO'}
-        - Escolha actual: ${schedulingState.selectedBarberName ?? 'ainda não definido'}
+        Estado: profissional confirmado=${schedulingState.barberConfirmed ? 'SIM' : 'NÃO'}; escolha=${schedulingState.selectedBarberName ?? '—'}
 
-        REGRAS OBRIGATÓRIAS:
-        1. Ao detectar intenção de agendar, PERGUNTE com qual profissional o cliente quer marcar OU "Sem Preferência".
-        2. Se o cliente não conhecer os profissionais, perguntar quem trabalha na barbearia, ou pedir indicação — LISTE os nomes de forma amigável.
-        3. NUNCA apresente horários definitivos nem confirme marcação (isScheduling com data/hora) ANTES de barberConfirmed=true.
-        4. Só depois da escolha, apresente horários livres (use OCUPADOS filtrados para o profissional escolhido).
-        5. Se o cliente escolheu "Sem Preferência", sugira SEMPRE os horários mais cedo disponíveis (use SUGESTOES_SEM_PREFERENCIA se existir no contexto).
-        6. barberSelection = nome exacto da lista ou "SEM_PREFERENCIA". barberConfirmed=true só após escolha explícita.
+        REGRAS:
+        1. Intenção de agendar → pergunte profissional OU "Sem Preferência" (numa frase).
+        2. Cliente não conhece a equipe → cite só os nomes, sem descrições.
+        3. Sem barberConfirmed=true: não sugira horários nem confirme marcação.
+        4. Com profissional escolhido → horários livres compactos (use OCUPADOS).
+        5. "Sem Preferência" → horários mais cedo (SUGESTOES_SEM_PREFERENCIA se houver).
+        6. barberSelection = nome exacto ou SEM_PREFERENCIA; barberConfirmed=true só após escolha explícita.
         `
             : `
-        CENÁRIO A — UM ÚNICO PROFISSIONAL${singleBarberName ? ` (${singleBarberName})` : ''}:
-        - NÃO pergunte preferência de barbeiro, NÃO liste equipe, NÃO mencione "Sem Preferência".
-        - Avance directamente para horários disponíveis e confirmação de data/hora.
-        - barberConfirmed=true quando houver intenção de agendar.
-        - barberSelection deve ser null.
+        CENÁRIO A — UM PROFISSIONAL${singleBarberName ? ` (${singleBarberName})` : ''}:
+        - Não pergunte barbeiro nem liste equipe.
+        - Vá directo a dia/horário disponível.
+        - barberConfirmed=true com intenção de agendar; barberSelection=null.
         `;
 
         const busyContext = multiBarber && !schedulingState.barberConfirmed
-            ? 'Aguardando escolha do profissional — não use horários ocupados para sugerir slots ainda.'
+            ? 'Aguardando escolha do profissional.'
             : busySlots.join(', ') || 'nenhum';
 
         const prompt = `
-        Você é o Wagoo, assistente da "${storeLabel}".
-        Extraia intenção de agendamento e escolha de profissional conforme o cenário.
+        Você é o Wagoo, secretária virtual da "${storeLabel}" no WhatsApp.
+        Extraia intenção de agendamento e escolha de profissional.
 
-        REGRAS DE EXTRAÇÃO:
-        - Se o cliente quer marcar, extraia DATA (YYYY-MM-DD) e HORA (HH:mm) apenas quando puder confirmar (Cenário A ou B com profissional já escolhido).
-        - Hoje é ${diaAtualNome}, ${dataFormatadaBR} às ${currentTimeBR}.
-        - Duração do serviço: ${dbRow.service_duration ?? 30} minutos.
+        ESTILO DO CAMPO "response" (obrigatório):
+        - Cordial e profissional, como secretária educada — nunca seca ou robótica.
+        - Mínimo de caracteres: directo ao ponto, sem rodeios nem repetições.
+        - Ideal: 1–2 frases curtas (≤160 caracteres; máximo ~220).
+        - Cordialidade enxuta: "Olá", "Por favor", "Obrigada" quando couber — sem bajulação.
+        - Proibido: elogios longos ("excelente profissional", "ótima escolha"), parágrafos, repetir o pedido do cliente.
+        - Horários: formato compacto (ex: "14h, 15h30 ou 17h").
+        - Uma pergunta por vez. Se isScheduling=true, NÃO escreva confirmação final — o sistema confirma depois.
+        - Exemplos de tom: "Olá! Com o Marcos. Qual dia e horário?" | "Temos Marcos e Robson. Algum preferido?" | "Amanhã: 14h, 15h ou 16h30. Qual prefere?"
 
-        OCUPADOS (contexto de agenda): ${busyContext}
-        HORÁRIOS DA LOJA: ${JSON.stringify(dbRow.working_hours ?? {})}
+        EXTRAÇÃO:
+        - DATA (YYYY-MM-DD) e HORA (HH:mm) só quando puder confirmar (Cenário A ou B com profissional escolhido).
+        - Hoje: ${diaAtualNome}, ${dataFormatadaBR} ${currentTimeBR}.
+        - Serviço: ${dbRow.service_duration ?? 30} min.
+
+        OCUPADOS: ${busyContext}
+        HORÁRIOS LOJA: ${JSON.stringify(dbRow.working_hours ?? {})}
         ${teamBlock}
 
         HISTÓRICO:
@@ -239,7 +246,7 @@ export const analyzeMessage = async (
         MENSAGEM:
         "${currentMessage}"
 
-        Responda SOMENTE com JSON válido (sem markdown):
+        JSON válido apenas (sem markdown):
         {
             "isScheduling": boolean,
             "isCancelling": boolean,
@@ -247,7 +254,7 @@ export const analyzeMessage = async (
             "extractedTime": "HH:mm ou null",
             "barberSelection": "nome exacto, SEM_PREFERENCIA ou null",
             "barberConfirmed": boolean,
-            "response": "Resposta humanizada em português do Brasil"
+            "response": "Resposta curta, cordial, em português do Brasil"
         }`;
 
         const parsed = await callGeminiWithFallback(prompt);
@@ -304,7 +311,7 @@ export const analyzeMessage = async (
         const responseText =
             typeof parsed.response === 'string' && parsed.response.trim()
                 ? parsed.response.trim()
-                : 'Como posso ajudar com seu agendamento?';
+                : 'Como posso ajudar?';
 
         return {
             isScheduling,
@@ -327,8 +334,8 @@ export const analyzeMessage = async (
             isScheduling: false,
             isCancelling: false,
             response: isLeakedApiKeyError(error)
-                ? 'No momento estou indisponível. A barbearia foi avisada — tente novamente em alguns minutos.'
-                : 'Desculpe, tive um problema técnico. Pode repetir sua mensagem?',
+                ? 'Estou indisponível no momento. Tente de novo em alguns minutos.'
+                : 'Desculpe, tive um problema. Pode repetir?',
             date: null,
             barberSelection: null,
             barberConfirmed: false,

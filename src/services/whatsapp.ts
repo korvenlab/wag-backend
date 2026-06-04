@@ -372,14 +372,14 @@ export async function startWhatsApp(email: string, res: Response | null) {
                 if (success) {
                     const eventDate = new Date(event.start.dateTime).toLocaleString('pt-BR');
                     await sock.sendMessage(remoteJid, { 
-                        text: `Certo. Localizei seu agendamento para ${eventDate} e ele foi cancelado com sucesso.` 
+                        text: `Agendamento de ${eventDate} cancelado.`
                     });
                     delete memoryCache[cacheKey]; 
                     return;
                 }
             } else {
                 await sock.sendMessage(remoteJid, { 
-                    text: "Não encontrei nenhum agendamento futuro para o seu número." 
+                    text: 'Não encontrei agendamento futuro no seu número.'
                 });
                 return;
             }
@@ -430,7 +430,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
               );
               if (!assigned) {
                 await sock.sendMessage(remoteJid, {
-                  text: 'Esse horário não está disponível. Posso sugerir o próximo horário mais cedo — qual dia prefere?',
+                  text: 'Horário indisponível. Quer outro dia ou horário?',
                 });
                 return;
               }
@@ -451,8 +451,8 @@ export async function startWhatsApp(email: string, res: Response | null) {
               if (!isFree) {
                 await sock.sendMessage(remoteJid, {
                   text: multiBarber && barberName
-                    ? `Esse horário não está livre para ${barberName}. Posso sugerir outro horário ou outro profissional — o que prefere?`
-                    : 'Esse horário acabou de ser ocupado. Quer tentar outro horário?',
+                    ? `Horário indisponível para ${barberName}. Outro horário ou profissional?`
+                    : 'Horário indisponível. Quer tentar outro?',
                 });
                 return;
               }
@@ -479,7 +479,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
                       multiBarber && finalBarberName
                         ? `\nProfissional: ${finalBarberName}`
                         : '';
-                    const confirmText = `Perfeito! Seu horário está confirmado para ${confirmDate}.${profLine}\nAté lá!`;
+                    const confirmText = `Confirmado: ${confirmDate}.${profLine}\nAté lá!`;
                     await sock.sendMessage(remoteJid, { text: confirmText });
                     memoryCache[cacheKey].messages.push({ role: 'assistant', content: confirmText });
                     await supabase.from('profiles').update({
