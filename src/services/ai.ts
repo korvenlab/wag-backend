@@ -12,12 +12,16 @@ dotenv.config();
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim() ?? '';
 
-/** Primário: gemini-3.1-flash-lite (Render). Fallbacks se a API falhar. */
+/** Primário: gemini-3.1-flash-lite (Render). Fallback se a API falhar. */
 const DEFAULT_GEMINI_MODELS = [
   'gemini-3.1-flash-lite',
   'gemini-2.5-flash',
-  'gemini-1.5-flash',
 ] as const;
+
+function isLeakedApiKeyError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes('leaked') || msg.includes('API key was reported');
+}
 
 function resolveModelCandidates(): string[] {
   const fromEnv = process.env.GEMINI_MODEL?.trim();
@@ -121,6 +125,13 @@ async function callGeminiWithFallback(prompt: string): Promise<AiJsonPayload> {
     } catch (err) {
       lastError = err;
       const msg = err instanceof Error ? err.message : String(err);
+      if (isLeakedApiKeyError(err)) {
+        console.error(
+          '[WAGOO AI] CRÍTICO: GEMINI_API_KEY revogada (vazamento detectado pelo Google). ' +
+            'Gere uma nova chave em https://aistudio.google.com/apikey e atualize no Render.',
+        );
+        throw err;
+      }
       console.warn(`[WAGOO AI] Falha com modelo ${modelName}: ${msg}`);
     }
   }
@@ -307,11 +318,17 @@ export const analyzeMessage = async (
 
     } catch (error: unknown) {
         const detail = error instanceof Error ? error.message : String(error);
-        console.error('[WAGOO AI] Erro fatal:', detail, error);
+        if (isLeakedApiKeyError(error)) {
+            console.error('[WAGOO AI] Serviço indisponível até substituir GEMINI_API_KEY no Render.');
+        } else {
+            console.error('[WAGOO AI] Erro fatal:', detail, error);
+        }
         return {
             isScheduling: false,
             isCancelling: false,
-            response: 'Desculpe, tive um problema técnico. Pode repetir sua mensagem?',
+            response: isLeakedApiKeyError(error)
+                ? 'No momento estou indisponível. A barbearia foi avisada — tente novamente em alguns minutos.'
+                : 'Desculpe, tive um problema técnico. Pode repetir sua mensagem?',
             date: null,
             barberSelection: null,
             barberConfirmed: false,
