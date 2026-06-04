@@ -1,4 +1,4 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, type GenerateContentResult } from "@google/generative-ai";
 import dotenv from 'dotenv';
 import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
@@ -10,8 +10,22 @@ dayjs.tz.setDefault("America/Sao_Paulo");
 
 dotenv.config();
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-const MODEL_NAME = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite-preview";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim() ?? '';
+
+/** Primário: gemini-3.1-flash-lite (Render). Fallbacks se a API falhar. */
+const DEFAULT_GEMINI_MODELS = [
+  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-1.5-flash',
+] as const;
+
+function resolveModelCandidates(): string[] {
+  const fromEnv = process.env.GEMINI_MODEL?.trim();
+  const ordered = fromEnv ? [fromEnv, ...DEFAULT_GEMINI_MODELS] : [...DEFAULT_GEMINI_MODELS];
+  return [...new Set(ordered.filter(Boolean))];
+}
+
+const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
 
 export type ActiveBarbeiroForAi = { id: string; nome: string };
 
@@ -30,6 +44,89 @@ export const hasSchedulingIntent = (message: string): boolean => {
     const keywords = ['horário', 'horario', 'agendar', 'marcar', 'vaga', 'disponível', 'disponivel', 'amanhã', 'amanha', 'hoje', 'agenda', 'reservar', 'sessão', 'marcado', 'cancelar', 'desmarcar', 'mudar', 'trocar', 'barbeiro', 'profissional', 'corte'];
     return keywords.some(keyword => lowerMsg.includes(keyword)) || /\d/.test(lowerMsg);
 };
+
+type AiJsonPayload = {
+  isScheduling?: boolean;
+  isCancelling?: boolean;
+  extractedDate?: string | null;
+  extractedTime?: string | null;
+  barberSelection?: string | null;
+  barberConfirmed?: boolean;
+  response?: string;
+};
+
+function extractResponseText(result: GenerateContentResult): string {
+  const response = result.response;
+  const blockReason = response.promptFeedback?.blockReason;
+  if (blockReason) {
+    throw new Error(`Gemini bloqueou o prompt: ${blockReason}`);
+  }
+
+  let text = '';
+  try {
+    text = response.text()?.trim() ?? '';
+  } catch {
+    const parts = response.candidates?.[0]?.content?.parts ?? [];
+    text = parts
+      .map((p) => ('text' in p && typeof p.text === 'string' ? p.text : ''))
+      .join('')
+      .trim();
+  }
+
+  if (!text) {
+    const finish = response.candidates?.[0]?.finishReason ?? 'desconhecido';
+    throw new Error(`Resposta vazia do Gemini (finishReason=${finish})`);
+  }
+
+  return text;
+}
+
+function parseAiJson(raw: string): AiJsonPayload {
+  const cleaned = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
+
+  try {
+    return JSON.parse(cleaned) as AiJsonPayload;
+  } catch {
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (!match) throw new Error('JSON inválido na resposta da IA');
+    return JSON.parse(match[0]) as AiJsonPayload;
+  }
+}
+
+async function callGemini(prompt: string, modelName: string): Promise<AiJsonPayload> {
+  if (!genAI) throw new Error('GEMINI_API_KEY não configurada no servidor');
+
+  const model = genAI.getGenerativeModel({
+    model: modelName,
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: 1024,
+      responseMimeType: 'application/json',
+    },
+  });
+
+  const result = await model.generateContent(prompt);
+  const text = extractResponseText(result);
+  return parseAiJson(text);
+}
+
+async function callGeminiWithFallback(prompt: string): Promise<AiJsonPayload> {
+  const models = resolveModelCandidates();
+  let lastError: unknown;
+
+  for (const modelName of models) {
+    try {
+      const parsed = await callGemini(prompt, modelName);
+      return parsed;
+    } catch (err) {
+      lastError = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[WAGOO AI] Falha com modelo ${modelName}: ${msg}`);
+    }
+  }
+
+  throw lastError ?? new Error('Nenhum modelo Gemini disponível');
+}
 
 export const analyzeMessage = async (
     history: string,
@@ -58,8 +155,20 @@ export const analyzeMessage = async (
         };
     }
 
+    if (!GEMINI_API_KEY) {
+        console.error('[WAGOO AI] GEMINI_API_KEY ausente — configure no Render');
+        return {
+            isScheduling: false,
+            isCancelling: false,
+            response: 'No momento não consigo processar mensagens. A equipa técnica foi alertada.',
+            date: null,
+            barberSelection: null,
+            barberConfirmed: false,
+            canConfirmSchedule: false,
+        };
+    }
+
     try {
-        const model = genAI.getGenerativeModel({ model: MODEL_NAME });
         const multiBarber = isMultiBarberTeam(activeBarbeiros);
         const singleBarberName =
             activeBarbeiros.length === 1 ? activeBarbeiros[0].nome : null;
@@ -68,6 +177,7 @@ export const analyzeMessage = async (
         const currentTimeBR = agoraBR.format('HH:mm');
         const dataFormatadaBR = agoraBR.format('DD/MM/YYYY');
         const diaAtualNome = agoraBR.format('dddd');
+        const storeLabel = dbRow.store_name?.trim() || 'Barbearia';
 
         const teamBlock = multiBarber
             ? `
@@ -84,7 +194,7 @@ export const analyzeMessage = async (
         2. Se o cliente não conhecer os profissionais, perguntar quem trabalha na barbearia, ou pedir indicação — LISTE os nomes de forma amigável.
         3. NUNCA apresente horários definitivos nem confirme marcação (isScheduling com data/hora) ANTES de barberConfirmed=true.
         4. Só depois da escolha, apresente horários livres (use OCUPADOS filtrados para o profissional escolhido).
-        5. Se o cliente escolheu "Sem Preferência", sugira SEMPRE os horários mais cedo disponíveis (use SUGESTÕES_SEM_PREFERÊNCIA se existir no contexto).
+        5. Se o cliente escolheu "Sem Preferência", sugira SEMPRE os horários mais cedo disponíveis (use SUGESTOES_SEM_PREFERENCIA se existir no contexto).
         6. barberSelection = nome exacto da lista ou "SEM_PREFERENCIA". barberConfirmed=true só após escolha explícita.
         `
             : `
@@ -99,23 +209,17 @@ export const analyzeMessage = async (
             ? 'Aguardando escolha do profissional — não use horários ocupados para sugerir slots ainda.'
             : busySlots.join(', ') || 'nenhum';
 
-        const generationConfig = {
-            temperature: 0,
-            maxOutputTokens: 700,
-            responseMimeType: "application/json",
-        };
-
         const prompt = `
-        Você é o Wagoo, assistente da "${dbRow.store_name}".
+        Você é o Wagoo, assistente da "${storeLabel}".
         Extraia intenção de agendamento e escolha de profissional conforme o cenário.
 
         REGRAS DE EXTRAÇÃO:
         - Se o cliente quer marcar, extraia DATA (YYYY-MM-DD) e HORA (HH:mm) apenas quando puder confirmar (Cenário A ou B com profissional já escolhido).
         - Hoje é ${diaAtualNome}, ${dataFormatadaBR} às ${currentTimeBR}.
-        - Duração do serviço: ${dbRow.service_duration} minutos.
+        - Duração do serviço: ${dbRow.service_duration ?? 30} minutos.
 
         OCUPADOS (contexto de agenda): ${busyContext}
-        HORÁRIOS DA LOJA: ${JSON.stringify(dbRow.working_hours)}
+        HORÁRIOS DA LOJA: ${JSON.stringify(dbRow.working_hours ?? {})}
         ${teamBlock}
 
         HISTÓRICO:
@@ -124,7 +228,7 @@ export const analyzeMessage = async (
         MENSAGEM:
         "${currentMessage}"
 
-        Responda em JSON:
+        Responda SOMENTE com JSON válido (sem markdown):
         {
             "isScheduling": boolean,
             "isCancelling": boolean,
@@ -135,13 +239,7 @@ export const analyzeMessage = async (
             "response": "Resposta humanizada em português do Brasil"
         }`;
 
-        const result = await model.generateContent({
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
-            generationConfig
-        });
-
-        const response = await result.response;
-        const parsed = JSON.parse(response.text().replace(/```json/g, '').replace(/```/g, '').trim());
+        const parsed = await callGeminiWithFallback(prompt);
 
         let barberConfirmed = Boolean(parsed.barberConfirmed);
         let barberSelection: string | null =
@@ -178,31 +276,42 @@ export const analyzeMessage = async (
             wantsSchedule &&
             canConfirmSchedule &&
             parsed.extractedDate &&
-            parsed.extractedTime
+            parsed.extractedTime &&
+            parsed.extractedDate !== 'null' &&
+            parsed.extractedTime !== 'null'
         ) {
             const rawDate = `${parsed.extractedDate} ${parsed.extractedTime}`;
-            finalIsoDate = dayjs.tz(rawDate, "YYYY-MM-DD HH:mm", "America/Sao_Paulo").format();
-            console.log(`[WAGOO] Agendamento solicitado para: ${finalIsoDate}`);
+            const parsedDate = dayjs.tz(rawDate, "YYYY-MM-DD HH:mm", "America/Sao_Paulo");
+            if (parsedDate.isValid()) {
+                finalIsoDate = parsedDate.format();
+                console.log(`[WAGOO] Agendamento solicitado para: ${finalIsoDate}`);
+            }
         }
 
         const isScheduling = wantsSchedule && !!finalIsoDate;
 
+        const responseText =
+            typeof parsed.response === 'string' && parsed.response.trim()
+                ? parsed.response.trim()
+                : 'Como posso ajudar com seu agendamento?';
+
         return {
             isScheduling,
-            isCancelling: parsed.isCancelling || false,
+            isCancelling: Boolean(parsed.isCancelling),
             date: finalIsoDate,
-            response: parsed.response,
+            response: responseText,
             barberSelection,
             barberConfirmed,
             canConfirmSchedule,
         };
 
     } catch (error: unknown) {
-        console.error("Erro Wagoo AI:", error);
+        const detail = error instanceof Error ? error.message : String(error);
+        console.error('[WAGOO AI] Erro fatal:', detail, error);
         return {
             isScheduling: false,
             isCancelling: false,
-            response: "Poderia repetir o horário?",
+            response: 'Desculpe, tive um problema técnico. Pode repetir sua mensagem?',
             date: null,
             barberSelection: null,
             barberConfirmed: false,
