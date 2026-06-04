@@ -183,10 +183,23 @@ router.delete('/:id', async (req: Request, res: Response) => {
     });
   }
 
+  const id = String(req.params.id);
+
+  const { data: existing } = await supabase
+    .from('barbeiros')
+    .select('id')
+    .eq('id', id)
+    .eq('user_id', auth.user.id)
+    .maybeSingle();
+
+  if (!existing) {
+    return res.status(404).json({ error: 'Profissional não encontrado.' });
+  }
+
   const { error } = await supabase
     .from('barbeiros')
     .delete()
-    .eq('id', String(req.params.id))
+    .eq('id', id)
     .eq('user_id', auth.user.id);
 
   if (error) return res.status(500).json({ error: error.message });
