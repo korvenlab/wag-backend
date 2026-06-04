@@ -43,7 +43,80 @@ interface ChatContext {
 
 const memoryCache: Record<string, ChatContext> = {};
 const SESSION_EXPIRATION = 10 * 60 * 60 * 1000; 
-const MAX_HISTORY = 14; 
+const MAX_HISTORY = 14;
+
+/** Evita processar a mesma mensagem 2x (@lid + @s.whatsapp.net ou retry do Baileys). */
+const recentlyProcessed = new Map<string, number>();
+const inFlightMessages = new Set<string>();
+const MESSAGE_DEDUPE_TTL_MS = 5 * 60 * 1000;
+
+type IncomingWaMessage = {
+  key: {
+    id?: string | null;
+    remoteJid?: string | null;
+    remoteJidAlt?: string | null;
+    fromMe?: boolean | null;
+  };
+  messageTimestamp?: number | Long | null;
+  pushName?: string | null;
+  message?: unknown;
+};
+
+type Long = { toNumber?: () => number };
+
+function messageTimestampMs(ts: number | Long | null | undefined): number {
+  if (ts == null) return 0;
+  if (typeof ts === 'number') return ts > 1e12 ? ts : ts * 1000;
+  if (typeof ts.toNumber === 'function') {
+    const n = ts.toNumber();
+    return n > 1e12 ? n : n * 1000;
+  }
+  return 0;
+}
+
+function messageDedupeKey(email: string, msg: IncomingWaMessage): string {
+  const id = msg.key.id?.trim();
+  if (id) return `${email}:msg:${id}`;
+  const jid = msg.key.remoteJidAlt ?? msg.key.remoteJid ?? 'unknown';
+  return `${email}:ts:${jid}:${messageTimestampMs(msg.messageTimestamp)}`;
+}
+
+function shouldSkipDuplicateMessage(dedupeKey: string): boolean {
+  if (inFlightMessages.has(dedupeKey)) return true;
+  const seenAt = recentlyProcessed.get(dedupeKey);
+  return seenAt != null && Date.now() - seenAt < MESSAGE_DEDUPE_TTL_MS;
+}
+
+function beginMessageProcessing(dedupeKey: string): void {
+  inFlightMessages.add(dedupeKey);
+}
+
+function finishMessageProcessing(dedupeKey: string): void {
+  inFlightMessages.delete(dedupeKey);
+  recentlyProcessed.set(dedupeKey, Date.now());
+  if (recentlyProcessed.size > 500) {
+    const cutoff = Date.now() - MESSAGE_DEDUPE_TTL_MS;
+    for (const [key, at] of recentlyProcessed) {
+      if (at < cutoff) recentlyProcessed.delete(key);
+    }
+  }
+}
+
+/** Unifica sessão RAM entre @lid e número @s.whatsapp.net do mesmo cliente. */
+function stableCacheKey(email: string, msg: IncomingWaMessage): string {
+  const alt = msg.key.remoteJidAlt ?? '';
+  const jid = msg.key.remoteJid ?? '';
+  const preferred =
+    alt.endsWith('@s.whatsapp.net') ? alt :
+    jid.endsWith('@s.whatsapp.net') ? jid :
+    alt || jid;
+  const phone = preferred.split('@')[0].replace(/\D/g, '');
+  return phone ? `${email}:${phone}` : `${email}:${preferred}`;
+}
+
+function replyJid(msg: IncomingWaMessage): string {
+  return msg.key.remoteJidAlt ?? msg.key.remoteJid ?? '';
+}
 
 export async function disconnectWhatsApp(email: string) {
   try {
@@ -156,17 +229,27 @@ export async function startWhatsApp(email: string, res: Response | null) {
     });
 
     sock.ev.on('messages.upsert', async (m) => {
-      const msg = m.messages[0];
+      if (m.type !== 'notify') return;
+
+      const msg = m.messages[0] as IncomingWaMessage;
       if (!msg.message || msg.key.fromMe) return;
 
-      const remoteJid = msg.key.remoteJid;
+      const remoteJid = replyJid(msg);
       if (!remoteJid || remoteJid.endsWith('@g.us')) return;
 
-      const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
+      const textMessage =
+        (msg.message as { conversation?: string }).conversation ||
+        (msg.message as { extendedTextMessage?: { text?: string } }).extendedTextMessage?.text;
       if (!textMessage) return;
 
+      const dedupeKey = messageDedupeKey(email, msg);
+      if (shouldSkipDuplicateMessage(dedupeKey)) {
+        return;
+      }
+      beginMessageProcessing(dedupeKey);
+
       const now = Date.now();
-      const cacheKey = `${email}:${remoteJid}`; 
+      const cacheKey = stableCacheKey(email, msg);
 
       try {
         const { data: p } = await supabase.from('profiles').select('*').eq('email', email).single();
@@ -281,7 +364,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
         // --- 🗑️ CANCELAMENTO ---
         if (aiResult.isCancelling) {
-            const clientPhone = remoteJid.split('@')[0];
+            const clientPhone = remoteJid.split('@')[0].replace(/\D/g, '');
             const event = await findEventByPhone(email, clientPhone);
 
             if (event) {
@@ -302,7 +385,9 @@ export async function startWhatsApp(email: string, res: Response | null) {
             }
         }
 
-        if (aiResult.response) {
+        const willCreateAppointment = Boolean(aiResult.isScheduling && aiResult.date);
+
+        if (aiResult.response && !willCreateAppointment) {
           try {
               await sock.sendMessage(remoteJid, { text: aiResult.response });
               memoryCache[cacheKey].messages.push({ role: 'assistant', content: aiResult.response });
@@ -318,7 +403,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
         }
 
         // --- 🎯 AGENDAMENTO ---
-        if (aiResult.isScheduling && aiResult.date) {
+        if (willCreateAppointment && aiResult.date) {
             const sched = memoryCache[cacheKey].scheduling;
             const semPref =
               sched?.selectedBarberName?.toLowerCase().includes('sem prefer') ?? false;
@@ -375,7 +460,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
             {
                 const clientName = msg.pushName || "Cliente WhatsApp";
-                const clientPhone = remoteJid.split('@')[0];
+                const clientPhone = remoteJid.split('@')[0].replace(/\D/g, '');
                 const created = await createEvent(
                   email,
                   clientName,
@@ -394,17 +479,23 @@ export async function startWhatsApp(email: string, res: Response | null) {
                       multiBarber && finalBarberName
                         ? `\nProfissional: ${finalBarberName}`
                         : '';
-                    await sock.sendMessage(remoteJid, {
-                      text: `Perfeito! Seu horário está confirmado para ${confirmDate}.${profLine}\nAté lá!`,
-                    });
+                    const confirmText = `Perfeito! Seu horário está confirmado para ${confirmDate}.${profLine}\nAté lá!`;
+                    await sock.sendMessage(remoteJid, { text: confirmText });
+                    memoryCache[cacheKey].messages.push({ role: 'assistant', content: confirmText });
                     await supabase.from('profiles').update({
+                        messages_answered: (p.messages_answered || 0) + 1,
                         appointments_count: (p.appointments_count || 0) + 1
                     }).eq('email', email);
                     delete memoryCache[cacheKey];
+                } else if (aiResult.response) {
+                    await sock.sendMessage(remoteJid, { text: aiResult.response });
                 }
             }
         }
       } catch (err) { console.error("Erro Lucy:", err); }
+      finally {
+        finishMessageProcessing(dedupeKey);
+      }
     });
   } catch (error) { console.error('Erro startWhatsApp:', error); }
 }
