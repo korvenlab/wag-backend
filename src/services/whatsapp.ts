@@ -24,6 +24,14 @@ import {
 import { pushAdminEvent } from './adminEvents';
 import { profileHasWagooAccess } from '../lib/profileAccess';
 import { listActiveBarbeirosForUser, resolveBarberFromSelection } from '../lib/barbeiros';
+import {
+  bundleLooksComplete,
+  clearWhatsAppSessionInSupabase,
+  persistWhatsAppSessionToSupabase,
+  restoreWhatsAppSessionToDisk,
+  schedulePersistWhatsAppSession,
+  sessionDirLooksComplete,
+} from '../lib/whatsappSessionStore';
 import { supabase } from '../lib/supabase';
 export const sessions: Record<string, any> = {};
 
@@ -128,20 +136,6 @@ function isBaileysCryptoError(err: unknown): boolean {
   );
 }
 
-/** Baileys multi-file precisa de mais ficheiros além de creds.json (Render perde disco no deploy). */
-function sessionDirLooksComplete(sessionDir: string): boolean {
-  if (!fs.existsSync(sessionDir)) return false;
-  const entries = fs.readdirSync(sessionDir).filter((n) => !n.startsWith('.'));
-  if (!entries.includes('creds.json')) return false;
-  return entries.some(
-    (n) =>
-      n.startsWith('session-') ||
-      n.startsWith('pre-key-') ||
-      n.startsWith('sender-key-') ||
-      n.startsWith('app-state-sync-key-'),
-  );
-}
-
 async function purgeWhatsAppSession(email: string, reason: string): Promise<void> {
   const baseAuthDir = path.join(__dirname, '..', '..', 'auth_info_baileys');
   const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
@@ -172,7 +166,7 @@ async function purgeWhatsAppSession(email: string, reason: string): Promise<void
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }
 
-  await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
+  await clearWhatsAppSessionInSupabase(email);
   console.warn(`[WAGOO WA] Sessão removida (${email}): ${reason}`);
   pushAdminEvent('wagoo', `Sessão WhatsApp inválida — novo QR necessário (${email})`, 'offline');
 }
@@ -223,7 +217,7 @@ export async function disconnectWhatsApp(email: string) {
       fs.rmSync(sessionDir, { recursive: true, force: true });
     }
 
-    await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
+    await clearWhatsAppSessionInSupabase(email);
     pushAdminEvent('wagoo', 'Sessão WhatsApp encerrada pelo utilizador', 'offline');
     return { success: true };
   } catch (error) {
@@ -236,7 +230,6 @@ export async function startWhatsApp(email: string, res: Response | null) {
   const baseAuthDir = path.join(__dirname, '..', '..', 'auth_info_baileys');
   const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
   const sessionDir = path.join(baseAuthDir, safeEmailFolder);
-  const credsFilePath = path.join(sessionDir, 'creds.json');
 
   try {
     if (sessions[email]) {
@@ -254,23 +247,28 @@ export async function startWhatsApp(email: string, res: Response | null) {
       .eq('email', email)
       .single();
 
-    if (!fs.existsSync(credsFilePath) && profile?.whatsapp_session) {
-      fs.writeFileSync(credsFilePath, JSON.stringify(profile.whatsapp_session));
+    const storedSession = profile?.whatsapp_session;
+
+    if (!sessionDirLooksComplete(sessionDir) && storedSession) {
+      const restored = restoreWhatsAppSessionToDisk(sessionDir, storedSession);
+      if (restored) {
+        console.log(`[WAGOO WA] Sessão completa restaurada do Supabase (${email})`);
+      }
     }
 
-    const hasStoredSession = Boolean(profile?.whatsapp_session);
+    const hasCompleteStoredSession = bundleLooksComplete(storedSession);
     const sessionComplete = sessionDirLooksComplete(sessionDir);
 
-    // Auto-reconnect após deploy: só creds.json no Supabase não basta — evita crash crypto.
-    if (!res && hasStoredSession && !sessionComplete) {
+    // Auto-reconnect: bundle v1 (só creds) ou pasta incompleta — aguarda novo QR.
+    if (!res && storedSession && !sessionComplete && !hasCompleteStoredSession) {
       console.warn(
-        `[WAGOO WA] Sessão incompleta para ${email} (disco efémero). Aguardando novo QR no painel.`,
+        `[WAGOO WA] Sessão legada/incompleta para ${email}. Escaneie QR uma vez para activar persistência completa.`,
       );
       return;
     }
 
-    // Novo QR no painel: descarta credenciais parciais que quebram o Baileys.
-    if (res && hasStoredSession && !sessionComplete) {
+    // Novo QR: descarta credenciais parciais.
+    if (res && storedSession && !sessionComplete && !hasCompleteStoredSession) {
       await purgeWhatsAppSession(email, 'sessão incompleta — novo pareamento');
       if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
     }
@@ -309,17 +307,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
     sock.ev.on('creds.update', async () => {
       await saveCreds();
-      try {
-        if (fs.existsSync(credsFilePath)) {
-          const fileContent = fs.readFileSync(credsFilePath, 'utf-8');
-          if (fileContent && fileContent.trim().length > 0) {
-            const credsData = JSON.parse(fileContent);
-            await supabase.from('profiles').update({ whatsapp_session: credsData }).eq('email', email);
-          }
-        }
-      } catch (parseError) {
-        if (fs.existsSync(credsFilePath)) fs.unlinkSync(credsFilePath);
-      }
+      schedulePersistWhatsAppSession(email, sessionDir);
     });
 
     sock.ev.on('connection.update', async (update) => {
@@ -359,6 +347,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
       } else if (connection === 'open') {
         console.log(`✅ [ATIVO] Bot online para: ${email}`);
         pushAdminEvent('wagoo', `Bot WhatsApp conectado (${email})`, 'online');
+        await persistWhatsAppSessionToSupabase(email, sessionDir);
         if (res && !res.headersSent) res.status(200).json({ message: 'Conectado!' });
       }
     });
