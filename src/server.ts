@@ -15,13 +15,15 @@ import { getMaxBarbeirosSlots, WAGOO_PLANS } from './lib/wagooSubscription';
 import { countBarbeirosForUser } from './lib/barbeiros';
 import { syncCalendarShareSlug } from './lib/storeSlug';
 import { pushAdminEvent } from './services/adminEvents';
-import { startWhatsApp, autoReconnectAll, disconnectWhatsApp } from './services/whatsapp';
+import { startWhatsApp, autoReconnectAll, disconnectWhatsApp, installWhatsAppProcessSafetyNet } from './services/whatsapp';
 import { generateAuthUrl, getTokensFromCode } from './services/googleAuth';
 import { getUserFromBearerHeader } from './lib/supabaseAuthUser';
 import { supabase } from './lib/supabase';
 
 const app = express();
 const port: number = process.env.PORT ? Number(process.env.PORT) : 3000;
+
+installWhatsAppProcessSafetyNet();
 
 // 1. Configuração de CORS (Essencial para o Frontend conseguir salvar configurações)
 app.use(cors({

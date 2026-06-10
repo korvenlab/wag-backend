@@ -118,6 +118,93 @@ function replyJid(msg: IncomingWaMessage): string {
   return msg.key.remoteJidAlt ?? msg.key.remoteJid ?? '';
 }
 
+function isBaileysCryptoError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('unable to authenticate data') ||
+    msg.includes('Unsupported state') ||
+    msg.includes('bad decrypt') ||
+    msg.includes('cipher')
+  );
+}
+
+/** Baileys multi-file precisa de mais ficheiros além de creds.json (Render perde disco no deploy). */
+function sessionDirLooksComplete(sessionDir: string): boolean {
+  if (!fs.existsSync(sessionDir)) return false;
+  const entries = fs.readdirSync(sessionDir).filter((n) => !n.startsWith('.'));
+  if (!entries.includes('creds.json')) return false;
+  return entries.some(
+    (n) =>
+      n.startsWith('session-') ||
+      n.startsWith('pre-key-') ||
+      n.startsWith('sender-key-') ||
+      n.startsWith('app-state-sync-key-'),
+  );
+}
+
+async function purgeWhatsAppSession(email: string, reason: string): Promise<void> {
+  const baseAuthDir = path.join(__dirname, '..', '..', 'auth_info_baileys');
+  const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
+  const sessionDir = path.join(baseAuthDir, safeEmailFolder);
+
+  const sock = sessions[email];
+  if (sock) {
+    sock.ev.removeAllListeners();
+    try {
+      sock.ws?.removeAllListeners?.();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await sock.logout();
+    } catch {
+      /* ignore */
+    }
+    try {
+      sock.ws?.close?.();
+    } catch {
+      /* ignore */
+    }
+    delete sessions[email];
+  }
+
+  if (fs.existsSync(sessionDir)) {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+
+  await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
+  console.warn(`[WAGOO WA] Sessão removida (${email}): ${reason}`);
+  pushAdminEvent('wagoo', `Sessão WhatsApp inválida — novo QR necessário (${email})`, 'offline');
+}
+
+let processSafetyInstalled = false;
+
+/** Impede que erro crypto do Baileys derrube a API no Render. */
+export function installWhatsAppProcessSafetyNet(): void {
+  if (processSafetyInstalled) return;
+  processSafetyInstalled = true;
+
+  process.on('uncaughtException', (err) => {
+    if (isBaileysCryptoError(err)) {
+      console.error('[WAGOO WA] uncaughtException (sessão inválida, API continua):', err.message);
+      return;
+    }
+    console.error('[WAGOO] uncaughtException:', err);
+    process.exit(1);
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    if (isBaileysCryptoError(reason)) {
+      console.error(
+        '[WAGOO WA] unhandledRejection (sessão inválida, API continua):',
+        reason instanceof Error ? reason.message : String(reason),
+      );
+      return;
+    }
+    console.error('[WAGOO] unhandledRejection:', reason);
+  });
+}
+
 export async function disconnectWhatsApp(email: string) {
   try {
     const sock = sessions[email];
@@ -146,16 +233,18 @@ export async function disconnectWhatsApp(email: string) {
 }
 
 export async function startWhatsApp(email: string, res: Response | null) {
+  const baseAuthDir = path.join(__dirname, '..', '..', 'auth_info_baileys');
+  const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
+  const sessionDir = path.join(baseAuthDir, safeEmailFolder);
+  const credsFilePath = path.join(sessionDir, 'creds.json');
+
   try {
     if (sessions[email]) {
         sessions[email].ev.removeAllListeners();
+        try { sessions[email].ws?.removeAllListeners?.(); } catch(e) {}
         try { sessions[email].ws.close(); } catch(e) {}
         delete sessions[email];
     }
-
-    const baseAuthDir = path.join(__dirname, '..', '..', 'auth_info_baileys');
-    const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
-    const sessionDir = path.join(baseAuthDir, safeEmailFolder);
 
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
@@ -165,10 +254,25 @@ export async function startWhatsApp(email: string, res: Response | null) {
       .eq('email', email)
       .single();
 
-    const credsFilePath = path.join(sessionDir, 'creds.json');
-
     if (!fs.existsSync(credsFilePath) && profile?.whatsapp_session) {
       fs.writeFileSync(credsFilePath, JSON.stringify(profile.whatsapp_session));
+    }
+
+    const hasStoredSession = Boolean(profile?.whatsapp_session);
+    const sessionComplete = sessionDirLooksComplete(sessionDir);
+
+    // Auto-reconnect após deploy: só creds.json no Supabase não basta — evita crash crypto.
+    if (!res && hasStoredSession && !sessionComplete) {
+      console.warn(
+        `[WAGOO WA] Sessão incompleta para ${email} (disco efémero). Aguardando novo QR no painel.`,
+      );
+      return;
+    }
+
+    // Novo QR no painel: descarta credenciais parciais que quebram o Baileys.
+    if (res && hasStoredSession && !sessionComplete) {
+      await purgeWhatsAppSession(email, 'sessão incompleta — novo pareamento');
+      if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -186,6 +290,22 @@ export async function startWhatsApp(email: string, res: Response | null) {
     });
 
     sessions[email] = sock;
+
+    const onSocketFailure = (err: unknown) => {
+      if (!isBaileysCryptoError(err)) {
+        console.error(`[WAGOO WA] Erro socket (${email}):`, err);
+        return;
+      }
+      console.error(`[WAGOO WA] Crypto inválido (${email}) — limpando sessão.`);
+      void purgeWhatsAppSession(email, 'chaves de sessão corrompidas ou incompletas');
+    };
+
+    sock.ws?.on?.('error', onSocketFailure);
+    sock.ws?.on?.('close', (code: number) => {
+      if (code >= 1002) {
+        console.warn(`[WAGOO WA] WebSocket fechou (${email}) code=${code}`);
+      }
+    });
 
     sock.ev.on('creds.update', async () => {
       await saveCreds();
@@ -210,16 +330,31 @@ export async function startWhatsApp(email: string, res: Response | null) {
       }
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        const disconnectMsg = (lastDisconnect?.error as Error)?.message ?? '';
         if (sessions[email]) {
             sessions[email].ev.removeAllListeners();
+            try { sessions[email].ws?.removeAllListeners?.(); } catch(e) {}
             delete sessions[email];
         }
-        if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 440 || statusCode === 403) {
-          await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
-          pushAdminEvent('wagoo', `Bot WhatsApp desconectado (${email})`, 'offline');
-          if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+        if (
+          statusCode === DisconnectReason.loggedOut ||
+          statusCode === 401 ||
+          statusCode === 440 ||
+          statusCode === 403 ||
+          isBaileysCryptoError(lastDisconnect?.error)
+        ) {
+          await purgeWhatsAppSession(
+            email,
+            isBaileysCryptoError(lastDisconnect?.error)
+              ? 'desconexão por chave inválida'
+              : `logout (${statusCode ?? disconnectMsg})`,
+          );
         } else {
-          setTimeout(() => startWhatsApp(email, null), 5000);
+          setTimeout(() => {
+            startWhatsApp(email, null).catch((err) => {
+              console.error(`[WAGOO WA] Falha ao reconectar ${email}:`, err);
+            });
+          }, 5000);
         }
       } else if (connection === 'open') {
         console.log(`✅ [ATIVO] Bot online para: ${email}`);
@@ -497,7 +632,12 @@ export async function startWhatsApp(email: string, res: Response | null) {
         finishMessageProcessing(dedupeKey);
       }
     });
-  } catch (error) { console.error('Erro startWhatsApp:', error); }
+  } catch (error) {
+    console.error('Erro startWhatsApp:', error);
+    if (isBaileysCryptoError(error)) {
+      await purgeWhatsAppSession(email, 'falha ao iniciar com credenciais inválidas');
+    }
+  }
 }
 
 export async function autoReconnectAll() {
@@ -508,5 +648,13 @@ export async function autoReconnectAll() {
   const eligible = (profiles ?? []).filter((p) =>
     profileHasWagooAccess(p as { has_paid?: boolean; complimentary_access_until?: string | null }),
   );
-  eligible.forEach((p) => startWhatsApp(p.email, null));
+
+  for (const p of eligible) {
+    try {
+      await startWhatsApp(p.email, null);
+    } catch (err) {
+      console.error(`[WAGOO WA] autoReconnect falhou (${p.email}):`, err);
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
 }
