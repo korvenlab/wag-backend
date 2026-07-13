@@ -247,7 +247,7 @@ router.get('/public/:slug/events', async (req: Request, res: Response) => {
       return res.json({
         events: [],
         googleConnected: false,
-        store_name: profile.store_name ?? 'Barbearia',
+        store_name: profile.store_name ?? 'Loja',
         slug,
         barbeiros: barbeiros.map((b) => ({ id: b.id, nome: b.nome, ativo: b.ativo })),
       });
@@ -260,7 +260,7 @@ router.get('/public/:slug/events', async (req: Request, res: Response) => {
     res.json({
       events,
       googleConnected: true,
-      store_name: profile.store_name ?? 'Barbearia',
+      store_name: profile.store_name ?? 'Loja',
       slug,
       barbeiros: barbeiros.map((b) => ({ id: b.id, nome: b.nome, ativo: b.ativo })),
     });

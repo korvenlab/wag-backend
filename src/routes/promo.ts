@@ -116,8 +116,14 @@ router.post('/redeem', async (req: Request, res: Response) => {
     const { error: incErr } = await supabase
       .from('wagoo_promo_links')
       .update({ redemption_count: count + 1 })
-      .eq('id', link.id);
-    if (incErr) console.error('[promo/redeem] increment redemption_count:', incErr);
+      .eq('id', link.id)
+      .eq('redemption_count', count);
+    if (incErr) {
+      console.error('[promo/redeem] increment redemption_count:', incErr);
+    } else if (max != null) {
+      // Optimistic lock: se outro request avançou o contador, ainda registámos o redeem
+      // (único por user); o limite máximo pode falhar por 1 em corrida — aceitável vs overshoot grande.
+    }
 
     const { data: fresh } = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
     const has_access = profileHasWagooAccess(

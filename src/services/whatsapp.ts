@@ -467,6 +467,8 @@ export async function startWhatsApp(email: string, res: Response | null) {
             store_name: p.store_name,
             working_hours: p.working_hours,
             service_duration: p.service_duration,
+            business_niche: p.business_niche,
+            business_niche_custom: p.business_niche_custom,
           },
           activeBarbeiros.map((b) => ({ id: b.id, nome: b.nome })),
           {

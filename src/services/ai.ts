@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
+import { resolveNicheVocabulary } from '../lib/businessNiche';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -45,7 +46,12 @@ export const isMultiBarberTeam = (activeBarbeiros: ActiveBarbeiroForAi[]): boole
 export const hasSchedulingIntent = (message: string): boolean => {
     if (!message) return false;
     const lowerMsg = message.toLowerCase().trim();
-    const keywords = ['horário', 'horario', 'agendar', 'marcar', 'vaga', 'disponível', 'disponivel', 'amanhã', 'amanha', 'hoje', 'agenda', 'reservar', 'sessão', 'marcado', 'cancelar', 'desmarcar', 'mudar', 'trocar', 'barbeiro', 'profissional', 'corte'];
+    const keywords = [
+      'horário', 'horario', 'agendar', 'marcar', 'vaga', 'disponível', 'disponivel',
+      'amanhã', 'amanha', 'hoje', 'agenda', 'reservar', 'sessão', 'marcado', 'cancelar',
+      'desmarcar', 'mudar', 'trocar', 'barbeiro', 'profissional', 'corte', 'cabelo',
+      'manicure', 'unha', 'unhas', 'escova', 'barba', 'estética', 'estetica',
+    ];
     return keywords.some(keyword => lowerMsg.includes(keyword)) || /\d/.test(lowerMsg);
 };
 
@@ -148,7 +154,9 @@ export const analyzeMessage = async (
     dbRow: {
         store_name: string,
         working_hours: unknown,
-        service_duration: number
+        service_duration: number,
+        business_niche?: string | null,
+        business_niche_custom?: string | null,
     },
     activeBarbeiros: ActiveBarbeiroForAi[] = [],
     schedulingState: SchedulingBarberState = { barberConfirmed: false, selectedBarberName: null },
@@ -188,7 +196,9 @@ export const analyzeMessage = async (
         const currentTimeBR = agoraBR.format('HH:mm');
         const dataFormatadaBR = agoraBR.format('DD/MM/YYYY');
         const diaAtualNome = agoraBR.format('dddd');
-        const storeLabel = dbRow.store_name?.trim() || 'Barbearia';
+        const niche = resolveNicheVocabulary(dbRow.business_niche, dbRow.business_niche_custom);
+        const storeLabel = dbRow.store_name?.trim() || niche.defaultStoreName;
+        const { professional, professionals, businessType } = niche;
 
         const teamBlock = multiBarber
             ? `
@@ -196,30 +206,36 @@ export const analyzeMessage = async (
         Equipe: ${activeBarbeiros.map((b) => b.nome).join(', ')}
         Opção extra: "Sem Preferência".
 
-        Estado: profissional confirmado=${schedulingState.barberConfirmed ? 'SIM' : 'NÃO'}; escolha=${schedulingState.selectedBarberName ?? '—'}
+        Estado: ${professional} confirmado=${schedulingState.barberConfirmed ? 'SIM' : 'NÃO'}; escolha=${schedulingState.selectedBarberName ?? '—'}
 
         REGRAS:
-        1. Intenção de agendar → pergunte profissional OU "Sem Preferência" (numa frase).
+        1. Intenção de agendar → pergunte ${professional} OU "Sem Preferência" (numa frase).
         2. Cliente não conhece a equipe → cite só os nomes, sem descrições.
         3. Sem barberConfirmed=true: não sugira horários nem confirme marcação.
-        4. Com profissional escolhido → horários livres compactos (use OCUPADOS).
+        4. Com ${professional} escolhido → horários livres compactos (use OCUPADOS).
         5. "Sem Preferência" → horários mais cedo (SUGESTOES_SEM_PREFERENCIA se houver).
         6. barberSelection = nome exacto ou SEM_PREFERENCIA; barberConfirmed=true só após escolha explícita.
         `
             : `
         CENÁRIO A — UM PROFISSIONAL${singleBarberName ? ` (${singleBarberName})` : ''}:
-        - Não pergunte barbeiro nem liste equipe.
+        - Não pergunte ${professional} nem liste equipe.
         - Vá directo a dia/horário disponível.
         - barberConfirmed=true com intenção de agendar; barberSelection=null.
         `;
 
         const busyContext = multiBarber && !schedulingState.barberConfirmed
-            ? 'Aguardando escolha do profissional.'
+            ? `Aguardando escolha do ${professional}.`
             : busySlots.join(', ') || 'nenhum';
 
         const prompt = `
-        Você é o Wagoo, secretária virtual da "${storeLabel}" no WhatsApp.
-        Extraia intenção de agendamento e escolha de profissional.
+        Você é o Wagoo, secretária virtual da "${storeLabel}" (${businessType}) no WhatsApp.
+        Extraia intenção de agendamento e escolha de ${professional}.
+
+        NICHO DO NEGÓCIO (obrigatório respeitar):
+        - Tipo: ${businessType} (${niche.label})
+        - Singular: "${professional}" | Plural: "${professionals}"
+        - Nunca diga "barbeiro", "barbeiros" ou "barbearia" salvo se o nicho for barbearia.
+        - Nunca invente outro tipo de negócio.
 
         ESTILO DO CAMPO "response" (obrigatório):
         - Cordial e profissional, como secretária educada — nunca seca ou robótica.
@@ -232,7 +248,7 @@ export const analyzeMessage = async (
         - Exemplos de tom: "Olá! Com o Marcos. Qual dia e horário?" | "Temos Marcos e Robson. Algum preferido?" | "Amanhã: 14h, 15h ou 16h30. Qual prefere?"
 
         EXTRAÇÃO:
-        - DATA (YYYY-MM-DD) e HORA (HH:mm) só quando puder confirmar (Cenário A ou B com profissional escolhido).
+        - DATA (YYYY-MM-DD) e HORA (HH:mm) só quando puder confirmar (Cenário A ou B com ${professional} escolhido).
         - Hoje: ${diaAtualNome}, ${dataFormatadaBR} ${currentTimeBR}.
         - Serviço: ${dbRow.service_duration ?? 30} min.
 

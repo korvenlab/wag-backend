@@ -19,15 +19,44 @@ import { startWhatsApp, autoReconnectAll, disconnectWhatsApp, installWhatsAppPro
 import { generateAuthUrl, getTokensFromCode } from './services/googleAuth';
 import { getUserFromBearerHeader } from './lib/supabaseAuthUser';
 import { supabase } from './lib/supabase';
+import { isBusinessNicheId } from './lib/businessNiche';
+import { requireBearerUser, sanitizeProfileForClient } from './lib/requireAuth';
+import { createGoogleOAuthState, verifyGoogleOAuthState } from './lib/googleOAuthState';
 
 const app = express();
 const port: number = process.env.PORT ? Number(process.env.PORT) : 3000;
 
 installWhatsAppProcessSafetyNet();
 
-// 1. Configuração de CORS (Essencial para o Frontend conseguir salvar configurações)
+const defaultOrigins = [
+  'https://wagoobot.com',
+  'https://www.wagoobot.com',
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:5173',
+];
+const allowedOrigins = new Set(
+  [
+    ...defaultOrigins,
+    ...(process.env.FRONTEND_ORIGINS || '')
+      .split(',')
+      .map((o) => o.trim())
+      .filter(Boolean),
+    process.env.FRONTEND_URL?.trim(),
+  ].filter(Boolean) as string[],
+);
+
 app.use(cors({
-  origin: true, 
+  origin(origin, callback) {
+    // Same-origin / curl / server-to-server (no Origin header)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.has(origin)) return callback(null, true);
+    // Preview deploys (Vercel/etc.) — só se FRONTEND_ORIGINS não restringir demais
+    if (process.env.CORS_ALLOW_VERCEL === '1' && /\.vercel\.app$/.test(origin)) {
+      return callback(null, true);
+    }
+    return callback(null, false);
+  },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: [
     'Content-Type',
@@ -37,7 +66,7 @@ app.use(cors({
     'x-api-key',
     'X-API-Key',
   ],
-  credentials: true 
+  credentials: true,
 }));
 
 app.use('/api/stripe', stripeRoutes);
@@ -73,9 +102,10 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
     });
     const maxTeamUsers = getMaxBarbeirosSlots(tier);
     const teamUsersUsed = await countBarbeirosForUser(auth.user.id);
+    const safe = sanitizeProfileForClient(row);
 
     res.json({
-      ...row,
+      ...safe,
       has_access: profileHasWagooAccess({
         has_paid: row.has_paid,
         complimentary_access_until: row.complimentary_access_until,
@@ -95,13 +125,13 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
   }
 });
 
-// --- 2. ROTAS DE AUTENTICAÇÃO GOOGLE (OAUTH CORRIGIDO) ---
-app.get('/api/auth/google/url', (req: Request, res: Response) => {
-  const { email } = req.query;
-  if (!email) return res.status(400).json({ error: 'Email necessário' });
-  
-  // O state passa o email para ser recuperado no callback e salvar no perfil correto
-  const url = generateAuthUrl(String(email).toLowerCase().trim());
+// --- 2. GOOGLE CALENDAR OAUTH (state assinado + Bearer na URL) ---
+app.get('/api/auth/google/url', async (req: Request, res: Response) => {
+  const authed = await requireBearerUser(req, res);
+  if (!authed) return;
+
+  const state = createGoogleOAuthState(authed.user.id, authed.email);
+  const url = generateAuthUrl(state);
   res.json({ url });
 });
 
@@ -110,32 +140,50 @@ app.get('/api/auth/google/url', (req: Request, res: Response) => {
  * https://wag-backend.onrender.com/api/auth/google/callback
  */
 app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
-  const { code, state } = req.query; // 'state' contém o email do usuário
+  const { code, state } = req.query;
   if (!code) return res.status(400).send('Sem código de autorização.');
+
+  const verified = verifyGoogleOAuthState(state);
+  if (!verified.ok) {
+    return res.status(400).send(`Falha na ligação Google: ${verified.error}`);
+  }
 
   try {
     const tokens = await getTokensFromCode(code as string);
-    const userEmail = String(state).toLowerCase().trim();
 
-    // Estrutura o objeto JSONB para a coluna googleAuth exatamente como os serviços de calendário esperam
-    const googleAuthData = {
-      accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token,
-      expiryDate: tokens.expiry_date,
-      updatedAt: new Date().toISOString()
+    const { data: current } = await supabase
+      .from('profiles')
+      .select('googleAuth')
+      .eq('id', verified.payload.sub)
+      .maybeSingle();
+
+    const prev = (current?.googleAuth || {}) as {
+      refreshToken?: string | null;
     };
 
-    const { error } = await supabase
+    const googleAuthData = {
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token || prev.refreshToken || null,
+      expiryDate: tokens.expiry_date,
+      updatedAt: new Date().toISOString(),
+    };
+
+    const { error, data: updated } = await supabase
       .from('profiles')
       .update({ googleAuth: googleAuthData })
-      .eq('email', userEmail);
+      .eq('id', verified.payload.sub)
+      .eq('email', verified.payload.email)
+      .select('id');
 
     if (error) throw error;
+    if (!updated?.length) {
+      return res.status(404).send('Perfil não encontrado para esta sessão.');
+    }
 
     res.send(`
       <div style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-        <h1 style="color: #10b981;">✅ Agenda Conectada com Sucesso!</h1>
-        <p>A Lucy já pode acessar seu calendário. Esta janela fechará automaticamente.</p>
+        <h1 style="color: #10b981;">Agenda conectada com sucesso!</h1>
+        <p>O Wagoo já pode acessar seu calendário. Esta janela fechará automaticamente.</p>
         <script>setTimeout(() => window.close(), 3000)</script>
       </div>
     `);
@@ -145,101 +193,140 @@ app.get('/api/auth/google/callback', async (req: Request, res: Response) => {
   }
 });
 
-// --- 3. CONFIGURAÇÕES (IA, Agenda e Loja) ---
+// --- 3. CONFIGURAÇÕES (IA, Agenda e Loja) — Bearer obrigatório ---
 app.post('/api/settings/ai', async (req: Request, res: Response) => {
-  // Verificação dupla para aceitar 'aiEnabled' (frontend) ou 'is_ai_enabled' (banco)
-  const { email, aiEnabled, is_ai_enabled } = req.body;
-  const userEmail = String(email).toLowerCase().trim();
+  const authed = await requireBearerUser(req, res);
+  if (!authed) return;
+
+  const { aiEnabled, is_ai_enabled } = req.body;
   const valueToSave = aiEnabled !== undefined ? aiEnabled : is_ai_enabled;
-  
-  const { error } = await supabase.from('profiles').update({ is_ai_enabled: valueToSave }).eq('email', userEmail);
+
+  const { error } = await supabase
+    .from('profiles')
+    .update({ is_ai_enabled: valueToSave })
+    .eq('id', authed.user.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
 
 app.post('/api/settings/hours', async (req: Request, res: Response) => {
-  const { email, workingHours, serviceDuration } = req.body;
-  const userEmail = String(email).toLowerCase().trim();
+  const authed = await requireBearerUser(req, res);
+  if (!authed) return;
 
-  const { error } = await supabase.from('profiles')
+  const { workingHours, serviceDuration } = req.body;
+
+  const { error } = await supabase
+    .from('profiles')
     .update({ working_hours: workingHours, service_duration: serviceDuration })
-    .eq('email', userEmail);
-    
+    .eq('id', authed.user.id);
+
   if (error) return res.status(500).json({ error: error.message });
   res.json({ ok: true });
 });
 
 app.post('/api/settings/store', async (req: Request, res: Response) => {
-  const { email, storeName } = req.body;
-  const userEmail = String(email).toLowerCase().trim();
+  const authed = await requireBearerUser(req, res);
+  if (!authed) return;
+
+  const { storeName, businessNiche, businessNicheCustom } = req.body;
+
+  if (businessNiche !== undefined && businessNiche !== null && !isBusinessNicheId(businessNiche)) {
+    return res.status(400).json({
+      error: 'business_niche inválido',
+      allowed: ['barbearia', 'salao', 'manicure', 'estetica', 'outro'],
+    });
+  }
+
+  if (businessNiche === 'outro') {
+    const custom = typeof businessNicheCustom === 'string' ? businessNicheCustom.trim() : '';
+    if (!custom) {
+      return res.status(400).json({ error: 'Descreva o nicho quando escolher "outro".' });
+    }
+  }
 
   const { data: existing } = await supabase
     .from('profiles')
     .select('id, calendar_share_token')
-    .eq('email', userEmail)
+    .eq('id', authed.user.id)
     .maybeSingle();
 
-  const { error } = await supabase.from('profiles').update({ store_name: storeName }).eq('email', userEmail);
+  const updatePayload: Record<string, unknown> = {};
+  if (storeName !== undefined) updatePayload.store_name = storeName;
+  if (businessNiche !== undefined) {
+    updatePayload.business_niche = businessNiche;
+    updatePayload.business_niche_custom =
+      businessNiche === 'outro'
+        ? String(businessNicheCustom).trim()
+        : null;
+  }
+
+  if (Object.keys(updatePayload).length === 0) {
+    return res.status(400).json({ error: 'Nada para actualizar' });
+  }
+
+  const { error } = await supabase
+    .from('profiles')
+    .update(updatePayload)
+    .eq('id', authed.user.id);
   if (error) return res.status(500).json({ error: error.message });
 
-  if (existing?.id && existing.calendar_share_token) {
+  if (existing?.id && existing.calendar_share_token && storeName !== undefined) {
     await syncCalendarShareSlug(supabase, existing.id, storeName, null);
   }
 
   res.json({ ok: true });
 });
 
-// --- 4. AUTH SYNC (Proteção de Refresh Token no Login) ---
+// --- 4. AUTH SYNC (Bearer + só o próprio user) ---
 app.post('/api/auth/sync', async (req: Request, res: Response) => {
-  const { id, email, accessToken, refreshToken, expiresAt } = req.body;
-  
-  if (!email || !id) return res.status(400).json({ error: 'ID e Email são obrigatórios' });
-  const userEmail = String(email).trim().toLowerCase();
+  const authed = await requireBearerUser(req, res);
+  if (!authed) return;
+
+  const { accessToken, refreshToken, expiresAt } = req.body;
+  const userEmail = authed.email;
+  const id = authed.user.id;
 
   try {
-    // 🔍 Busca o perfil existente para não apagar o refreshToken antigo (o Google só manda o refresh uma vez)
     const { data: currentProfile } = await supabase
       .from('profiles')
       .select('googleAuth')
-      .eq('email', userEmail)
-      .single();
+      .eq('id', id)
+      .maybeSingle();
 
     const googleAuthData = accessToken ? {
       updatedAt: new Date().toISOString(),
       expiryDate: expiresAt ? Number(expiresAt) * 1000 : (currentProfile?.googleAuth?.expiryDate || null),
       accessToken,
-      // Se o login atual não trouxer refreshToken, mantém o que já estava salvo no banco
       refreshToken: refreshToken || currentProfile?.googleAuth?.refreshToken || null
     } : undefined;
 
-    const { data, error } = await supabase
+    const { error } = await supabase
       .from('profiles')
-      .upsert({ 
-        id, 
+      .upsert({
+        id,
         email: userEmail,
         ...(googleAuthData && { googleAuth: googleAuthData })
-      }, { onConflict: 'email' })
-      .select()
-      .single();
+      }, { onConflict: 'email' });
 
     if (error) throw error;
-    res.json({ ok: true, user: data });
+    res.json({ ok: true });
   } catch (err: any) {
     console.error("❌ Erro na sincronização:", err.message);
     res.status(500).json({ error: 'Erro na sincronização' });
   }
 });
 
-// --- 5. WHATSAPP ROUTES ---
-app.post('/api/whatsapp/qr', (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'Email necessário' });
-  startWhatsApp(String(email).toLowerCase().trim(), res);
+// --- 5. WHATSAPP (Bearer — só a própria conta) ---
+app.post('/api/whatsapp/qr', async (req, res) => {
+  const authed = await requireBearerUser(req, res);
+  if (!authed) return;
+  startWhatsApp(authed.email, res);
 });
 
 app.post('/api/whatsapp/disconnect', async (req, res) => {
-  const { email } = req.body;
-  await disconnectWhatsApp(String(email).toLowerCase().trim());
+  const authed = await requireBearerUser(req, res);
+  if (!authed) return;
+  await disconnectWhatsApp(authed.email);
   res.json({ ok: true });
 });
 
