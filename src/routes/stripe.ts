@@ -179,7 +179,11 @@ router.post('/create-billing-portal-session', express.json(), async (req: Reques
       });
     }
 
-    const emailNorm = String(auth.email).trim().toLowerCase();
+    const emailNorm = String(auth.user.email ?? '').trim().toLowerCase();
+    if (!emailNorm) {
+      return res.status(400).json({ error: 'Conta sem e-mail. Faça login com Google novamente.' });
+    }
+
     const customerId = await resolveStripeCustomerId(auth.user.id, emailNorm);
     if (!customerId) {
       return res.status(404).json({
