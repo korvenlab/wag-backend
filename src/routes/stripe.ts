@@ -133,6 +133,78 @@ router.post('/create-multi-barber-checkout-session', express.json(), (req, res) 
   createCheckoutForTier(req, res, 'pro'),
 );
 
+/** Localiza o customer Stripe do usuário (metadata da assinatura ou e-mail do checkout). */
+async function resolveStripeCustomerId(userId: string, email: string): Promise<string | null> {
+  try {
+    const found = await stripe.subscriptions.search({
+      query: `metadata['supabase_user_id']:'${userId}'`,
+      limit: 5,
+    });
+    for (const sub of found.data) {
+      if (typeof sub.customer === 'string') return sub.customer;
+      if (sub.customer && typeof sub.customer === 'object' && 'id' in sub.customer) {
+        return (sub.customer as Stripe.Customer).id;
+      }
+    }
+  } catch (e) {
+    console.warn('[stripe portal] subscriptions.search indisponível, tentando por e-mail:', e);
+  }
+
+  const customers = await stripe.customers.list({ email, limit: 10 });
+  for (const customer of customers.data) {
+    const subs = await stripe.subscriptions.list({
+      customer: customer.id,
+      status: 'all',
+      limit: 1,
+    });
+    if (subs.data.length > 0) return customer.id;
+  }
+
+  return customers.data[0]?.id ?? null;
+}
+
+/**
+ * Customer Portal da Stripe — cancelar assinatura, trocar cartão, etc.
+ * Requer Portal activo no Dashboard Stripe (Settings → Billing → Customer portal).
+ */
+router.post('/create-billing-portal-session', express.json(), async (req: Request, res: Response) => {
+  try {
+    const auth = await getUserFromBearerHeader(supabase, req.headers.authorization);
+    if (!auth.ok) {
+      return res.status(401).json({
+        error:
+          auth.reason === 'missing_token'
+            ? 'Faça login e envie Authorization: Bearer (access_token).'
+            : 'Sessão inválida ou expirada.',
+      });
+    }
+
+    const emailNorm = String(auth.email).trim().toLowerCase();
+    const customerId = await resolveStripeCustomerId(auth.user.id, emailNorm);
+    if (!customerId) {
+      return res.status(404).json({
+        error: 'Não encontramos uma assinatura Stripe ligada a esta conta.',
+      });
+    }
+
+    const frontendUrl = process.env.FRONTEND_URL?.trim().replace(/\/$/, '');
+    if (!frontendUrl) {
+      return res.status(503).json({ error: 'FRONTEND_URL não configurada no servidor.' });
+    }
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: `${frontendUrl}/dashboard`,
+    });
+
+    res.json({ url: session.url });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('❌ Erro ao abrir portal de assinatura:', message);
+    res.status(500).json({ error: message });
+  }
+});
+
 router.post('/webhook', express.raw({ type: 'application/json' }), async (req: Request, res: Response) => {
   const sig = req.headers['stripe-signature'] as string;
   let event: Stripe.Event;
