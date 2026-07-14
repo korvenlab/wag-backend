@@ -35,6 +35,9 @@ import {
 import { supabase } from '../lib/supabase';
 export const sessions: Record<string, any> = {};
 
+/** Último QR por e-mail — Baileys renova o QR; a HTTP response só consegue enviar o 1º. */
+const pendingQrByEmail: Record<string, string> = {};
+
 /**
  * 🧠 MEMÓRIA RAM VOLÁTIL (SaaS Ready)
  * Configurada para 10h de inatividade e histórico de 7 trocas completas.
@@ -162,6 +165,8 @@ async function purgeWhatsAppSession(email: string, reason: string): Promise<void
     delete sessions[email];
   }
 
+  delete pendingQrByEmail[email];
+
   if (fs.existsSync(sessionDir)) {
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }
@@ -213,6 +218,8 @@ export async function disconnectWhatsApp(email: string) {
       delete sessions[email];
     }
 
+    delete pendingQrByEmail[email];
+
     if (fs.existsSync(sessionDir)) {
       fs.rmSync(sessionDir, { recursive: true, force: true });
     }
@@ -232,12 +239,25 @@ export async function startWhatsApp(email: string, res: Response | null) {
   const sessionDir = path.join(baseAuthDir, safeEmailFolder);
 
   try {
+    // Já online — não derruba o socket pedindo QR de novo.
+    if (sessions[email]?.user && res && !res.headersSent) {
+      res.status(200).json({ message: 'Conectado!', connected: true });
+      return;
+    }
+
+    // Pareamento em curso: devolve o QR atual em vez de matar o socket (loop incompleto).
+    if (sessions[email] && res && pendingQrByEmail[email] && !res.headersSent) {
+      res.status(200).json({ qrCode: pendingQrByEmail[email] });
+      return;
+    }
+
     if (sessions[email]) {
         sessions[email].ev.removeAllListeners();
         try { sessions[email].ws?.removeAllListeners?.(); } catch(e) {}
         try { sessions[email].ws.close(); } catch(e) {}
         delete sessions[email];
     }
+    delete pendingQrByEmail[email];
 
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
@@ -248,29 +268,43 @@ export async function startWhatsApp(email: string, res: Response | null) {
       .single();
 
     const storedSession = profile?.whatsapp_session;
+    const hasCompleteStoredSession = bundleLooksComplete(storedSession);
 
-    if (!sessionDirLooksComplete(sessionDir) && storedSession) {
+    // Só restaura bundle completo — incompleto (só creds) NÃO vai para o disco.
+    if (!sessionDirLooksComplete(sessionDir) && hasCompleteStoredSession) {
       const restored = restoreWhatsAppSessionToDisk(sessionDir, storedSession);
       if (restored) {
         console.log(`[WAGOO WA] Sessão completa restaurada do Supabase (${email})`);
       }
     }
 
-    const hasCompleteStoredSession = bundleLooksComplete(storedSession);
     const sessionComplete = sessionDirLooksComplete(sessionDir);
 
-    // Auto-reconnect: bundle v1 (só creds) ou pasta incompleta — aguarda novo QR.
-    if (!res && storedSession && !sessionComplete && !hasCompleteStoredSession) {
-      console.warn(
-        `[WAGOO WA] Sessão legada/incompleta para ${email}. Escaneie QR uma vez para activar persistência completa.`,
-      );
+    // Auto-reconnect sem QR: limpa lixo incompleto e espera pareamento no dashboard.
+    if (!res && !sessionComplete && !hasCompleteStoredSession) {
+      if (storedSession || fs.existsSync(sessionDir)) {
+        console.warn(
+          `[WAGOO WA] Sessão incompleta ignorada (${email}) — aguarda novo QR no painel.`,
+        );
+        await clearWhatsAppSessionInSupabase(email);
+        if (fs.existsSync(sessionDir)) {
+          fs.rmSync(sessionDir, { recursive: true, force: true });
+        }
+        fs.mkdirSync(sessionDir, { recursive: true });
+      }
       return;
     }
 
-    // Novo QR: descarta credenciais parciais.
-    if (res && storedSession && !sessionComplete && !hasCompleteStoredSession) {
-      await purgeWhatsAppSession(email, 'sessão incompleta — novo pareamento');
-      if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+    // Novo QR: descarta só o parcial (creds sem keys), sem matar sessão completa.
+    if (res && !sessionComplete && (storedSession || fs.readdirSync(sessionDir).length > 0)) {
+      if (!hasCompleteStoredSession) {
+        await clearWhatsAppSessionInSupabase(email);
+        if (fs.existsSync(sessionDir)) {
+          fs.rmSync(sessionDir, { recursive: true, force: true });
+        }
+        fs.mkdirSync(sessionDir, { recursive: true });
+        console.log(`[WAGOO WA] Pasta limpa para novo pareamento (${email})`);
+      }
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -312,9 +346,16 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
-      if (qr && res && !res.headersSent) {
-        const qrCodeImage = await qrcode.toDataURL(qr);
-        res.status(200).json({ qrCode: qrCodeImage });
+      if (qr) {
+        try {
+          const qrCodeImage = await qrcode.toDataURL(qr);
+          pendingQrByEmail[email] = qrCodeImage;
+          if (res && !res.headersSent) {
+            res.status(200).json({ qrCode: qrCodeImage });
+          }
+        } catch (qrErr) {
+          console.error(`[WAGOO WA] Falha ao gerar QR (${email}):`, qrErr);
+        }
       }
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
@@ -324,6 +365,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
             try { sessions[email].ws?.removeAllListeners?.(); } catch(e) {}
             delete sessions[email];
         }
+        delete pendingQrByEmail[email];
         if (
           statusCode === DisconnectReason.loggedOut ||
           statusCode === 401 ||
@@ -337,15 +379,21 @@ export async function startWhatsApp(email: string, res: Response | null) {
               ? 'desconexão por chave inválida'
               : `logout (${statusCode ?? disconnectMsg})`,
           );
-        } else {
+        } else if (sessionDirLooksComplete(sessionDir)) {
+          // Só auto-reconecta se a sessão já estiver completa (após pareamento OK).
           setTimeout(() => {
             startWhatsApp(email, null).catch((err) => {
               console.error(`[WAGOO WA] Falha ao reconectar ${email}:`, err);
             });
           }, 5000);
+        } else {
+          console.warn(
+            `[WAGOO WA] Conexão fechou antes do pareamento (${email}). Gere o QR de novo no painel.`,
+          );
         }
       } else if (connection === 'open') {
         console.log(`✅ [ATIVO] Bot online para: ${email}`);
+        delete pendingQrByEmail[email];
         pushAdminEvent('wagoo', `Bot WhatsApp conectado (${email})`, 'online');
         await persistWhatsAppSessionToSupabase(email, sessionDir);
         if (res && !res.headersSent) res.status(200).json({ message: 'Conectado!' });

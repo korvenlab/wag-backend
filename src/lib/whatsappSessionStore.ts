@@ -123,6 +123,15 @@ export async function persistWhatsAppSessionToSupabase(
   const bundle = packSessionForSupabase(sessionDir);
   if (!bundle) return;
 
+  // Pareamento ainda só tem creds.json — gravar isso no Supabase causa loop
+  // (incompleto → purge → novo QR) e impede o scan concluir.
+  if (!sessionDirLooksComplete(sessionDir)) {
+    console.log(
+      `[WAGOO WA] Persistência adiada (${email}): aguardando chaves Baileys (${Object.keys(bundle.files).length} ficheiros)`,
+    );
+    return;
+  }
+
   const { error } = await supabase
     .from('profiles')
     .update({ whatsapp_session: bundle })
