@@ -18,6 +18,7 @@ import {
   getSchedulingBusyContext,
   buildSemPreferenciaHintsForAi,
   resolveSemPreferenciaBooking,
+  listFreeBarbersAtSlot,
   findEventByPhone,
   deleteEvent,
 } from './calendar';
@@ -34,7 +35,13 @@ import {
 } from '../lib/whatsappSessionStore';
 import { supabase } from '../lib/supabase';
 import { log } from '../lib/logger';
-export const sessions: Record<string, any> = {};
+import { formatDateTimeBR, isAskingProfessionalAvailability } from '../lib/dateTimeBR';
+import dayjs from 'dayjs';
+import timezone from 'dayjs/plugin/timezone';
+import utc from 'dayjs/plugin/utc';
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
 /** Último QR por e-mail — Baileys renova o QR; a HTTP response só consegue enviar o 1º. */
 const pendingQrByEmail: Record<string, string> = {};
@@ -43,6 +50,8 @@ const pairingRestartByEmail = new Set<string>();
 /** Evita dois startWhatsApp em paralelo (ex.: poll + reconnect). */
 const startInFlightByEmail = new Set<string>();
 const WA = 'WA';
+
+export const sessions: Record<string, any> = {};
 
 function sessionHasCreds(sessionDir: string): boolean {
   try {
@@ -678,7 +687,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
             if (event) {
                 const success = await deleteEvent(email, event.id);
                 if (success) {
-                    const eventDate = new Date(event.start.dateTime).toLocaleString('pt-BR');
+                    const eventDate = formatDateTimeBR(event.start.dateTime);
                     await sock.sendMessage(remoteJid, { 
                         text: `Agendamento de ${eventDate} cancelado.`
                     });
@@ -694,6 +703,80 @@ export async function startWhatsApp(email: string, res: Response | null) {
         }
 
         const willCreateAppointment = Boolean(aiResult.isScheduling && aiResult.date);
+        const askingWho =
+          Boolean(aiResult.askingProfessionalAvailability) ||
+          isAskingProfessionalAvailability(textMessage);
+
+        // Pergunta "qual barbeiro disponível?" → responde quem está livre; NÃO marca.
+        if (askingWho && multiBarber) {
+          let slotIso: string | null = aiResult.date;
+          if (!slotIso && aiResult.extractedDate && aiResult.extractedTime) {
+            const parsed = dayjs.tz(
+              `${aiResult.extractedDate} ${aiResult.extractedTime}`,
+              'YYYY-MM-DD HH:mm',
+              'America/Sao_Paulo',
+            );
+            if (parsed.isValid()) slotIso = parsed.format();
+          }
+          if (!slotIso && aiResult.extractedTime) {
+            const parsed = dayjs.tz(
+              `${dayjs().tz('America/Sao_Paulo').format('YYYY-MM-DD')} ${aiResult.extractedTime}`,
+              'YYYY-MM-DD HH:mm',
+              'America/Sao_Paulo',
+            );
+            if (parsed.isValid()) slotIso = parsed.format();
+          }
+
+          if (slotIso) {
+            const free = await listFreeBarbersAtSlot(
+              email,
+              slotIso,
+              p.service_duration ?? 30,
+              barberRefs,
+            );
+            const timeLabel = formatDateTimeBR(slotIso, 'HH:mm');
+            const reply =
+              free.length > 0
+                ? `Às ${timeLabel} estão disponíveis: ${free.join(', ')}. Qual prefere?`
+                : `Às ${timeLabel} nenhum profissional está livre. Quer outro horário?`;
+            log.info(WA, 'resposta de disponibilidade de profissionais', {
+              email,
+              slotIso,
+              free,
+            });
+            await sock.sendMessage(remoteJid, { text: reply });
+            memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+            await supabase
+              .from('profiles')
+              .update({ messages_answered: (p.messages_answered || 0) + 1 })
+              .eq('email', email);
+            return;
+          }
+
+          const teamNames = activeBarbeiros.map((b) => b.nome).join(', ');
+          const reply =
+            aiResult.response?.trim() ||
+            `Temos: ${teamNames}. Qual horário e profissional prefere?`;
+          await sock.sendMessage(remoteJid, { text: reply });
+          memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+          return;
+        }
+
+        // Multi: sem profissional escolhido, nunca confirma marca.
+        if (
+          willCreateAppointment &&
+          multiBarber &&
+          !memoryCache[cacheKey].scheduling?.barberConfirmed
+        ) {
+          log.warn(WA, 'IA tentou marcar sem profissional — pedindo escolha', { email });
+          const teamNames = activeBarbeiros.map((b) => b.nome).join(', ');
+          const reply =
+            aiResult.response?.trim() ||
+            `Antes de confirmar: qual profissional prefere? ${teamNames}, ou Sem Preferência.`;
+          await sock.sendMessage(remoteJid, { text: reply });
+          memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+          return;
+        }
 
         if (aiResult.response && !willCreateAppointment) {
           try {
@@ -782,12 +865,10 @@ export async function startWhatsApp(email: string, res: Response | null) {
                     log.info(WA, 'agendamento criado', {
                       email,
                       date: aiResult.date,
+                      dateBR: formatDateTimeBR(aiResult.date),
                       barber: finalBarberName,
                     });
-                    const confirmDate = new Date(aiResult.date).toLocaleString('pt-BR', {
-                      dateStyle: 'short',
-                      timeStyle: 'short',
-                    });
+                    const confirmDate = formatDateTimeBR(aiResult.date);
                     const profLine =
                       multiBarber && finalBarberName
                         ? `\nProfissional: ${finalBarberName}`

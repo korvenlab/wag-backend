@@ -2,6 +2,7 @@
 import { google } from 'googleapis';
 import { addMinutes, parseISO, startOfDay, endOfDay } from 'date-fns';
 import { supabase } from '../lib/supabase';
+import { formatTimeBR } from '../lib/dateTimeBR';
 
 const getOAuthClient = async (email: string) => {
     const { data: profile, error } = await supabase
@@ -310,30 +311,24 @@ export async function getSchedulingBusyContext(
 
     if (!options.multiBarber) {
         return events.map((e) => {
-            const t = parseISO(e.start);
-            return `${t.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`;
+            return formatTimeBR(e.start);
         });
     }
 
     if (options.semPreferencia) {
         return events.map((e) => {
-            const t = parseISO(e.start);
             const who = e.barberName || 'geral';
-            return `${t.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })} (${who})`;
+            return `${formatTimeBR(e.start)} (${who})`;
         });
     }
 
     if (options.barberName) {
         return events
             .filter((e) => eventBlocksBarber(e, options.barberName!))
-            .map((e) =>
-                parseISO(e.start).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
-            );
+            .map((e) => formatTimeBR(e.start));
     }
 
-    return events.map((e) =>
-        parseISO(e.start).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
-    );
+    return events.map((e) => formatTimeBR(e.start));
 }
 
 /** Valida se o horário está livre conforme o modo (1 barbeiro / multi / sem preferência). */
@@ -439,6 +434,26 @@ export async function resolveSemPreferenciaBooking(
     return pickBarberForSemPreferenciaSlot(events, slotStart, durationMin, barbers);
 }
 
+/** Profissionais livres no horário pedido (para responder "quem está disponível?"). */
+export async function listFreeBarbersAtSlot(
+    email: string,
+    dateIso: string,
+    durationMin: number,
+    barbers: BarberSlotRef[],
+): Promise<string[]> {
+    if (!barbers.length) return [];
+    const slotStart = parseISO(dateIso);
+    const slotEnd = addMinutes(slotStart, durationMin);
+    const events = await listCalendarEvents(
+        email,
+        startOfDay(slotStart).toISOString(),
+        endOfDay(slotStart).toISOString(),
+    );
+    return barbers
+        .filter((b) => isBarberFreeAtSlot(events, slotStart, slotEnd, b.nome))
+        .map((b) => b.nome);
+}
+
 const DEFAULT_DAY_START_H = 8;
 const DEFAULT_DAY_END_H = 20;
 
@@ -479,10 +494,7 @@ export async function findEarliestSemPreferenciaSlots(
             );
             if (assignment) {
                 results.push({
-                    label: slotStart.toLocaleTimeString('pt-BR', {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                    }),
+                    label: formatTimeBR(slotStart),
                     barberName: assignment.barberName,
                 });
             }

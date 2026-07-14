@@ -4,6 +4,8 @@ import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
 import { resolveNicheVocabulary } from '../lib/businessNiche';
+import { log } from '../lib/logger';
+import { isAskingProfessionalAvailability } from '../lib/dateTimeBR';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -168,9 +170,12 @@ export const analyzeMessage = async (
             isCancelling: false,
             response: null,
             date: null as string | null,
+            extractedDate: null as string | null,
+            extractedTime: null as string | null,
             barberSelection: null as string | null,
             barberConfirmed: false,
             canConfirmSchedule: false,
+            askingProfessionalAvailability: false,
         };
     }
 
@@ -181,9 +186,12 @@ export const analyzeMessage = async (
             isCancelling: false,
             response: 'No momento não consigo processar mensagens. A equipa foi avisada.',
             date: null,
+            extractedDate: null,
+            extractedTime: null,
             barberSelection: null,
             barberConfirmed: false,
             canConfirmSchedule: false,
+            askingProfessionalAvailability: false,
         };
     }
 
@@ -215,6 +223,8 @@ export const analyzeMessage = async (
         4. Com ${professional} escolhido → horários livres compactos (use OCUPADOS).
         5. "Sem Preferência" → horários mais cedo (SUGESTOES_SEM_PREFERENCIA se houver).
         6. barberSelection = nome exacto ou SEM_PREFERENCIA; barberConfirmed=true só após escolha explícita.
+        7. Se o cliente pergunta "qual ${professional} está disponível" num horário: isScheduling=false, liste quem está livre (use OCUPADOS) e peça a escolha — NÃO confirme marcação.
+        8. isScheduling=true SÓ quando o cliente confirmar dia+hora E ${professional} (ou Sem Preferência). Pergunta ≠ confirmação.
         `
             : `
         CENÁRIO A — UM PROFISSIONAL${singleBarberName ? ` (${singleBarberName})` : ''}:
@@ -245,12 +255,15 @@ export const analyzeMessage = async (
         - Proibido: elogios longos ("excelente profissional", "ótima escolha"), parágrafos, repetir o pedido do cliente.
         - Horários: formato compacto (ex: "14h, 15h30 ou 17h").
         - Uma pergunta por vez. Se isScheduling=true, NÃO escreva confirmação final — o sistema confirma depois.
+        - NUNCA invente confirmação ("Confirmado:") — o sistema envia isso.
+        - Se o cliente só pergunta horários ou profissionais disponíveis: isScheduling=false e responda à pergunta.
         - Exemplos de tom: "Olá! Com o Marcos. Qual dia e horário?" | "Temos Marcos e Robson. Algum preferido?" | "Amanhã: 14h, 15h ou 16h30. Qual prefere?"
 
         EXTRAÇÃO:
         - DATA (YYYY-MM-DD) e HORA (HH:mm) só quando puder confirmar (Cenário A ou B com ${professional} escolhido).
-        - Hoje: ${diaAtualNome}, ${dataFormatadaBR} ${currentTimeBR}.
+        - Hoje: ${diaAtualNome}, ${dataFormatadaBR} ${currentTimeBR} (fuso America/Sao_Paulo).
         - Serviço: ${dbRow.service_duration ?? 30} min.
+        - Horários e ocupados abaixo já estão em horário de Brasília — use exactamente esses.
 
         OCUPADOS: ${busyContext}
         HORÁRIOS LOJA: ${JSON.stringify(dbRow.working_hours ?? {})}
@@ -305,10 +318,13 @@ export const analyzeMessage = async (
 
         let finalIsoDate: string | null = null;
         const wantsSchedule = Boolean(parsed.isScheduling);
+        const askingWho = isAskingProfessionalAvailability(currentMessage);
 
+        // Pergunta "quem está disponível?" nunca confirma marca.
         if (
             wantsSchedule &&
             canConfirmSchedule &&
+            !askingWho &&
             parsed.extractedDate &&
             parsed.extractedTime &&
             parsed.extractedDate !== 'null' &&
@@ -318,11 +334,16 @@ export const analyzeMessage = async (
             const parsedDate = dayjs.tz(rawDate, "YYYY-MM-DD HH:mm", "America/Sao_Paulo");
             if (parsedDate.isValid()) {
                 finalIsoDate = parsedDate.format();
-                console.log(`[WAGOO] Agendamento solicitado para: ${finalIsoDate}`);
+                log.info('AI', 'agendamento solicitado', {
+                    iso: finalIsoDate,
+                    localBR: parsedDate.format('DD/MM/YYYY HH:mm'),
+                });
             }
+        } else if (askingWho) {
+            log.info('AI', 'cliente perguntou profissionais disponíveis — sem confirmar marca');
         }
 
-        const isScheduling = wantsSchedule && !!finalIsoDate;
+        const isScheduling = wantsSchedule && !!finalIsoDate && !askingWho;
 
         const responseText =
             typeof parsed.response === 'string' && parsed.response.trim()
@@ -333,10 +354,19 @@ export const analyzeMessage = async (
             isScheduling,
             isCancelling: Boolean(parsed.isCancelling),
             date: finalIsoDate,
+            extractedDate:
+                typeof parsed.extractedDate === 'string' && parsed.extractedDate !== 'null'
+                    ? parsed.extractedDate
+                    : null,
+            extractedTime:
+                typeof parsed.extractedTime === 'string' && parsed.extractedTime !== 'null'
+                    ? parsed.extractedTime
+                    : null,
             response: responseText,
             barberSelection,
             barberConfirmed,
             canConfirmSchedule,
+            askingProfessionalAvailability: askingWho,
         };
 
     } catch (error: unknown) {
@@ -353,9 +383,12 @@ export const analyzeMessage = async (
                 ? 'Estou indisponível no momento. Tente de novo em alguns minutos.'
                 : 'Desculpe, tive um problema. Pode repetir?',
             date: null,
+            extractedDate: null,
+            extractedTime: null,
             barberSelection: null,
             barberConfirmed: false,
             canConfirmSchedule: false,
+            askingProfessionalAvailability: false,
         };
     }
 };
