@@ -690,6 +690,11 @@ export async function startWhatsApp(email: string, res: Response | null) {
                 );
 
                 if (created) {
+                    log.info(WA, 'agendamento criado', {
+                      email,
+                      date: aiResult.date,
+                      barber: finalBarberName,
+                    });
                     const confirmDate = new Date(aiResult.date).toLocaleString('pt-BR', {
                       dateStyle: 'short',
                       timeStyle: 'short',
