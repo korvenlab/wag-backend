@@ -3,6 +3,17 @@ import { google } from 'googleapis';
 import { addMinutes, parseISO, startOfDay, endOfDay } from 'date-fns';
 import { supabase } from '../lib/supabase';
 import { formatTimeBR } from '../lib/dateTimeBR';
+import {
+  BR_TZ,
+  collapseSlotsToRanges,
+  dayWindowsFromWorkingHours,
+} from '../lib/dateTimeBR';
+import dayjs from 'dayjs';
+import timezone from 'dayjs/plugin/timezone';
+import utc from 'dayjs/plugin/utc';
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
 const getOAuthClient = async (email: string) => {
     const { data: profile, error } = await supabase
@@ -452,6 +463,75 @@ export async function listFreeBarbersAtSlot(
     return barbers
         .filter((b) => isBarberFreeAtSlot(events, slotStart, slotEnd, b.nome))
         .map((b) => b.nome);
+}
+
+/**
+ * Resume horários livres do dia em intervalos (ex.: "9h–11h30, 14h–17h").
+ * Usa working_hours + eventos ocupados (+ profissional no multi).
+ */
+export async function buildFreeRangesSummary(
+    email: string,
+    dayIso: string,
+    durationMin: number,
+    workingHours: unknown,
+    options: SchedulingAvailabilityOptions & { barbers?: BarberSlotRef[] },
+): Promise<string> {
+    const windows = dayWindowsFromWorkingHours(workingHours, dayIso);
+    const day = dayjs(dayIso).tz(BR_TZ).startOf('day');
+    const now = dayjs().tz(BR_TZ);
+    const events = await listCalendarEvents(
+        email,
+        startOfDay(day.toDate()).toISOString(),
+        endOfDay(day.toDate()).toISOString(),
+    );
+
+    const freeStarts: dayjs.Dayjs[] = [];
+    const scanWindows =
+        windows.length > 0
+            ? windows
+            : [{ startHm: '08:00', endHm: '20:00' }];
+
+    for (const w of scanWindows) {
+        const [sh, sm] = w.startHm.split(':').map(Number);
+        const [eh, em] = w.endHm.split(':').map(Number);
+        let cursor = day.hour(sh).minute(sm).second(0).millisecond(0);
+        const end = day.hour(eh).minute(em).second(0).millisecond(0);
+
+        while (!cursor.add(durationMin, 'minute').isAfter(end)) {
+            if (cursor.isBefore(now)) {
+                cursor = cursor.add(durationMin, 'minute');
+                continue;
+            }
+            const slotStart = cursor.toDate();
+            const slotEnd = addMinutes(slotStart, durationMin);
+
+            let free = false;
+            if (!options.multiBarber) {
+                free = !events.some((ev) => {
+                    const { start, end: evEnd } = eventWindow(ev);
+                    return rangesOverlap(slotStart, slotEnd, start, evEnd);
+                });
+            } else if (options.semPreferencia && options.barbers?.length) {
+                free = options.barbers.some((b) =>
+                    isBarberFreeAtSlot(events, slotStart, slotEnd, b.nome),
+                );
+            } else if (options.barberName) {
+                free = isBarberFreeAtSlot(events, slotStart, slotEnd, options.barberName);
+            } else if (options.barbers?.length) {
+                free = options.barbers.some((b) =>
+                    isBarberFreeAtSlot(events, slotStart, slotEnd, b.nome),
+                );
+            } else {
+                free = true;
+            }
+
+            if (free) freeStarts.push(cursor);
+            cursor = cursor.add(durationMin, 'minute');
+        }
+    }
+
+    if (!freeStarts.length) return 'nenhum horário livre neste dia';
+    return collapseSlotsToRanges(freeStarts, durationMin);
 }
 
 const DEFAULT_DAY_START_H = 8;

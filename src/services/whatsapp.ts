@@ -19,6 +19,7 @@ import {
   buildSemPreferenciaHintsForAi,
   resolveSemPreferenciaBooking,
   listFreeBarbersAtSlot,
+  buildFreeRangesSummary,
   findEventByPhone,
   deleteEvent,
 } from './calendar';
@@ -35,13 +36,21 @@ import {
 } from '../lib/whatsappSessionStore';
 import { supabase } from '../lib/supabase';
 import { log } from '../lib/logger';
-import { formatDateTimeBR, isAskingProfessionalAvailability } from '../lib/dateTimeBR';
+import {
+  formatDateTimeBR,
+  formatHourCompact,
+  isAffirmativeBooking,
+  isAskingProfessionalAvailability,
+  isNegativeBooking,
+} from '../lib/dateTimeBR';
 import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
+
+export const sessions: Record<string, any> = {};
 
 /** Último QR por e-mail — Baileys renova o QR; a HTTP response só consegue enviar o 1º. */
 const pendingQrByEmail: Record<string, string> = {};
@@ -50,8 +59,6 @@ const pairingRestartByEmail = new Set<string>();
 /** Evita dois startWhatsApp em paralelo (ex.: poll + reconnect). */
 const startInFlightByEmail = new Set<string>();
 const WA = 'WA';
-
-export const sessions: Record<string, any> = {};
 
 function sessionHasCreds(sessionDir: string): boolean {
   try {
@@ -81,6 +88,12 @@ interface ChatContext {
     barberConfirmed: boolean;
     selectedBarberName: string | null;
     selectedBarberEmail: string | null;
+    /** Aguardando "sim" do cliente antes de criar no Google Calendar. */
+    pendingConfirmation?: {
+      dateIso: string;
+      barberName: string | null;
+      barberEmail: string | null;
+    } | null;
   };
 }
 
@@ -632,6 +645,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
           nome: b.nome,
           google_calendar_email: b.google_calendar_email,
         }));
+        const dayIsoForRanges = dayjs().tz('America/Sao_Paulo').format('YYYY-MM-DD');
         let busySlots = await getSchedulingBusyContext(email, new Date().toISOString(), {
           multiBarber,
           barberName: semPreferencia ? null : schedForBusy.selectedBarberName,
@@ -648,6 +662,22 @@ export async function startWhatsApp(email: string, res: Response | null) {
           busySlots = [...busySlots, hints];
         }
 
+        const freeRangesSummary =
+          !multiBarber || schedForBusy.barberConfirmed
+            ? await buildFreeRangesSummary(
+                email,
+                dayIsoForRanges,
+                p.service_duration ?? 30,
+                p.working_hours,
+                {
+                  multiBarber,
+                  barberName: semPreferencia ? null : schedForBusy.selectedBarberName,
+                  semPreferencia,
+                  barbers: barberRefs,
+                },
+              )
+            : '';
+
         const aiResult = await analyzeMessage(
           formattedHistory,
           textMessage,
@@ -660,6 +690,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
             service_duration: p.service_duration,
             business_niche: p.business_niche,
             business_niche_custom: p.business_niche_custom,
+            free_ranges_summary: freeRangesSummary || null,
           },
           activeBarbeiros.map((b) => ({ id: b.id, nome: b.nome })),
           {
@@ -672,6 +703,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
           const resolved = resolveBarberFromSelection(activeBarbeiros, aiResult.barberSelection);
           if (resolved) {
             memoryCache[cacheKey].scheduling = {
+              ...memoryCache[cacheKey].scheduling!,
               barberConfirmed: true,
               selectedBarberName: resolved.nome,
               selectedBarberEmail: resolved.email,
@@ -702,7 +734,6 @@ export async function startWhatsApp(email: string, res: Response | null) {
             }
         }
 
-        const willCreateAppointment = Boolean(aiResult.isScheduling && aiResult.date);
         const askingWho =
           Boolean(aiResult.askingProfessionalAvailability) ||
           isAskingProfessionalAvailability(textMessage);
@@ -734,7 +765,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
               p.service_duration ?? 30,
               barberRefs,
             );
-            const timeLabel = formatDateTimeBR(slotIso, 'HH:mm');
+            const timeLabel = formatHourCompact(slotIso);
             const reply =
               free.length > 0
                 ? `Às ${timeLabel} estão disponíveis: ${free.join(', ')}. Qual prefere?`
@@ -762,26 +793,81 @@ export async function startWhatsApp(email: string, res: Response | null) {
           return;
         }
 
-        // Multi: sem profissional escolhido, nunca confirma marca.
-        if (
-          willCreateAppointment &&
-          multiBarber &&
-          !memoryCache[cacheKey].scheduling?.barberConfirmed
-        ) {
-          log.warn(WA, 'IA tentou marcar sem profissional — pedindo escolha', { email });
-          const teamNames = activeBarbeiros.map((b) => b.nome).join(', ');
-          const reply =
-            aiResult.response?.trim() ||
-            `Antes de confirmar: qual profissional prefere? ${teamNames}, ou Sem Preferência.`;
+        const pending = memoryCache[cacheKey].scheduling?.pendingConfirmation ?? null;
+
+        // Cliente recusou a proposta pendente.
+        if (pending && isNegativeBooking(textMessage)) {
+          memoryCache[cacheKey].scheduling!.pendingConfirmation = null;
+          const reply = 'Sem problema. Qual outro horário prefere?';
           await sock.sendMessage(remoteJid, { text: reply });
           memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+          log.info(WA, 'cliente recusou confirmação pendente', { email });
           return;
         }
 
-        if (aiResult.response && !willCreateAppointment) {
+        // Só marca no calendário após "sim" explícito sobre a proposta.
+        const confirmedByUser = Boolean(pending && isAffirmativeBooking(textMessage));
+        const proposedIso = aiResult.date;
+        const willCreateAppointment = confirmedByUser;
+
+        // Nova proposta de horário → pede confirmação (nunca marca na hora).
+        if (!confirmedByUser && proposedIso && !askingWho) {
+          if (multiBarber && !memoryCache[cacheKey].scheduling?.barberConfirmed) {
+            log.warn(WA, 'proposta sem profissional — pedindo escolha', { email });
+            const teamNames = activeBarbeiros.map((b) => b.nome).join(', ');
+            const reply =
+              aiResult.response?.trim() ||
+              `Qual profissional prefere? ${teamNames}, ou Sem Preferência.`;
+            await sock.sendMessage(remoteJid, { text: reply });
+            memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+            return;
+          }
+
+          const sched = memoryCache[cacheKey].scheduling!;
+          const pendingBarberName = multiBarber
+            ? sched.selectedBarberName
+            : activeBarbeiros[0]?.nome ?? null;
+          const pendingBarberEmail = multiBarber
+            ? sched.selectedBarberEmail
+            : activeBarbeiros[0]?.google_calendar_email ?? null;
+
+          memoryCache[cacheKey].scheduling!.pendingConfirmation = {
+            dateIso: proposedIso,
+            barberName: pendingBarberName,
+            barberEmail: pendingBarberEmail,
+          };
+
+          const when = formatDateTimeBR(proposedIso);
+          const profBit =
+            multiBarber && pendingBarberName ? ` com ${pendingBarberName}` : '';
+          const reply = `Posso confirmar ${when}${profBit}? Responda *sim* para marcar.`;
+          log.info(WA, 'aguardando confirmação do cliente', {
+            email,
+            proposedIso,
+            barber: pendingBarberName,
+          });
+          await sock.sendMessage(remoteJid, { text: reply });
+          memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+          await supabase
+            .from('profiles')
+            .update({ messages_answered: (p.messages_answered || 0) + 1 })
+            .eq('email', email);
+          return;
+        }
+
+        if (aiResult.response && !willCreateAppointment && !proposedIso) {
           try {
-              await sock.sendMessage(remoteJid, { text: aiResult.response });
-              memoryCache[cacheKey].messages.push({ role: 'assistant', content: aiResult.response });
+              // Se listou horários sem intervalos, reforça com o resumo calculado.
+              let text = aiResult.response;
+              if (
+                freeRangesSummary &&
+                /horario|horário|disponiv|livre|hoje|amanh/i.test(textMessage) &&
+                !/[–-]/.test(text)
+              ) {
+                text = `Hoje: ${freeRangesSummary}. Qual horário prefere?`;
+              }
+              await sock.sendMessage(remoteJid, { text });
+              memoryCache[cacheKey].messages.push({ role: 'assistant', content: text });
               
               if (memoryCache[cacheKey].messages.length > MAX_HISTORY) {
                   memoryCache[cacheKey].messages = memoryCache[cacheKey].messages.slice(-MAX_HISTORY);
@@ -793,21 +879,22 @@ export async function startWhatsApp(email: string, res: Response | null) {
           }
         }
 
-        // --- 🎯 AGENDAMENTO ---
-        if (willCreateAppointment && aiResult.date) {
-            const sched = memoryCache[cacheKey].scheduling;
+        // --- 🎯 AGENDAMENTO (só após sim) ---
+        if (willCreateAppointment && pending) {
+            const bookingIso = pending.dateIso;
+            const sched = memoryCache[cacheKey].scheduling!;
             const semPref =
-              sched?.selectedBarberName?.toLowerCase().includes('sem prefer') ?? false;
+              pending.barberName?.toLowerCase().includes('sem prefer') ?? false;
             const barberName = multiBarber
-              ? sched?.selectedBarberName ?? 'Sem Preferência'
+              ? pending.barberName ?? sched.selectedBarberName ?? 'Sem Preferência'
               : activeBarbeiros.length === 1
                 ? activeBarbeiros[0].nome
-                : undefined;
+                : pending.barberName ?? undefined;
             const barberEmail = multiBarber
-              ? sched?.selectedBarberEmail ?? null
+              ? pending.barberEmail ?? sched.selectedBarberEmail
               : activeBarbeiros.length === 1
                 ? activeBarbeiros[0].google_calendar_email
-                : null;
+                : pending.barberEmail;
 
             let finalBarberName = barberName;
             let finalBarberEmail = barberEmail;
@@ -815,11 +902,12 @@ export async function startWhatsApp(email: string, res: Response | null) {
             if (semPref && multiBarber) {
               const assigned = await resolveSemPreferenciaBooking(
                 email,
-                aiResult.date,
+                bookingIso,
                 p.service_duration ?? 30,
                 barberRefs,
               );
               if (!assigned) {
+                memoryCache[cacheKey].scheduling!.pendingConfirmation = null;
                 await sock.sendMessage(remoteJid, {
                   text: 'Horário indisponível. Quer outro dia ou horário?',
                 });
@@ -830,16 +918,17 @@ export async function startWhatsApp(email: string, res: Response | null) {
             } else {
               const isFree = await checkSchedulingAvailability(
                 email,
-                aiResult.date,
+                bookingIso,
                 p.service_duration ?? 30,
                 {
                   multiBarber,
-                  barberName: sched?.selectedBarberName ?? null,
+                  barberName: pending.barberName ?? null,
                   semPreferencia: false,
                   activeBarberNames: activeBarbeiros.map((b) => b.nome),
                 },
               );
               if (!isFree) {
+                memoryCache[cacheKey].scheduling!.pendingConfirmation = null;
                 await sock.sendMessage(remoteJid, {
                   text: multiBarber && barberName
                     ? `Horário indisponível para ${barberName}. Outro horário ou profissional?`
@@ -856,19 +945,20 @@ export async function startWhatsApp(email: string, res: Response | null) {
                   email,
                   clientName,
                   clientPhone,
-                  aiResult.date,
+                  bookingIso,
                   p.service_duration,
                   { barberName: finalBarberName, barberEmail: finalBarberEmail },
                 );
 
                 if (created) {
-                    log.info(WA, 'agendamento criado', {
+                    log.info(WA, 'agendamento criado após confirmação', {
                       email,
-                      date: aiResult.date,
-                      dateBR: formatDateTimeBR(aiResult.date),
+                      date: bookingIso,
+                      dateBR: formatDateTimeBR(bookingIso),
                       barber: finalBarberName,
                     });
-                    const confirmDate = formatDateTimeBR(aiResult.date);
+                    memoryCache[cacheKey].scheduling!.pendingConfirmation = null;
+                    const confirmDate = formatDateTimeBR(bookingIso);
                     const profLine =
                       multiBarber && finalBarberName
                         ? `\nProfissional: ${finalBarberName}`
