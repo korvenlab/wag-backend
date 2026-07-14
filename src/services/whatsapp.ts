@@ -38,7 +38,28 @@ export const sessions: Record<string, any> = {};
 
 /** Último QR por e-mail — Baileys renova o QR; a HTTP response só consegue enviar o 1º. */
 const pendingQrByEmail: Record<string, string> = {};
+/** Após scan, Baileys manda 515 e precisa reiniciar com o mesmo creds.json. */
+const pairingRestartByEmail = new Set<string>();
+/** Evita dois startWhatsApp em paralelo (ex.: poll + reconnect). */
+const startInFlightByEmail = new Set<string>();
 const WA = 'WA';
+
+function sessionHasCreds(sessionDir: string): boolean {
+  try {
+    return fs.existsSync(path.join(sessionDir, 'creds.json'));
+  } catch {
+    return false;
+  }
+}
+
+function scheduleReconnect(email: string, delayMs: number, reason: string): void {
+  log.step(WA, `agendando reconnect (${reason})`, { email, delayMs });
+  setTimeout(() => {
+    startWhatsApp(email, null).catch((err) => {
+      log.error(WA, 'falha ao reconectar', err, { email, reason });
+    });
+  }, delayMs);
+}
 
 /**
  * 🧠 MEMÓRIA RAM VOLÁTIL (SaaS Ready)
@@ -168,6 +189,7 @@ async function purgeWhatsAppSession(email: string, reason: string): Promise<void
   }
 
   delete pendingQrByEmail[email];
+  pairingRestartByEmail.delete(email);
 
   if (fs.existsSync(sessionDir)) {
     fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -219,6 +241,7 @@ export async function disconnectWhatsApp(email: string) {
     }
 
     delete pendingQrByEmail[email];
+    pairingRestartByEmail.delete(email);
 
     if (fs.existsSync(sessionDir)) {
       fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -245,17 +268,51 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
     // Já online — não derruba o socket pedindo QR de novo.
     if (sessions[email]?.user && res && !res.headersSent) {
+      pairingRestartByEmail.delete(email);
       log.info(WA, 'já conectado — QR dispensado', { email });
-      res.status(200).json({ message: 'Conectado!', connected: true });
+      res.status(200).json({ message: 'Conectado!', connected: true, status: 'connected' });
       return;
     }
 
-    // Pareamento em curso: devolve o QR atual em vez de matar o socket (loop incompleto).
-    if (sessions[email] && res && pendingQrByEmail[email] && !res.headersSent) {
-      log.info(WA, 'reutilizando QR pendente (socket vivo)', { email });
-      res.status(200).json({ qrCode: pendingQrByEmail[email] });
+    // Handshake pós-515 em andamento: avisa o front e deixa o reconnect seguir.
+    if (res && pairingRestartByEmail.has(email)) {
+      log.info(WA, 'handshake pós-scan em curso', { email, hasSocket: !!sessions[email] });
+      if (!res.headersSent) {
+        res.status(200).json({
+          status: 'connecting',
+          message: 'Conectando… finalize no celular se pedir.',
+        });
+      }
+      if (!sessions[email] && !startInFlightByEmail.has(email)) {
+        scheduleReconnect(email, 300, 'pairing-restart-poll');
+      }
       return;
     }
+
+    // Pareamento em curso: devolve o QR atual (sempre o pending mais recente).
+    if (sessions[email] && res && pendingQrByEmail[email] && !res.headersSent) {
+      log.info(WA, 'reutilizando QR pendente (socket vivo)', { email });
+      res.status(200).json({
+        qrCode: pendingQrByEmail[email],
+        status: 'waiting_qr',
+      });
+      return;
+    }
+
+    if (startInFlightByEmail.has(email)) {
+      log.warn(WA, 'startWhatsApp já em progresso — ignorando chamada paralela', { email, mode });
+      if (res && !res.headersSent) {
+        if (pendingQrByEmail[email]) {
+          res.status(200).json({ qrCode: pendingQrByEmail[email], status: 'waiting_qr' });
+        } else if (pairingRestartByEmail.has(email)) {
+          res.status(200).json({ status: 'connecting', message: 'Conectando…' });
+        } else {
+          res.status(200).json({ status: 'connecting', message: 'Iniciando conexão…' });
+        }
+      }
+      return;
+    }
+    startInFlightByEmail.add(email);
 
     if (sessions[email]) {
         log.warn(WA, 'substituindo socket existente', { email, mode });
@@ -286,6 +343,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
     const diskFilesBefore = fs.existsSync(sessionDir)
       ? fs.readdirSync(sessionDir).filter((n) => !n.startsWith('.')).length
       : 0;
+    const hasCreds = sessionHasCreds(sessionDir);
 
     log.info(WA, 'estado da sessão antes do start', {
       email,
@@ -293,6 +351,8 @@ export async function startWhatsApp(email: string, res: Response | null) {
       hasStored: !!storedSession,
       storedComplete: hasCompleteStoredSession,
       diskFiles: diskFilesBefore,
+      hasCreds,
+      pairingRestart: pairingRestartByEmail.has(email),
     });
 
     // Só restaura bundle completo — incompleto (só creds) NÃO vai para o disco.
@@ -307,29 +367,43 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
     const sessionComplete = sessionDirLooksComplete(sessionDir);
 
-    // Auto-reconnect sem QR: limpa lixo incompleto e espera pareamento no dashboard.
+    // Auto-reconnect: com creds.json (mesmo incompleto) = pós-QR 515 → continuar handshake.
+    // Sem creds = nada a reconectar.
     if (!res && !sessionComplete && !hasCompleteStoredSession) {
-      if (storedSession || fs.existsSync(sessionDir)) {
-        log.warn(WA, 'sessão incompleta no reconnect — limpando e aguardando QR', { email });
-        await clearWhatsAppSessionInSupabase(email);
-        if (fs.existsSync(sessionDir)) {
-          fs.rmSync(sessionDir, { recursive: true, force: true });
-        }
-        fs.mkdirSync(sessionDir, { recursive: true });
+      if (sessionHasCreds(sessionDir)) {
+        log.step(WA, 'reconnect com creds parcial (pós-scan / 515)', { email });
+        // fall through → makeWASocket
       } else {
-        log.info(WA, 'reconnect sem sessão — nada a fazer', { email });
+        if (storedSession) {
+          log.warn(WA, 'reconnect sem creds no disco — limpando lixo Supabase', { email });
+          await clearWhatsAppSessionInSupabase(email);
+        } else {
+          log.info(WA, 'reconnect sem sessão — nada a fazer', { email });
+        }
+        pairingRestartByEmail.delete(email);
+        return;
       }
-      return;
     }
 
-    // Novo QR: descarta só o parcial (creds sem keys), sem matar sessão completa.
-    if (res && !sessionComplete && (storedSession || fs.readdirSync(sessionDir).length > 0)) {
-      if (!hasCompleteStoredSession) {
+    // QR: NÃO apagar creds se restart 515 pendente.
+    // Pedido explícito de QR sem restart → limpa parcial órfão e gera QR novo.
+    if (res && !sessionComplete && !hasCompleteStoredSession) {
+      if (sessionHasCreds(sessionDir) && pairingRestartByEmail.has(email)) {
+        log.step(WA, 'mantendo creds pós-515 — abrindo socket de novo', { email });
+        if (!res.headersSent) {
+          res.status(200).json({
+            status: 'connecting',
+            message: 'Conectando…',
+          });
+        }
+        res = null;
+      } else if (sessionHasCreds(sessionDir) || diskFilesBefore > 0) {
         await clearWhatsAppSessionInSupabase(email);
         if (fs.existsSync(sessionDir)) {
           fs.rmSync(sessionDir, { recursive: true, force: true });
         }
         fs.mkdirSync(sessionDir, { recursive: true });
+        pairingRestartByEmail.delete(email);
         log.step(WA, 'pasta limpa para novo pareamento', { email });
       }
     }
@@ -357,6 +431,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
         return;
       }
       log.error(WA, 'crypto inválido — limpando sessão', err, { email });
+      pairingRestartByEmail.delete(email);
       void purgeWhatsAppSession(email, 'chaves de sessão corrompidas ou incompletas');
     };
 
@@ -386,12 +461,13 @@ export async function startWhatsApp(email: string, res: Response | null) {
         log.step(WA, `connection=${connection}`, { email });
       }
       if (qr) {
+        pairingRestartByEmail.delete(email);
         try {
           const qrCodeImage = await qrcode.toDataURL(qr);
           pendingQrByEmail[email] = qrCodeImage;
           const sentToClient = !!(res && !res.headersSent);
           if (sentToClient) {
-            res!.status(200).json({ qrCode: qrCodeImage });
+            res!.status(200).json({ qrCode: qrCodeImage, status: 'waiting_qr' });
           }
           log.info(WA, 'QR gerado/atualizado', { email, sentToClient });
         } catch (qrErr) {
@@ -401,11 +477,14 @@ export async function startWhatsApp(email: string, res: Response | null) {
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         const disconnectMsg = (lastDisconnect?.error as Error)?.message ?? '';
+        const hasCredsNow = sessionHasCreds(sessionDir);
+        const completeNow = sessionDirLooksComplete(sessionDir);
         log.warn(WA, 'conexão fechada', {
           email,
           statusCode,
           disconnectMsg,
-          completeOnDisk: sessionDirLooksComplete(sessionDir),
+          completeOnDisk: completeNow,
+          hasCreds: hasCredsNow,
         });
         if (sessions[email]) {
             sessions[email].ev.removeAllListeners();
@@ -413,35 +492,45 @@ export async function startWhatsApp(email: string, res: Response | null) {
             delete sessions[email];
         }
         delete pendingQrByEmail[email];
-        if (
+
+        const isRestartRequired =
+          statusCode === DisconnectReason.restartRequired || statusCode === 515;
+        const isLoggedOut =
           statusCode === DisconnectReason.loggedOut ||
           statusCode === 401 ||
           statusCode === 440 ||
           statusCode === 403 ||
-          isBaileysCryptoError(lastDisconnect?.error)
-        ) {
+          isBaileysCryptoError(lastDisconnect?.error);
+
+        if (isLoggedOut) {
+          pairingRestartByEmail.delete(email);
           await purgeWhatsAppSession(
             email,
             isBaileysCryptoError(lastDisconnect?.error)
               ? 'desconexão por chave inválida'
               : `logout (${statusCode ?? disconnectMsg})`,
           );
-        } else if (sessionDirLooksComplete(sessionDir)) {
-          log.step(WA, 'agendando reconnect em 5s', { email });
-          setTimeout(() => {
-            startWhatsApp(email, null).catch((err) => {
-              log.error(WA, 'falha ao reconectar', err, { email });
-            });
-          }, 5000);
+        } else if (isRestartRequired) {
+          // Normal após escanear o QR — reconectar com o mesmo creds.json.
+          pairingRestartByEmail.add(email);
+          log.step(WA, '515 restartRequired após scan — reconectando com creds', { email });
+          scheduleReconnect(email, 1200, '515-restart-required');
+        } else if (completeNow || hasCredsNow) {
+          pairingRestartByEmail.add(email);
+          scheduleReconnect(email, 3000, completeNow ? 'session-complete' : 'has-creds');
         } else {
-          log.warn(WA, 'fechou antes do pareamento — usuário deve gerar QR de novo', { email });
+          pairingRestartByEmail.delete(email);
+          log.warn(WA, 'fechou sem creds — usuário deve gerar QR de novo', { email });
         }
       } else if (connection === 'open') {
         log.info(WA, 'BOT ONLINE', { email });
+        pairingRestartByEmail.delete(email);
         delete pendingQrByEmail[email];
         pushAdminEvent('wagoo', `Bot WhatsApp conectado (${email})`, 'online');
         await persistWhatsAppSessionToSupabase(email, sessionDir);
-        if (res && !res.headersSent) res.status(200).json({ message: 'Conectado!' });
+        if (res && !res.headersSent) {
+          res.status(200).json({ message: 'Conectado!', connected: true, status: 'connected' });
+        }
       }
     });
 
@@ -725,12 +814,15 @@ export async function startWhatsApp(email: string, res: Response | null) {
     });
   } catch (error) {
     log.error(WA, 'Erro startWhatsApp', error, { email });
+    pairingRestartByEmail.delete(email);
     if (isBaileysCryptoError(error)) {
       await purgeWhatsAppSession(email, 'falha ao iniciar com credenciais inválidas');
     }
     if (res && !res.headersSent) {
       res.status(500).json({ error: 'Falha ao iniciar WhatsApp. Veja os logs do Render.' });
     }
+  } finally {
+    startInFlightByEmail.delete(email);
   }
 }
 
