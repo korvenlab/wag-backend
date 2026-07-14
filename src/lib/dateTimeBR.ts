@@ -35,13 +35,18 @@ export function isAskingProfessionalAvailability(message: string): boolean {
 /** "Sim / confirma / pode marcar" — libera o agendamento pendente. */
 export function isAffirmativeBooking(message: string): boolean {
   const m = message.toLowerCase().normalize('NFD').replace(/\p{M}/gu, '').trim();
+  if (!m) return false;
   if (isAskingProfessionalAvailability(message)) return false;
   if (isNegativeBooking(message)) return false;
   // Evita "pode ser 10h" (nova proposta) ser tratado só como sim.
   if (/\d/.test(m) && /\b(h|hora|:)\b/.test(m)) return false;
   return (
-    /^(sim|s|yes|ok|okay|certo|isso|fechado|confirmo|confirma|pode|claro|perfeito|combinado)\b/.test(m) ||
-    /\b(pode marcar|pode agendar|pode confirmar|esta confirmado|tá bom|ta bom|isso mesmo|fechamos)\b/.test(m)
+    /^(sim+|s+|yes|ok|okay|certo|isso|fechado|confirmo|confirma(do|r)?|pode( sim)?|claro|perfeito|combinado|bora|vamos)\b/.test(
+      m,
+    ) ||
+    /\b(pode marcar|pode agendar|pode confirmar|pode sim|esta confirmado|ta confirmado|tá bom|ta bom|isso mesmo|fechamos|confirmado)\b/.test(
+      m,
+    )
   );
 }
 

@@ -613,18 +613,23 @@ export async function startWhatsApp(email: string, res: Response | null) {
             barberConfirmed: false,
             selectedBarberName: null,
             selectedBarberEmail: null,
+            pendingConfirmation: null,
           };
         }
 
         if (!multiBarber && activeBarbeiros.length === 1) {
           const only = activeBarbeiros[0];
+          const prev = memoryCache[cacheKey].scheduling!;
           memoryCache[cacheKey].scheduling = {
+            ...prev,
             barberConfirmed: true,
             selectedBarberName: only.nome,
             selectedBarberEmail: only.google_calendar_email,
           };
         } else if (!multiBarber && activeBarbeiros.length === 0) {
+          const prev = memoryCache[cacheKey].scheduling!;
           memoryCache[cacheKey].scheduling = {
+            ...prev,
             barberConfirmed: true,
             selectedBarberName: null,
             selectedBarberEmail: null,
@@ -827,8 +832,17 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
         // Só marca no calendário após "sim" explícito sobre a proposta.
         const confirmedByUser = Boolean(pending && isAffirmativeBooking(textMessage));
-        const proposedIso = aiResult.date;
+        const proposedIso = confirmedByUser ? null : aiResult.date;
         const willCreateAppointment = confirmedByUser;
+
+        log.info(WA, 'estado confirmação', {
+          email,
+          hasPending: !!pending,
+          pendingIso: pending?.dateIso ?? null,
+          confirmedByUser,
+          proposedIso,
+          text: textMessage.slice(0, 80),
+        });
 
         // Nova proposta de horário → pede confirmação (nunca marca na hora).
         if (!confirmedByUser && proposedIso && !askingWho) {
