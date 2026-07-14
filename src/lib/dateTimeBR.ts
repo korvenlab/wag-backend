@@ -88,7 +88,19 @@ const WEEKDAY_KEYS = [
 ] as const;
 
 export function weekdayKeyBR(dayIso: string): string {
-  return WEEKDAY_KEYS[dayjs(dayIso).tz(BR_TZ).day()];
+  // Date-only ("2026-07-14") deve ser dia civil em Brasília — não UTC midnight.
+  const d = /^\d{4}-\d{2}-\d{2}$/.test(dayIso.trim())
+    ? dayjs.tz(dayIso.trim(), 'YYYY-MM-DD', BR_TZ)
+    : dayjs(dayIso).tz(BR_TZ);
+  return WEEKDAY_KEYS[d.day()];
+}
+
+/** Início do dia civil em America/Sao_Paulo a partir de YYYY-MM-DD (ou ISO). */
+export function startOfDayBR(dayIso: string): dayjs.Dayjs {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dayIso.trim())) {
+    return dayjs.tz(dayIso.trim(), 'YYYY-MM-DD', BR_TZ).startOf('day');
+  }
+  return dayjs(dayIso).tz(BR_TZ).startOf('day');
 }
 
 type DayHours = {

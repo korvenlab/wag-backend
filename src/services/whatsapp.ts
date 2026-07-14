@@ -662,21 +662,25 @@ export async function startWhatsApp(email: string, res: Response | null) {
           busySlots = [...busySlots, hints];
         }
 
-        const freeRangesSummary =
-          !multiBarber || schedForBusy.barberConfirmed
-            ? await buildFreeRangesSummary(
-                email,
-                dayIsoForRanges,
-                p.service_duration ?? 30,
-                p.working_hours,
-                {
-                  multiBarber,
-                  barberName: semPreferencia ? null : schedForBusy.selectedBarberName,
-                  semPreferencia,
-                  barbers: barberRefs,
-                },
-              )
-            : '';
+        // Multi sem profissional escolhido: resume quem tem vaga (qualquer um).
+        const freeRangesSummary = await buildFreeRangesSummary(
+          email,
+          dayIsoForRanges,
+          p.service_duration ?? 30,
+          p.working_hours,
+          {
+            multiBarber,
+            barberName:
+              multiBarber && !schedForBusy.barberConfirmed
+                ? null
+                : semPreferencia
+                  ? null
+                  : schedForBusy.selectedBarberName,
+            semPreferencia:
+              semPreferencia || (multiBarber && !schedForBusy.barberConfirmed),
+            barbers: barberRefs,
+          },
+        );
 
         const aiResult = await analyzeMessage(
           formattedHistory,
@@ -756,6 +760,22 @@ export async function startWhatsApp(email: string, res: Response | null) {
               'America/Sao_Paulo',
             );
             if (parsed.isValid()) slotIso = parsed.format();
+          }
+          if (!slotIso) {
+            const hm =
+              textMessage.match(/\b(\d{1,2})\s*:\s*(\d{2})\b/) ||
+              textMessage.match(/\b(\d{1,2})\s*h(?:oras?)?\s*(\d{2})?\b/i);
+            if (hm) {
+              const hour = Number(hm[1]);
+              const minute = hm[2] ? Number(hm[2]) : 0;
+              const parsed = dayjs()
+                .tz('America/Sao_Paulo')
+                .hour(hour)
+                .minute(minute)
+                .second(0)
+                .millisecond(0);
+              if (parsed.isValid()) slotIso = parsed.format();
+            }
           }
 
           if (slotIso) {
@@ -857,14 +877,20 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
         if (aiResult.response && !willCreateAppointment && !proposedIso) {
           try {
-              // Se listou horários sem intervalos, reforça com o resumo calculado.
               let text = aiResult.response;
-              if (
-                freeRangesSummary &&
+              const asksAvailability =
                 /horario|horário|disponiv|livre|hoje|amanh/i.test(textMessage) &&
-                !/[–-]/.test(text)
-              ) {
+                !isAskingProfessionalAvailability(textMessage);
+              const hasUsefulRanges =
+                !!freeRangesSummary &&
+                !/nenhum horário livre/i.test(freeRangesSummary);
+
+              if (asksAvailability && hasUsefulRanges && !/[–-]/.test(text)) {
                 text = `Hoje: ${freeRangesSummary}. Qual horário prefere?`;
+              } else if (asksAvailability && !hasUsefulRanges) {
+                text = multiBarber
+                  ? 'Hoje não há horários livres. Quer tentar outro dia?'
+                  : 'Hoje não há horários livres. Quer tentar outro dia?';
               }
               await sock.sendMessage(remoteJid, { text });
               memoryCache[cacheKey].messages.push({ role: 'assistant', content: text });

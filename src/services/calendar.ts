@@ -7,10 +7,12 @@ import {
   BR_TZ,
   collapseSlotsToRanges,
   dayWindowsFromWorkingHours,
+  startOfDayBR,
 } from '../lib/dateTimeBR';
 import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
+import { log } from '../lib/logger';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -476,13 +478,14 @@ export async function buildFreeRangesSummary(
     workingHours: unknown,
     options: SchedulingAvailabilityOptions & { barbers?: BarberSlotRef[] },
 ): Promise<string> {
+    const step = Math.max(5, Number(durationMin) || 30);
     const windows = dayWindowsFromWorkingHours(workingHours, dayIso);
-    const day = dayjs(dayIso).tz(BR_TZ).startOf('day');
+    const day = startOfDayBR(dayIso);
     const now = dayjs().tz(BR_TZ);
     const events = await listCalendarEvents(
         email,
-        startOfDay(day.toDate()).toISOString(),
-        endOfDay(day.toDate()).toISOString(),
+        day.toISOString(),
+        day.endOf('day').toISOString(),
     );
 
     const freeStarts: dayjs.Dayjs[] = [];
@@ -491,19 +494,29 @@ export async function buildFreeRangesSummary(
             ? windows
             : [{ startHm: '08:00', endHm: '20:00' }];
 
+    log.info('CAL', 'buildFreeRangesSummary', {
+        email,
+        dayIso,
+        dayBR: day.format('YYYY-MM-DD dddd'),
+        windows: scanWindows.length,
+        events: events.length,
+        step,
+        multiBarber: !!options.multiBarber,
+    });
+
     for (const w of scanWindows) {
         const [sh, sm] = w.startHm.split(':').map(Number);
         const [eh, em] = w.endHm.split(':').map(Number);
         let cursor = day.hour(sh).minute(sm).second(0).millisecond(0);
         const end = day.hour(eh).minute(em).second(0).millisecond(0);
 
-        while (!cursor.add(durationMin, 'minute').isAfter(end)) {
+        while (!cursor.add(step, 'minute').isAfter(end)) {
             if (cursor.isBefore(now)) {
-                cursor = cursor.add(durationMin, 'minute');
+                cursor = cursor.add(step, 'minute');
                 continue;
             }
             const slotStart = cursor.toDate();
-            const slotEnd = addMinutes(slotStart, durationMin);
+            const slotEnd = addMinutes(slotStart, step);
 
             let free = false;
             if (!options.multiBarber) {
@@ -526,12 +539,12 @@ export async function buildFreeRangesSummary(
             }
 
             if (free) freeStarts.push(cursor);
-            cursor = cursor.add(durationMin, 'minute');
+            cursor = cursor.add(step, 'minute');
         }
     }
 
     if (!freeStarts.length) return 'nenhum horário livre neste dia';
-    return collapseSlotsToRanges(freeStarts, durationMin);
+    return collapseSlotsToRanges(freeStarts, step);
 }
 
 const DEFAULT_DAY_START_H = 8;
