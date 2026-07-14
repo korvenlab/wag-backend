@@ -22,11 +22,13 @@ import { supabase } from './lib/supabase';
 import { isBusinessNicheId } from './lib/businessNiche';
 import { requireBearerUser, sanitizeProfileForClient } from './lib/requireAuth';
 import { createGoogleOAuthState, verifyGoogleOAuthState } from './lib/googleOAuthState';
+import { log } from './lib/logger';
 
 const app = express();
 const port: number = process.env.PORT ? Number(process.env.PORT) : 3000;
 
 installWhatsAppProcessSafetyNet();
+log.info('CORE', 'safety net WhatsApp instalado');
 
 const defaultOrigins = [
   'https://wagoobot.com',
@@ -309,9 +311,10 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
       }, { onConflict: 'email' });
 
     if (error) throw error;
+    log.info('AUTH', 'sync OK', { email: userEmail, userId: id, hasGoogleToken: !!accessToken });
     res.json({ ok: true });
   } catch (err: any) {
-    console.error("❌ Erro na sincronização:", err.message);
+    log.error('AUTH', 'erro na sincronização', err, { email: userEmail, userId: id });
     res.status(500).json({ error: 'Erro na sincronização' });
   }
 });
@@ -320,14 +323,24 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
 app.post('/api/whatsapp/qr', async (req, res) => {
   const authed = await requireBearerUser(req, res);
   if (!authed) return;
-  startWhatsApp(authed.email, res);
+  log.step('WA', 'POST /api/whatsapp/qr', { email: authed.email });
+  startWhatsApp(authed.email, res).catch((err) => {
+    log.error('WA', 'startWhatsApp rejeitado na rota QR', err, { email: authed.email });
+    if (!res.headersSent) res.status(500).json({ error: 'Falha ao gerar QR' });
+  });
 });
 
 app.post('/api/whatsapp/disconnect', async (req, res) => {
   const authed = await requireBearerUser(req, res);
   if (!authed) return;
-  await disconnectWhatsApp(authed.email);
-  res.json({ ok: true });
+  log.step('WA', 'POST /api/whatsapp/disconnect', { email: authed.email });
+  try {
+    await disconnectWhatsApp(authed.email);
+    res.json({ ok: true });
+  } catch (err) {
+    log.error('WA', 'disconnect falhou na rota', err, { email: authed.email });
+    res.status(500).json({ error: 'Falha ao desconectar' });
+  }
 });
 
 // --- 6. MONITORAMENTO E BOOT ---
@@ -337,7 +350,7 @@ app.get('/health', (_req, res) =>
 );
 
 app.listen(port, '0.0.0.0', () => {
-  console.log(`🚀 Wagoo Online na porta ${port}`);
+  log.info('CORE', `API online na porta ${port}`);
   pushAdminEvent('core', `API Wagoo inicializada na porta ${port}`, 'online');
-  autoReconnectAll().catch(err => console.error("Erro na reconexão automática:", err));
+  autoReconnectAll().catch((err) => log.error('WA', 'Erro na reconexão automática', err));
 });

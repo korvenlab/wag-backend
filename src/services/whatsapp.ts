@@ -33,10 +33,12 @@ import {
   sessionDirLooksComplete,
 } from '../lib/whatsappSessionStore';
 import { supabase } from '../lib/supabase';
+import { log } from '../lib/logger';
 export const sessions: Record<string, any> = {};
 
 /** Último QR por e-mail — Baileys renova o QR; a HTTP response só consegue enviar o 1º. */
 const pendingQrByEmail: Record<string, string> = {};
+const WA = 'WA';
 
 /**
  * 🧠 MEMÓRIA RAM VOLÁTIL (SaaS Ready)
@@ -172,7 +174,7 @@ async function purgeWhatsAppSession(email: string, reason: string): Promise<void
   }
 
   await clearWhatsAppSessionInSupabase(email);
-  console.warn(`[WAGOO WA] Sessão removida (${email}): ${reason}`);
+  log.warn(WA, 'Sessão removida', { email, reason });
   pushAdminEvent('wagoo', `Sessão WhatsApp inválida — novo QR necessário (${email})`, 'offline');
 }
 
@@ -185,27 +187,25 @@ export function installWhatsAppProcessSafetyNet(): void {
 
   process.on('uncaughtException', (err) => {
     if (isBaileysCryptoError(err)) {
-      console.error('[WAGOO WA] uncaughtException (sessão inválida, API continua):', err.message);
+      log.error(WA, 'uncaughtException — sessão inválida (API continua)', err);
       return;
     }
-    console.error('[WAGOO] uncaughtException:', err);
+    log.error('CORE', 'uncaughtException fatal', err);
     process.exit(1);
   });
 
   process.on('unhandledRejection', (reason) => {
     if (isBaileysCryptoError(reason)) {
-      console.error(
-        '[WAGOO WA] unhandledRejection (sessão inválida, API continua):',
-        reason instanceof Error ? reason.message : String(reason),
-      );
+      log.error(WA, 'unhandledRejection — sessão inválida (API continua)', reason);
       return;
     }
-    console.error('[WAGOO] unhandledRejection:', reason);
+    log.error('CORE', 'unhandledRejection', reason);
   });
 }
 
 export async function disconnectWhatsApp(email: string) {
   try {
+    log.step(WA, 'disconnect solicitado', { email });
     const sock = sessions[email];
     const baseAuthDir = path.join(__dirname, '..', '..', 'auth_info_baileys');
     const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
@@ -226,9 +226,10 @@ export async function disconnectWhatsApp(email: string) {
 
     await clearWhatsAppSessionInSupabase(email);
     pushAdminEvent('wagoo', 'Sessão WhatsApp encerrada pelo utilizador', 'offline');
+    log.info(WA, 'disconnect concluído', { email });
     return { success: true };
   } catch (error) {
-    console.error('Erro ao desconectar WhatsApp:', error);
+    log.error(WA, 'Erro ao desconectar WhatsApp', error, { email });
     throw error;
   }
 }
@@ -237,21 +238,27 @@ export async function startWhatsApp(email: string, res: Response | null) {
   const baseAuthDir = path.join(__dirname, '..', '..', 'auth_info_baileys');
   const safeEmailFolder = email.replace(/[^a-zA-Z0-9]/g, '_');
   const sessionDir = path.join(baseAuthDir, safeEmailFolder);
+  const mode = res ? 'qr' : 'reconnect';
 
   try {
+    log.step(WA, 'startWhatsApp', { email, mode });
+
     // Já online — não derruba o socket pedindo QR de novo.
     if (sessions[email]?.user && res && !res.headersSent) {
+      log.info(WA, 'já conectado — QR dispensado', { email });
       res.status(200).json({ message: 'Conectado!', connected: true });
       return;
     }
 
     // Pareamento em curso: devolve o QR atual em vez de matar o socket (loop incompleto).
     if (sessions[email] && res && pendingQrByEmail[email] && !res.headersSent) {
+      log.info(WA, 'reutilizando QR pendente (socket vivo)', { email });
       res.status(200).json({ qrCode: pendingQrByEmail[email] });
       return;
     }
 
     if (sessions[email]) {
+        log.warn(WA, 'substituindo socket existente', { email, mode });
         sessions[email].ev.removeAllListeners();
         try { sessions[email].ws?.removeAllListeners?.(); } catch(e) {}
         try { sessions[email].ws.close(); } catch(e) {}
@@ -261,20 +268,40 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
-    const { data: profile } = await supabase
+    const { data: profile, error: profileErr } = await supabase
       .from('profiles')
       .select('whatsapp_session')
       .eq('email', email)
       .single();
 
+    if (profileErr) {
+      log.warn(WA, 'falha ao ler whatsapp_session no Supabase', {
+        email,
+        error: profileErr.message,
+      });
+    }
+
     const storedSession = profile?.whatsapp_session;
     const hasCompleteStoredSession = bundleLooksComplete(storedSession);
+    const diskFilesBefore = fs.existsSync(sessionDir)
+      ? fs.readdirSync(sessionDir).filter((n) => !n.startsWith('.')).length
+      : 0;
+
+    log.info(WA, 'estado da sessão antes do start', {
+      email,
+      mode,
+      hasStored: !!storedSession,
+      storedComplete: hasCompleteStoredSession,
+      diskFiles: diskFilesBefore,
+    });
 
     // Só restaura bundle completo — incompleto (só creds) NÃO vai para o disco.
     if (!sessionDirLooksComplete(sessionDir) && hasCompleteStoredSession) {
       const restored = restoreWhatsAppSessionToDisk(sessionDir, storedSession);
       if (restored) {
-        console.log(`[WAGOO WA] Sessão completa restaurada do Supabase (${email})`);
+        log.info(WA, 'sessão completa restaurada do Supabase', { email });
+      } else {
+        log.warn(WA, 'restore do Supabase falhou (bundle incompleto após escrita)', { email });
       }
     }
 
@@ -283,14 +310,14 @@ export async function startWhatsApp(email: string, res: Response | null) {
     // Auto-reconnect sem QR: limpa lixo incompleto e espera pareamento no dashboard.
     if (!res && !sessionComplete && !hasCompleteStoredSession) {
       if (storedSession || fs.existsSync(sessionDir)) {
-        console.warn(
-          `[WAGOO WA] Sessão incompleta ignorada (${email}) — aguarda novo QR no painel.`,
-        );
+        log.warn(WA, 'sessão incompleta no reconnect — limpando e aguardando QR', { email });
         await clearWhatsAppSessionInSupabase(email);
         if (fs.existsSync(sessionDir)) {
           fs.rmSync(sessionDir, { recursive: true, force: true });
         }
         fs.mkdirSync(sessionDir, { recursive: true });
+      } else {
+        log.info(WA, 'reconnect sem sessão — nada a fazer', { email });
       }
       return;
     }
@@ -303,12 +330,13 @@ export async function startWhatsApp(email: string, res: Response | null) {
           fs.rmSync(sessionDir, { recursive: true, force: true });
         }
         fs.mkdirSync(sessionDir, { recursive: true });
-        console.log(`[WAGOO WA] Pasta limpa para novo pareamento (${email})`);
+        log.step(WA, 'pasta limpa para novo pareamento', { email });
       }
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
+    log.info(WA, 'abrindo socket Baileys', { email, baileysVersion: version?.join?.('.') ?? version });
 
     const sock = makeWASocket({
       version,
@@ -325,41 +353,60 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
     const onSocketFailure = (err: unknown) => {
       if (!isBaileysCryptoError(err)) {
-        console.error(`[WAGOO WA] Erro socket (${email}):`, err);
+        log.error(WA, 'erro no websocket', err, { email });
         return;
       }
-      console.error(`[WAGOO WA] Crypto inválido (${email}) — limpando sessão.`);
+      log.error(WA, 'crypto inválido — limpando sessão', err, { email });
       void purgeWhatsAppSession(email, 'chaves de sessão corrompidas ou incompletas');
     };
 
     sock.ws?.on?.('error', onSocketFailure);
     sock.ws?.on?.('close', (code: number) => {
       if (code >= 1002) {
-        console.warn(`[WAGOO WA] WebSocket fechou (${email}) code=${code}`);
+        log.warn(WA, 'websocket fechou', { email, code });
       }
     });
 
     sock.ev.on('creds.update', async () => {
       await saveCreds();
+      const files = fs.existsSync(sessionDir)
+        ? fs.readdirSync(sessionDir).filter((n) => !n.startsWith('.')).length
+        : 0;
+      log.info(WA, 'creds.update', {
+        email,
+        diskFiles: files,
+        complete: sessionDirLooksComplete(sessionDir),
+      });
       schedulePersistWhatsAppSession(email, sessionDir);
     });
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
+      if (connection) {
+        log.step(WA, `connection=${connection}`, { email });
+      }
       if (qr) {
         try {
           const qrCodeImage = await qrcode.toDataURL(qr);
           pendingQrByEmail[email] = qrCodeImage;
-          if (res && !res.headersSent) {
-            res.status(200).json({ qrCode: qrCodeImage });
+          const sentToClient = !!(res && !res.headersSent);
+          if (sentToClient) {
+            res!.status(200).json({ qrCode: qrCodeImage });
           }
+          log.info(WA, 'QR gerado/atualizado', { email, sentToClient });
         } catch (qrErr) {
-          console.error(`[WAGOO WA] Falha ao gerar QR (${email}):`, qrErr);
+          log.error(WA, 'falha ao gerar imagem do QR', qrErr, { email });
         }
       }
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         const disconnectMsg = (lastDisconnect?.error as Error)?.message ?? '';
+        log.warn(WA, 'conexão fechada', {
+          email,
+          statusCode,
+          disconnectMsg,
+          completeOnDisk: sessionDirLooksComplete(sessionDir),
+        });
         if (sessions[email]) {
             sessions[email].ev.removeAllListeners();
             try { sessions[email].ws?.removeAllListeners?.(); } catch(e) {}
@@ -380,19 +427,17 @@ export async function startWhatsApp(email: string, res: Response | null) {
               : `logout (${statusCode ?? disconnectMsg})`,
           );
         } else if (sessionDirLooksComplete(sessionDir)) {
-          // Só auto-reconecta se a sessão já estiver completa (após pareamento OK).
+          log.step(WA, 'agendando reconnect em 5s', { email });
           setTimeout(() => {
             startWhatsApp(email, null).catch((err) => {
-              console.error(`[WAGOO WA] Falha ao reconectar ${email}:`, err);
+              log.error(WA, 'falha ao reconectar', err, { email });
             });
           }, 5000);
         } else {
-          console.warn(
-            `[WAGOO WA] Conexão fechou antes do pareamento (${email}). Gere o QR de novo no painel.`,
-          );
+          log.warn(WA, 'fechou antes do pareamento — usuário deve gerar QR de novo', { email });
         }
       } else if (connection === 'open') {
-        console.log(`✅ [ATIVO] Bot online para: ${email}`);
+        log.info(WA, 'BOT ONLINE', { email });
         delete pendingQrByEmail[email];
         pushAdminEvent('wagoo', `Bot WhatsApp conectado (${email})`, 'online');
         await persistWhatsAppSessionToSupabase(email, sessionDir);
@@ -436,7 +481,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
         }
 
         if (!activeSession) {
-            console.log(`🎯 [ATIVADO] Intenção detectada para ${cacheKey}.`);
+            log.info(WA, 'intenção de agendamento detectada', { cacheKey });
             memoryCache[cacheKey] = {
               lastUpdate: now,
               messages: [],
@@ -572,7 +617,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
               await supabase.from('profiles').update({ messages_answered: (p.messages_answered || 0) + 1 }).eq('email', email);
           } catch (sendError) {
-              console.error(`❌ Erro no envio para ${remoteJid}`);
+              log.error(WA, 'erro ao enviar resposta WhatsApp', sendError, { email, remoteJid });
           }
         }
 
@@ -666,34 +711,49 @@ export async function startWhatsApp(email: string, res: Response | null) {
                 }
             }
         }
-      } catch (err) { console.error("Erro Lucy:", err); }
+      } catch (err) {
+        log.error(WA, 'Erro no fluxo da IA / mensagem', err, { email });
+      }
       finally {
         finishMessageProcessing(dedupeKey);
       }
     });
   } catch (error) {
-    console.error('Erro startWhatsApp:', error);
+    log.error(WA, 'Erro startWhatsApp', error, { email });
     if (isBaileysCryptoError(error)) {
       await purgeWhatsAppSession(email, 'falha ao iniciar com credenciais inválidas');
+    }
+    if (res && !res.headersSent) {
+      res.status(500).json({ error: 'Falha ao iniciar WhatsApp. Veja os logs do Render.' });
     }
   }
 }
 
 export async function autoReconnectAll() {
-  const { data: profiles } = await supabase
+  log.step(WA, 'autoReconnectAll iniciado');
+  const { data: profiles, error } = await supabase
     .from('profiles')
     .select('email, has_paid, complimentary_access_until, is_ai_enabled')
     .eq('is_ai_enabled', true);
+
+  if (error) {
+    log.error(WA, 'autoReconnectAll — falha ao listar profiles', error);
+    return;
+  }
+
   const eligible = (profiles ?? []).filter((p) =>
     profileHasWagooAccess(p as { has_paid?: boolean; complimentary_access_until?: string | null }),
   );
+
+  log.info(WA, 'autoReconnectAll elegíveis', { total: eligible.length });
 
   for (const p of eligible) {
     try {
       await startWhatsApp(p.email, null);
     } catch (err) {
-      console.error(`[WAGOO WA] autoReconnect falhou (${p.email}):`, err);
+      log.error(WA, 'autoReconnect falhou', err, { email: p.email });
     }
     await new Promise((r) => setTimeout(r, 1500));
   }
+  log.step(WA, 'autoReconnectAll concluído');
 }

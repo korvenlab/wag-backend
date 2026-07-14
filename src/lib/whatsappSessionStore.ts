@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { supabase } from './supabase';
+import { log } from './logger';
 
 export const WHATSAPP_SESSION_BUNDLE_VERSION = 2;
 
@@ -126,9 +127,10 @@ export async function persistWhatsAppSessionToSupabase(
   // Pareamento ainda só tem creds.json — gravar isso no Supabase causa loop
   // (incompleto → purge → novo QR) e impede o scan concluir.
   if (!sessionDirLooksComplete(sessionDir)) {
-    console.log(
-      `[WAGOO WA] Persistência adiada (${email}): aguardando chaves Baileys (${Object.keys(bundle.files).length} ficheiros)`,
-    );
+    log.info('WA', 'persistência adiada — aguardando chaves Baileys', {
+      email,
+      files: Object.keys(bundle.files).length,
+    });
     return;
   }
 
@@ -138,13 +140,14 @@ export async function persistWhatsAppSessionToSupabase(
     .eq('email', email);
 
   if (error) {
-    console.error(`[WAGOO WA] Falha ao persistir sessão (${email}):`, error.message);
+    log.error('WA', 'falha ao persistir sessão no Supabase', error, { email });
     return;
   }
 
-  console.log(
-    `[WAGOO WA] Sessão persistida no Supabase (${email}, ${Object.keys(bundle.files).length} ficheiros)`,
-  );
+  log.info('WA', 'sessão persistida no Supabase', {
+    email,
+    files: Object.keys(bundle.files).length,
+  });
 }
 
 export async function clearWhatsAppSessionInSupabase(email: string): Promise<void> {
@@ -153,5 +156,10 @@ export async function clearWhatsAppSessionInSupabase(email: string): Promise<voi
     clearTimeout(pending);
     persistTimers.delete(email);
   }
-  await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
+  const { error } = await supabase.from('profiles').update({ whatsapp_session: null }).eq('email', email);
+  if (error) {
+    log.error('WA', 'falha ao limpar whatsapp_session no Supabase', error, { email });
+  } else {
+    log.info('WA', 'whatsapp_session limpa no Supabase', { email });
+  }
 }
