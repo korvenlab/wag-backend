@@ -78,11 +78,16 @@ export function getMaxBarbeirosSlots(tier: WagooSubscriptionTier | null): number
 }
 
 export function canManageTeam(tier: WagooSubscriptionTier | null): boolean {
-  return tier !== null;
+  return tier === 'pro' || tier === 'pro_plus';
 }
 
 export function tierSupportsMultiBarberAi(tier: WagooSubscriptionTier | null): boolean {
   return getMaxBarbeirosSlots(tier) > 1;
+}
+
+/** Lembretes WhatsApp antes do horário — só Pro e Pro+. */
+export function tierSupportsReminders(tier: WagooSubscriptionTier | null): boolean {
+  return tier === 'pro' || tier === 'pro_plus';
 }
 
 export function syncLegacyFlagsFromTier(tier: WagooSubscriptionTier | null): {

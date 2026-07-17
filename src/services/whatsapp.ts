@@ -43,6 +43,10 @@ import {
   isAskingProfessionalAvailability,
   isNegativeBooking,
 } from '../lib/dateTimeBR';
+import {
+  cancelAppointmentReminder,
+  enqueueAppointmentReminder,
+} from './reminders';
 import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
@@ -728,6 +732,9 @@ export async function startWhatsApp(email: string, res: Response | null) {
             if (event) {
                 const success = await deleteEvent(email, event.id);
                 if (success) {
+                    if (p.id && event.id) {
+                      await cancelAppointmentReminder(p.id as string, event.id);
+                    }
                     const eventDate = formatDateTimeBR(event.start.dateTime);
                     await sock.sendMessage(remoteJid, { 
                         text: `Agendamento de ${eventDate} cancelado.`
@@ -996,6 +1003,23 @@ export async function startWhatsApp(email: string, res: Response | null) {
                       date: bookingIso,
                       dateBR: formatDateTimeBR(bookingIso),
                       barber: finalBarberName,
+                      eventId: created.id,
+                    });
+                    await enqueueAppointmentReminder({
+                      profile: {
+                        id: p.id as string,
+                        email,
+                        reminders_enabled: p.reminders_enabled,
+                        remind_before_minutes: p.remind_before_minutes,
+                        subscription_tier: p.subscription_tier,
+                        has_paid: p.has_paid,
+                        multi_barber_plan: p.multi_barber_plan as boolean | null | undefined,
+                      },
+                      googleEventId: created.id,
+                      clientPhone,
+                      clientName,
+                      barberName: finalBarberName,
+                      startsAtIso: created.startIso || bookingIso,
                     });
                     memoryCache[cacheKey].scheduling!.pendingConfirmation = null;
                     const confirmDate = formatDateTimeBR(bookingIso);

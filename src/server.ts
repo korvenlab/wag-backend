@@ -12,11 +12,12 @@ import calendarRoutes from './routes/calendar';
 import pitchRemoteRoutes from './routes/pitchRemote';
 import { profileHasWagooAccess } from './lib/profileAccess';
 import { profileHasMultiBarberPlan, profileSubscriptionTier } from './lib/profileMultiBarber';
-import { getMaxBarbeirosSlots, WAGOO_PLANS } from './lib/wagooSubscription';
+import { getMaxBarbeirosSlots, WAGOO_PLANS, tierSupportsReminders } from './lib/wagooSubscription';
 import { countBarbeirosForUser } from './lib/barbeiros';
 import { syncCalendarShareSlug } from './lib/storeSlug';
 import { pushAdminEvent } from './services/adminEvents';
 import { startWhatsApp, autoReconnectAll, disconnectWhatsApp, installWhatsAppProcessSafetyNet } from './services/whatsapp';
+import { clampRemindBeforeMinutes, startReminderWorker } from './services/reminders';
 import { generateAuthUrl, getTokensFromCode } from './services/googleAuth';
 import { getUserFromBearerHeader } from './lib/supabaseAuthUser';
 import { supabase } from './lib/supabase';
@@ -228,6 +229,54 @@ app.post('/api/settings/hours', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+app.post('/api/settings/reminders', async (req: Request, res: Response) => {
+  const authed = await requireBearerUser(req, res);
+  if (!authed) return;
+
+  const { data: row, error: fetchErr } = await supabase
+    .from('profiles')
+    .select('subscription_tier, has_paid, multi_barber_plan')
+    .eq('id', authed.user.id)
+    .maybeSingle();
+
+  if (fetchErr) return res.status(500).json({ error: fetchErr.message });
+  if (!row) return res.status(404).json({ error: 'Perfil não encontrado' });
+
+  const tier = profileSubscriptionTier({
+    subscription_tier: row.subscription_tier,
+    has_paid: row.has_paid,
+    multi_barber_plan: row.multi_barber_plan,
+  });
+
+  if (!tierSupportsReminders(tier)) {
+    return res.status(403).json({
+      error: 'Lembretes estão disponíveis nos planos Pro e Pro+.',
+    });
+  }
+
+  const remindersEnabled = Boolean(
+    req.body.remindersEnabled ?? req.body.reminders_enabled,
+  );
+  const remindBeforeMinutes = clampRemindBeforeMinutes(
+    req.body.remindBeforeMinutes ?? req.body.remind_before_minutes,
+  );
+
+  const { error } = await supabase
+    .from('profiles')
+    .update({
+      reminders_enabled: remindersEnabled,
+      remind_before_minutes: remindBeforeMinutes,
+    })
+    .eq('id', authed.user.id);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({
+    ok: true,
+    reminders_enabled: remindersEnabled,
+    remind_before_minutes: remindBeforeMinutes,
+  });
+});
+
 app.post('/api/settings/store', async (req: Request, res: Response) => {
   const authed = await requireBearerUser(req, res);
   if (!authed) return;
@@ -355,4 +404,5 @@ app.listen(port, '0.0.0.0', () => {
   log.info('CORE', `API online na porta ${port}`);
   pushAdminEvent('core', `API Wagoo inicializada na porta ${port}`, 'online');
   autoReconnectAll().catch((err) => log.error('WA', 'Erro na reconexão automática', err));
+  startReminderWorker();
 });

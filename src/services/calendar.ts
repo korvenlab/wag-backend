@@ -159,6 +159,11 @@ export type CreateEventOptions = {
     barberEmail?: string | null;
 };
 
+export type CreateEventResult = {
+  id: string;
+  startIso: string;
+};
+
 export const createEvent = async (
     email: string,
     clientName: string,
@@ -166,10 +171,10 @@ export const createEvent = async (
     dateIso: string,
     durationMin: number = 30,
     options: CreateEventOptions = {},
-): Promise<boolean> => {
+): Promise<CreateEventResult | null> => {
     try {
         const calendar = await getOAuthClient(email);
-        if (!calendar) return false;
+        if (!calendar) return null;
 
         const start = parseISO(dateIso);
         const end = addMinutes(start, durationMin);
@@ -194,17 +199,23 @@ export const createEvent = async (
             requestBody.attendees = [{ email: options.barberEmail }];
         }
 
-        await calendar.events.insert({
+        const inserted = await calendar.events.insert({
             calendarId: 'primary',
             sendUpdates: options.barberEmail ? 'all' : 'none',
             requestBody,
         });
 
-        console.log(`✅ Evento criado: ${summary}`);
-        return true;
+        const eventId = inserted.data.id;
+        if (!eventId) {
+            console.error(`❌ Evento criado sem id para ${email}`);
+            return null;
+        }
+
+        console.log(`✅ Evento criado: ${summary} (${eventId})`);
+        return { id: eventId, startIso: start.toISOString() };
     } catch (error) {
         console.error(`❌ Erro ao criar evento para ${email}:`, error);
-        return false;
+        return null;
     }
 };
 

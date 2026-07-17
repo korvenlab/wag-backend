@@ -75,6 +75,14 @@ router.post('/', async (req: Request, res: Response) => {
     });
   }
 
+  if (!ctx.can_manage_team) {
+    return res.status(403).json({
+      error: 'upgrade_required',
+      message: 'Gerenciar equipe está disponível nos planos Pro e Pro+.',
+      subscription_tier: ctx.tier,
+    });
+  }
+
   if (ctx.used >= ctx.max) {
     const planName = ctx.plan_label ?? 'atual';
     return res.status(403).json({
