@@ -1642,7 +1642,7 @@ function generateWagooPromoCode(): string {
 }
 
 function wagooPublicBaseUrl(): string {
-  return (process.env.FRONTEND_URL || 'https://wagoobot.com').replace(/\/+$/, '');
+  return (process.env.FRONTEND_URL || 'https://wagobot.com').replace(/\/+$/, '');
 }
 
 /** Korven: lista links de cortesia Wagoo (`wagoo_promo_links`). */

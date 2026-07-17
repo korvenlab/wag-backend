@@ -33,6 +33,8 @@ installWhatsAppProcessSafetyNet();
 log.info('CORE', 'safety net WhatsApp instalado');
 
 const defaultOrigins = [
+  'https://wagobot.com',
+  'https://www.wagobot.com',
   'https://wagoobot.com',
   'https://www.wagoobot.com',
   'http://localhost:5173',
