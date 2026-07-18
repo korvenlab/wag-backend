@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 
 const router = Router();
 
-const VALUE_SLIDES = new Set(['mercado', 'concorrencia', 'margens', 'roadmap']);
+const VALUE_SLIDES = new Set(['mercado', 'concorrencia', 'margens', 'roadmap', 'fechamento']);
 const FLUXO_SCENES = new Set([
   'dor-cliente',
   'dor-negocio',
