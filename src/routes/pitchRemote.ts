@@ -3,6 +3,16 @@ import { Router, Request, Response } from 'express';
 const router = Router();
 
 const VALUE_SLIDES = new Set(['mercado', 'concorrencia', 'margens', 'roadmap']);
+const FLUXO_SCENES = new Set([
+  'dor-cliente',
+  'dor-negocio',
+  'canal',
+  'solucao',
+  'demo',
+  'setup',
+  'seguranca',
+  'outro',
+]);
 
 type PitchRemoteState = {
   mode: 'fluxo' | 'valores';
@@ -12,7 +22,7 @@ type PitchRemoteState = {
 
 let state: PitchRemoteState = {
   mode: 'fluxo',
-  slide: 'mercado',
+  slide: 'dor-cliente',
   updatedAt: Date.now(),
 };
 
@@ -21,8 +31,15 @@ function normalize(body: unknown): PitchRemoteState | null {
   const raw = body as Record<string, unknown>;
   const mode = raw.mode === 'valores' ? 'valores' : raw.mode === 'fluxo' ? 'fluxo' : null;
   if (!mode) return null;
-  const slideRaw = typeof raw.slide === 'string' ? raw.slide : 'mercado';
-  const slide = VALUE_SLIDES.has(slideRaw) ? slideRaw : 'mercado';
+
+  const slideRaw = typeof raw.slide === 'string' ? raw.slide.trim() : '';
+  let slide: string;
+  if (mode === 'valores') {
+    slide = VALUE_SLIDES.has(slideRaw) ? slideRaw : 'mercado';
+  } else {
+    slide = FLUXO_SCENES.has(slideRaw) ? slideRaw : 'dor-cliente';
+  }
+
   return { mode, slide, updatedAt: Date.now() };
 }
 
@@ -36,7 +53,10 @@ router.get('/remote', (_req: Request, res: Response) => {
 router.post('/remote', (req: Request, res: Response) => {
   const next = normalize(req.body);
   if (!next) {
-    return res.status(400).json({ error: 'Envie { mode: "fluxo"|"valores", slide?: string }.' });
+    return res.status(400).json({
+      error:
+        'Envie { mode: "fluxo"|"valores", slide?: string } (cena do fluxo ou slide de valor).',
+    });
   }
   state = next;
   res.json(state);
