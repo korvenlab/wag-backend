@@ -20,6 +20,8 @@ type PitchRemoteState = {
   updatedAt: number;
   /** Contador monotônico — clientes ignoram snapshots com rev menor. */
   rev: number;
+  /** Timestamp da intenção do cliente (last-write-wins contra POSTs fora de ordem). */
+  intentAt: number;
 };
 
 let rev = 0;
@@ -28,9 +30,12 @@ let state: PitchRemoteState = {
   slide: 'dor-cliente',
   updatedAt: Date.now(),
   rev: 0,
+  intentAt: 0,
 };
 
-function normalize(body: unknown): Omit<PitchRemoteState, 'updatedAt' | 'rev'> | null {
+function normalize(
+  body: unknown,
+): Omit<PitchRemoteState, 'updatedAt' | 'rev'> | null {
   if (!body || typeof body !== 'object') return null;
   const raw = body as Record<string, unknown>;
   const mode = raw.mode === 'valores' ? 'valores' : raw.mode === 'fluxo' ? 'fluxo' : null;
@@ -44,7 +49,12 @@ function normalize(body: unknown): Omit<PitchRemoteState, 'updatedAt' | 'rev'> |
     slide = FLUXO_SCENES.has(slideRaw) ? slideRaw : 'dor-cliente';
   }
 
-  return { mode, slide };
+  const intentAt =
+    typeof raw.intentAt === 'number' && Number.isFinite(raw.intentAt)
+      ? raw.intentAt
+      : Date.now();
+
+  return { mode, slide, intentAt };
 }
 
 /** Estado atual do controle remoto do pitch (público — só para apresentação). */
@@ -59,15 +69,33 @@ router.post('/remote', (req: Request, res: Response) => {
   if (!next) {
     return res.status(400).json({
       error:
-        'Envie { mode: "fluxo"|"valores", slide?: string } (cena do fluxo ou slide de valor).',
+        'Envie { mode: "fluxo"|"valores", slide?: string, intentAt?: number }.',
     });
   }
+
+  // POST atrasado / fora de ordem: mantém estado atual e devolve o canônico.
+  if (next.intentAt < state.intentAt) {
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json(state);
+  }
+
+  // Mesmo intent + mesmo slide: idempotente (não bumpa rev).
+  if (
+    next.intentAt === state.intentAt &&
+    next.mode === state.mode &&
+    next.slide === state.slide
+  ) {
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json(state);
+  }
+
   rev += 1;
   state = {
     ...next,
     updatedAt: Date.now(),
     rev,
   };
+  res.setHeader('Cache-Control', 'no-store');
   res.json(state);
 });
 
