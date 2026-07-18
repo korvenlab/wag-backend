@@ -18,15 +18,19 @@ type PitchRemoteState = {
   mode: 'fluxo' | 'valores';
   slide: string;
   updatedAt: number;
+  /** Contador monotônico — clientes ignoram snapshots com rev menor. */
+  rev: number;
 };
 
+let rev = 0;
 let state: PitchRemoteState = {
   mode: 'fluxo',
   slide: 'dor-cliente',
   updatedAt: Date.now(),
+  rev: 0,
 };
 
-function normalize(body: unknown): PitchRemoteState | null {
+function normalize(body: unknown): Omit<PitchRemoteState, 'updatedAt' | 'rev'> | null {
   if (!body || typeof body !== 'object') return null;
   const raw = body as Record<string, unknown>;
   const mode = raw.mode === 'valores' ? 'valores' : raw.mode === 'fluxo' ? 'fluxo' : null;
@@ -40,7 +44,7 @@ function normalize(body: unknown): PitchRemoteState | null {
     slide = FLUXO_SCENES.has(slideRaw) ? slideRaw : 'dor-cliente';
   }
 
-  return { mode, slide, updatedAt: Date.now() };
+  return { mode, slide };
 }
 
 /** Estado atual do controle remoto do pitch (público — só para apresentação). */
@@ -58,7 +62,12 @@ router.post('/remote', (req: Request, res: Response) => {
         'Envie { mode: "fluxo"|"valores", slide?: string } (cena do fluxo ou slide de valor).',
     });
   }
-  state = next;
+  rev += 1;
+  state = {
+    ...next,
+    updatedAt: Date.now(),
+    rev,
+  };
   res.json(state);
 });
 
