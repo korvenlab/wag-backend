@@ -751,6 +751,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
             response_templates: templates,
             is_first_reply: isFirstReply,
             time_greeting: openingGreeting,
+            ai_use_emojis: !!p.ai_use_emojis,
           },
           activeBarbeiros.map((b) => ({ id: b.id, nome: b.nome })),
           {

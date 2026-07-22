@@ -331,7 +331,10 @@ function periodOfHour(hour: number): DayPeriod {
 /**
  * Organiza horários livres por período, fácil de ler no WhatsApp:
  * Manhã: 08:00 / 09:00 / 10:00
+ *
  * Tarde: 13:00 / 14:00 / 15:00
+ *
+ * (linha em branco entre Manhã / Tarde / Noite)
  */
 export function formatAvailabilityByPeriod(
   slotStarts: dayjs.Dayjs[],
@@ -359,7 +362,7 @@ export function formatAvailabilityByPeriod(
     lines.push(`${period}: ${times}${extra}`);
   }
 
-  return lines.join('\n') || 'nenhum horário livre neste dia';
+  return lines.join('\n\n') || 'nenhum horário livre neste dia';
 }
 
 /**
@@ -376,6 +379,6 @@ export function formatAvailabilityWhatsAppMessage(
   if (options?.empty || /nenhum horário livre/i.test(periodBody)) {
     return `${prefix}${dayLabel} não há horários livres.\nQuer tentar outro dia?`;
   }
-  const cta = ask ? '\nQual horário prefere?' : '';
+  const cta = ask ? '\n\nQual horário prefere?' : '';
   return `${prefix}${dayLabel}:\n${periodBody}${cta}`;
 }

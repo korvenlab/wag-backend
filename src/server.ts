@@ -204,15 +204,26 @@ app.post('/api/settings/ai', async (req: Request, res: Response) => {
   const authed = await requireBearerUser(req, res);
   if (!authed) return;
 
-  const { aiEnabled, is_ai_enabled } = req.body;
-  const valueToSave = aiEnabled !== undefined ? aiEnabled : is_ai_enabled;
+  const { aiEnabled, is_ai_enabled, aiUseEmojis, ai_use_emojis } = req.body;
+  const patch: Record<string, boolean> = {};
+
+  if (aiEnabled !== undefined || is_ai_enabled !== undefined) {
+    patch.is_ai_enabled = aiEnabled !== undefined ? !!aiEnabled : !!is_ai_enabled;
+  }
+  if (aiUseEmojis !== undefined || ai_use_emojis !== undefined) {
+    patch.ai_use_emojis = aiUseEmojis !== undefined ? !!aiUseEmojis : !!ai_use_emojis;
+  }
+
+  if (Object.keys(patch).length === 0) {
+    return res.status(400).json({ error: 'Nada para atualizar.' });
+  }
 
   const { error } = await supabase
     .from('profiles')
-    .update({ is_ai_enabled: valueToSave })
+    .update(patch)
     .eq('id', authed.user.id);
   if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true });
+  res.json({ ok: true, ...patch });
 });
 
 app.post('/api/settings/hours', async (req: Request, res: Response) => {

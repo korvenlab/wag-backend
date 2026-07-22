@@ -164,6 +164,7 @@ export const analyzeMessage = async (
         response_templates?: ResponseTemplates | null,
         is_first_reply?: boolean,
         time_greeting?: string | null,
+        ai_use_emojis?: boolean,
     },
     activeBarbeiros: ActiveBarbeiroForAi[] = [],
     schedulingState: SchedulingBarberState = { barberConfirmed: false, selectedBarberName: null },
@@ -247,12 +248,19 @@ export const analyzeMessage = async (
 
         const freeRangesHint = dbRow.free_ranges_summary?.trim() || '';
         const templatesBlock = templatesPromptBlock(dbRow.response_templates ?? {});
+        const emojiBlock = dbRow.ai_use_emojis
+          ? `
+        EMOJIS: permitidos com moderação (no máximo 1 por mensagem, só se soar natural). Nunca em lista de horários.
+        `
+          : `
+        EMOJIS: proibidos. Não use nenhum emoji, emoticon ou símbolo decorativo.
+        `;
         const firstReplyBlock = dbRow.is_first_reply
           ? `
         PRIMEIRA MENSAGEM DA CONVERSA (obrigatório):
         - Comece de forma amigável com "${dbRow.time_greeting || 'Olá'}!" (conforme o horário atual em Brasília).
         - Depois continue a resposta útil (horários, pergunta, etc.).
-        - Ex.: "Boa noite!\\n\\nAmanhã:\\nManhã: 09:00 / 10:00\\nQual horário prefere?"
+        - Ex.: "Boa noite!\\n\\nAmanhã:\\nManhã: 09:00 / 10:00\\n\\nTarde: 14:00 / 15:00\\n\\nQual horário prefere?"
         `
           : `
         Continuação da conversa: NÃO repita Bom dia / Boa tarde / Boa noite — o cumprimento já foi dado.
@@ -268,6 +276,7 @@ export const analyzeMessage = async (
         - Nunca diga "barbeiro", "barbeiros" ou "barbearia" salvo se o nicho for barbearia.
         - Nunca invente outro tipo de negócio.
         ${templatesBlock}
+        ${emojiBlock}
         ${firstReplyBlock}
         ESTILO DO CAMPO "response" (obrigatório):
         - Cordial, humana e amigável — como secretária real no WhatsApp, nunca robótica ou de FAQ.
@@ -280,11 +289,13 @@ export const analyzeMessage = async (
         FIDELIDADE AO QUE O CLIENTE PEDIU (prioridade máxima):
         - Respeite SEMPRE o dia, horário, período (manhã/tarde/noite) e profissional que o cliente falou.
         - Nunca troque "amanhã" por "hoje", nem invente outro dia/hora sem o cliente pedir.
-        - Se LIVRES_RESUMO existir, PRESERVE o layout (dia + Manhã/Tarde/Noite em linhas separadas). Não amasse tudo numa frase.
+        - Se LIVRES_RESUMO existir, PRESERVE o layout (dia + Manhã/Tarde/Noite). Deixe UMA linha em branco entre Manhã, Tarde e Noite. Não amasse tudo numa frase.
         - Formato ideal ao listar vagas:
           Amanhã:
           Manhã: 08:00 / 09:00 / 10:00
+
           Tarde: 13:00 / 14:00 / 15:00
+
           Qual horário prefere?
         - Se o pedido não couber (sem vaga), diga isso no dia pedido e ofereça alternativa — sem fingir que era outro dia.
         - Uma pergunta por vez.
