@@ -162,6 +162,8 @@ export const analyzeMessage = async (
         business_niche_custom?: string | null,
         free_ranges_summary?: string | null,
         response_templates?: ResponseTemplates | null,
+        is_first_reply?: boolean,
+        time_greeting?: string | null,
     },
     activeBarbeiros: ActiveBarbeiroForAi[] = [],
     schedulingState: SchedulingBarberState = { barberConfirmed: false, selectedBarberName: null },
@@ -245,6 +247,16 @@ export const analyzeMessage = async (
 
         const freeRangesHint = dbRow.free_ranges_summary?.trim() || '';
         const templatesBlock = templatesPromptBlock(dbRow.response_templates ?? {});
+        const firstReplyBlock = dbRow.is_first_reply
+          ? `
+        PRIMEIRA MENSAGEM DA CONVERSA (obrigatório):
+        - Comece de forma amigável com "${dbRow.time_greeting || 'Olá'}!" (conforme o horário atual em Brasília).
+        - Depois continue a resposta útil (horários, pergunta, etc.).
+        - Ex.: "Boa noite!\\n\\nAmanhã:\\nManhã: 09:00 / 10:00\\nQual horário prefere?"
+        `
+          : `
+        Continuação da conversa: NÃO repita Bom dia / Boa tarde / Boa noite — o cumprimento já foi dado.
+        `;
 
         const prompt = `
         Você é o Wagoo, secretária virtual da "${storeLabel}" (${businessType}) no WhatsApp.
@@ -256,11 +268,12 @@ export const analyzeMessage = async (
         - Nunca diga "barbeiro", "barbeiros" ou "barbearia" salvo se o nicho for barbearia.
         - Nunca invente outro tipo de negócio.
         ${templatesBlock}
+        ${firstReplyBlock}
         ESTILO DO CAMPO "response" (obrigatório):
-        - Cordial, humana e natural — como secretária real no WhatsApp, nunca robótica ou de FAQ.
+        - Cordial, humana e amigável — como secretária real no WhatsApp, nunca robótica ou de FAQ.
         - Varie o jeito de falar a cada mensagem (sinônimos, ordem, ritmo); não repita a mesma fórmula.
-        - SEMPRE 1–2 frases curtas (ideal ≤160 caracteres; máximo ~220), mesmo se houver ESTILO DE CONVERSA DO DONO.
-        - Cordialidade enxuta: "Olá", "Por favor", "Obrigada" quando couber — sem bajulação.
+        - SEMPRE 1–2 frases curtas no corpo (ideal ≤160 caracteres; máximo ~220), além do cumprimento inicial se houver.
+        - Cordialidade enxuta: "Por favor", "Obrigada" quando couber — sem bajulação.
         - Proibido: elogios longos ("excelente profissional", "ótima escolha"), parágrafos, repetir o pedido do cliente.
         - Proibido: respostas que pareçam copiadas de um template ou menu.
 

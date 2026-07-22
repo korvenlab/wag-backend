@@ -37,9 +37,11 @@ import {
 import { supabase } from '../lib/supabase';
 import { log } from '../lib/logger';
 import {
+  ensureOpeningGreeting,
   formatAvailabilityWhatsAppMessage,
   formatDateTimeBR,
   formatHourCompact,
+  greetingForNowBR,
   isAffirmativeBooking,
   isAskingProfessionalAvailability,
   isNegativeBooking,
@@ -668,6 +670,10 @@ export async function startWhatsApp(email: string, res: Response | null) {
         }
 
         const schedulingState = memoryCache[cacheKey].scheduling!;
+        const isFirstReply = !(memoryCache[cacheKey].messages || []).some(
+          (m: { role?: string }) => m.role === 'assistant',
+        );
+        const openingGreeting = isFirstReply ? greetingForNowBR() : null;
 
         const currentHistory = memoryCache[cacheKey].messages.slice(-MAX_HISTORY);
         const formattedHistory = currentHistory
@@ -743,6 +749,8 @@ export async function startWhatsApp(email: string, res: Response | null) {
             business_niche_custom: p.business_niche_custom,
             free_ranges_summary: freeRangesLabeled || null,
             response_templates: templates,
+            is_first_reply: isFirstReply,
+            time_greeting: openingGreeting,
           },
           activeBarbeiros.map((b) => ({ id: b.id, nome: b.nome })),
           {
@@ -837,10 +845,12 @@ export async function startWhatsApp(email: string, res: Response | null) {
               barberRefs,
             );
             const timeLabel = formatHourCompact(slotIso);
-            const reply =
+            const reply = ensureOpeningGreeting(
               free.length > 0
                 ? `Às ${timeLabel} estão disponíveis: ${free.join(', ')}. Qual prefere?`
-                : `Às ${timeLabel} nenhum profissional está livre. Quer outro horário?`;
+                : `Às ${timeLabel} nenhum profissional está livre. Quer outro horário?`,
+              isFirstReply,
+            );
             log.info(WA, 'resposta de disponibilidade de profissionais', {
               email,
               slotIso,
@@ -856,9 +866,11 @@ export async function startWhatsApp(email: string, res: Response | null) {
           }
 
           const teamNames = activeBarbeiros.map((b) => b.nome).join(', ');
-          const reply =
+          const reply = ensureOpeningGreeting(
             aiResult.response?.trim() ||
-            `Temos: ${teamNames}. Qual horário e profissional prefere?`;
+              `Temos: ${teamNames}. Qual horário e profissional prefere?`,
+            isFirstReply,
+          );
           await sock.sendMessage(remoteJid, { text: reply });
           memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
           return;
@@ -895,9 +907,11 @@ export async function startWhatsApp(email: string, res: Response | null) {
           if (multiBarber && !memoryCache[cacheKey].scheduling?.barberConfirmed) {
             log.warn(WA, 'proposta sem profissional — pedindo escolha', { email });
             const teamNames = activeBarbeiros.map((b) => b.nome).join(', ');
-            const reply =
+            const reply = ensureOpeningGreeting(
               aiResult.response?.trim() ||
-              `Qual profissional prefere? ${teamNames}, ou Sem Preferência.`;
+                `Qual profissional prefere? ${teamNames}, ou Sem Preferência.`,
+              isFirstReply,
+            );
             await sock.sendMessage(remoteJid, { text: reply });
             memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
             return;
@@ -920,7 +934,10 @@ export async function startWhatsApp(email: string, res: Response | null) {
           const when = formatDateTimeBR(proposedIso);
           const profBit =
             multiBarber && pendingBarberName ? ` com ${pendingBarberName}` : '';
-          const reply = `Posso confirmar ${when}${profBit}? Responda *sim* para marcar.`;
+          const reply = ensureOpeningGreeting(
+            `Posso confirmar ${when}${profBit}? Responda *sim* para marcar.`,
+            isFirstReply,
+          );
           log.info(WA, 'aguardando confirmação do cliente', {
             email,
             proposedIso,
@@ -946,13 +963,17 @@ export async function startWhatsApp(email: string, res: Response | null) {
                 !!freeRangesSummary &&
                 !/nenhum horário livre/i.test(freeRangesSummary);
 
-              // Sempre usa layout organizado (Manhã/Tarde) para listar vagas — mais claro no WhatsApp.
               if (asksAvailability && hasUsefulRanges) {
-                text = formatAvailabilityWhatsAppMessage(dayLabel, freeRangesSummary);
+                text = formatAvailabilityWhatsAppMessage(dayLabel, freeRangesSummary, {
+                  greeting: openingGreeting,
+                });
               } else if (asksAvailability && !hasUsefulRanges) {
                 text = formatAvailabilityWhatsAppMessage(dayLabel, freeRangesSummary, {
                   empty: true,
+                  greeting: openingGreeting,
                 });
+              } else {
+                text = ensureOpeningGreeting(text, isFirstReply);
               }
               await sock.sendMessage(remoteJid, { text });
               memoryCache[cacheKey].messages.push({ role: 'assistant', content: text });

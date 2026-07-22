@@ -7,6 +7,35 @@ dayjs.extend(timezone);
 
 export const BR_TZ = 'America/Sao_Paulo';
 
+/** Cumprimento amigável conforme horário em Brasília. */
+export function greetingForNowBR(now: dayjs.Dayjs = dayjs().tz(BR_TZ)): string {
+  const h = now.hour();
+  if (h >= 5 && h < 12) return 'Bom dia';
+  if (h >= 12 && h < 18) return 'Boa tarde';
+  return 'Boa noite';
+}
+
+/**
+ * Na primeira resposta da conversa, garante Bom dia / Boa tarde / Boa noite no início.
+ * Não duplica se o texto já começar com cumprimento.
+ */
+export function ensureOpeningGreeting(
+  text: string,
+  isFirstReply: boolean,
+  now: dayjs.Dayjs = dayjs().tz(BR_TZ),
+): string {
+  const body = text.trim();
+  if (!body || !isFirstReply) return body;
+
+  const greeting = greetingForNowBR(now);
+  const already =
+    /^(bom\s+dia|boa\s+tarde|boa\s+noite)\b/i.test(body) ||
+    new RegExp(`^${greeting}\\b`, 'i').test(body);
+  if (already) return body;
+
+  return `${greeting}!\n\n${body}`;
+}
+
 /** Formata ISO/offset para data+hora no fuso do Brasil (Render roda em UTC). */
 export function formatDateTimeBR(
   value: string | Date,
@@ -339,12 +368,14 @@ export function formatAvailabilityByPeriod(
 export function formatAvailabilityWhatsAppMessage(
   dayLabel: string,
   periodBody: string,
-  options?: { askPreference?: boolean; empty?: boolean },
+  options?: { askPreference?: boolean; empty?: boolean; greeting?: string | null },
 ): string {
   const ask = options?.askPreference !== false;
+  const greet = options?.greeting?.trim();
+  const prefix = greet ? `${greet}!\n\n` : '';
   if (options?.empty || /nenhum horário livre/i.test(periodBody)) {
-    return `${dayLabel} não há horários livres.\nQuer tentar outro dia?`;
+    return `${prefix}${dayLabel} não há horários livres.\nQuer tentar outro dia?`;
   }
   const cta = ask ? '\nQual horário prefere?' : '';
-  return `${dayLabel}:\n${periodBody}${cta}`;
+  return `${prefix}${dayLabel}:\n${periodBody}${cta}`;
 }
