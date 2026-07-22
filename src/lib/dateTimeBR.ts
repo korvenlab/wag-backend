@@ -7,30 +7,82 @@ dayjs.extend(timezone);
 
 export const BR_TZ = 'America/Sao_Paulo';
 
+export type TimeGreeting = 'Bom dia' | 'Boa tarde' | 'Boa noite';
+
 /** Cumprimento amigável conforme horário em Brasília. */
-export function greetingForNowBR(now: dayjs.Dayjs = dayjs().tz(BR_TZ)): string {
+export function greetingForNowBR(now: dayjs.Dayjs = dayjs().tz(BR_TZ)): TimeGreeting {
   const h = now.hour();
   if (h >= 5 && h < 12) return 'Bom dia';
   if (h >= 12 && h < 18) return 'Boa tarde';
   return 'Boa noite';
 }
 
+function normalizeGreetingText(message: string): string {
+  return message
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .replace(/[!?.,;:~😊🙏👋]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /**
- * Na primeira resposta da conversa, garante Bom dia / Boa tarde / Boa noite no início.
+ * Detecta saudação do cliente e devolve o texto para retribuir.
+ * Bom dia/tarde/noite → mesmo cumprimento; oi/olá → Oi.
+ */
+export function detectUserGreeting(message: string): string | null {
+  const m = normalizeGreetingText(message);
+  if (!m) return null;
+  if (/\bbom\s+dia\b/.test(m)) return 'Bom dia';
+  if (/\bboa\s+tarde\b/.test(m)) return 'Boa tarde';
+  if (/\bboa\s+noite\b/.test(m)) return 'Boa noite';
+  if (/\b(oi+|oie+|ola+|eae|e\s*ai|hey|hello)\b/.test(m)) return 'Oi';
+  if (/\btudo\s+bem\b|\btd\s+bem\b|\bcomo\s+vai\b|\bcomo\s+esta\b/.test(m)) {
+    return 'Tudo bem';
+  }
+  return null;
+}
+
+/** @deprecated use detectUserGreeting */
+export function detectUserTimeGreeting(message: string): TimeGreeting | null {
+  const g = detectUserGreeting(message);
+  if (g === 'Bom dia' || g === 'Boa tarde' || g === 'Boa noite') return g;
+  return null;
+}
+
+/** Mensagem que é essencialmente só uma saudação (sem pedido de horário). */
+export function isPrimarilyGreeting(message: string): boolean {
+  if (!detectUserGreeting(message)) return false;
+  const m = normalizeGreetingText(message)
+    .replace(/\bbom\s+dia\b/g, ' ')
+    .replace(/\bboa\s+tarde\b/g, ' ')
+    .replace(/\bboa\s+noite\b/g, ' ')
+    .replace(/\b(oi+|oie+|ola+|eae|e\s*ai|hey|hello)\b/g, ' ')
+    .replace(/\btudo\s+bem\b|\btd\s+bem\b|\bcomo\s+vai\b|\bcomo\s+esta\b/g, ' ')
+    .replace(/\b(por\s+favor|pfv|pf|obrigad[oa]|valeu|e\s+ai)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return m.length === 0;
+}
+
+/**
+ * Garante cumprimento no início quando o cliente saudou ou é a 1ª resposta.
  * Não duplica se o texto já começar com cumprimento.
  */
 export function ensureOpeningGreeting(
   text: string,
-  isFirstReply: boolean,
+  shouldGreet: boolean,
   now: dayjs.Dayjs = dayjs().tz(BR_TZ),
+  preferredGreeting?: string | null,
 ): string {
   const body = text.trim();
-  if (!body || !isFirstReply) return body;
+  if (!body || !shouldGreet) return body;
 
-  const greeting = greetingForNowBR(now);
+  const greeting = (preferredGreeting?.trim() || greetingForNowBR(now)) as string;
   const already =
-    /^(bom\s+dia|boa\s+tarde|boa\s+noite)\b/i.test(body) ||
-    new RegExp(`^${greeting}\\b`, 'i').test(body);
+    /^(bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá]|tudo\s+bem)\b/i.test(body) ||
+    new RegExp(`^${greeting.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(body);
   if (already) return body;
 
   return `${greeting}!\n\n${body}`;

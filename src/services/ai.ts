@@ -163,6 +163,7 @@ export const analyzeMessage = async (
         free_ranges_summary?: string | null,
         response_templates?: ResponseTemplates | null,
         is_first_reply?: boolean,
+        should_greet?: boolean,
         time_greeting?: string | null,
         ai_use_emojis?: boolean,
     },
@@ -255,15 +256,15 @@ export const analyzeMessage = async (
           : `
         EMOJIS: proibidos. Não use nenhum emoji, emoticon ou símbolo decorativo.
         `;
-        const firstReplyBlock = dbRow.is_first_reply
+        const firstReplyBlock = dbRow.should_greet || dbRow.is_first_reply
           ? `
-        PRIMEIRA MENSAGEM DA CONVERSA (obrigatório):
-        - Comece de forma amigável com "${dbRow.time_greeting || 'Olá'}!" (conforme o horário atual em Brasília).
+        CUMPRIMENTO NESTA RESPOSTA (obrigatório — sempre retribuir):
+        - O cliente saudou OU é a primeira mensagem. SEMPRE comece retribuindo com "${dbRow.time_greeting || 'Olá'}!".
         - Depois continue a resposta útil (horários, pergunta, etc.).
-        - Ex.: "Boa noite!\\n\\nAmanhã:\\nManhã: 09:00 / 10:00\\n\\nTarde: 14:00 / 15:00\\n\\nQual horário prefere?"
+        - Ex.: "Boa noite!\\n\\nAmanhã:\\nManhã: 09:00 / 10:00\\n\\nQual horário prefere?"
         `
           : `
-        Continuação da conversa: NÃO repita Bom dia / Boa tarde / Boa noite — o cumprimento já foi dado.
+        Continuação: NÃO cumprimente de novo — só retribuir se o cliente saudar (Bom dia/Boa tarde/Boa noite/Oi).
         `;
 
         const prompt = `

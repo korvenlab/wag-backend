@@ -37,6 +37,7 @@ import {
 import { supabase } from '../lib/supabase';
 import { log } from '../lib/logger';
 import {
+  detectUserGreeting,
   ensureOpeningGreeting,
   formatAvailabilityWhatsAppMessage,
   formatDateTimeBR,
@@ -45,6 +46,7 @@ import {
   isAffirmativeBooking,
   isAskingProfessionalAvailability,
   isNegativeBooking,
+  isPrimarilyGreeting,
   resolveAvailabilityDayFromThread,
   startOfDayBR,
 } from '../lib/dateTimeBR';
@@ -620,12 +622,15 @@ export async function startWhatsApp(email: string, res: Response | null) {
         const isExpired = sessionExists && (now - memoryCache[cacheKey].lastUpdate > SESSION_EXPIRATION);
         const activeSession = sessionExists && !isExpired;
 
-        if (!activeSession && !hasSchedulingIntent(textMessage)) {
+        const userGreetingEarly = detectUserGreeting(textMessage);
+        if (!activeSession && !hasSchedulingIntent(textMessage) && !userGreetingEarly) {
             return; 
         }
 
         if (!activeSession) {
-            log.info(WA, 'intenção de agendamento detectada', { cacheKey });
+            log.info(WA, userGreetingEarly && !hasSchedulingIntent(textMessage)
+              ? 'saudação detectada — abrindo conversa'
+              : 'intenção de agendamento detectada', { cacheKey });
             memoryCache[cacheKey] = {
               lastUpdate: now,
               messages: [],
@@ -673,7 +678,24 @@ export async function startWhatsApp(email: string, res: Response | null) {
         const isFirstReply = !(memoryCache[cacheKey].messages || []).some(
           (m: { role?: string }) => m.role === 'assistant',
         );
-        const openingGreeting = isFirstReply ? greetingForNowBR() : null;
+        const userGreeting = userGreetingEarly || detectUserGreeting(textMessage);
+        const shouldGreet = isFirstReply || !!userGreeting;
+        const openingGreeting = shouldGreet
+          ? userGreeting || greetingForNowBR()
+          : null;
+
+        // Só saudação → retribuir na hora (sem chamar a IA).
+        if (userGreeting && isPrimarilyGreeting(textMessage)) {
+          const reply = `${userGreeting}! Em que posso ajudar?`;
+          log.info(WA, 'retribuindo saudação', { email, greeting: userGreeting });
+          await sock.sendMessage(remoteJid, { text: reply });
+          memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+          await supabase
+            .from('profiles')
+            .update({ messages_answered: (p.messages_answered || 0) + 1 })
+            .eq('email', email);
+          return;
+        }
 
         const currentHistory = memoryCache[cacheKey].messages.slice(-MAX_HISTORY);
         const formattedHistory = currentHistory
@@ -750,6 +772,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
             free_ranges_summary: freeRangesLabeled || null,
             response_templates: templates,
             is_first_reply: isFirstReply,
+            should_greet: shouldGreet,
             time_greeting: openingGreeting,
             ai_use_emojis: !!p.ai_use_emojis,
           },
@@ -850,7 +873,9 @@ export async function startWhatsApp(email: string, res: Response | null) {
               free.length > 0
                 ? `Às ${timeLabel} estão disponíveis: ${free.join(', ')}. Qual prefere?`
                 : `Às ${timeLabel} nenhum profissional está livre. Quer outro horário?`,
-              isFirstReply,
+              shouldGreet,
+              undefined,
+              openingGreeting,
             );
             log.info(WA, 'resposta de disponibilidade de profissionais', {
               email,
@@ -870,7 +895,9 @@ export async function startWhatsApp(email: string, res: Response | null) {
           const reply = ensureOpeningGreeting(
             aiResult.response?.trim() ||
               `Temos: ${teamNames}. Qual horário e profissional prefere?`,
-            isFirstReply,
+            shouldGreet,
+            undefined,
+            openingGreeting,
           );
           await sock.sendMessage(remoteJid, { text: reply });
           memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
@@ -911,7 +938,9 @@ export async function startWhatsApp(email: string, res: Response | null) {
             const reply = ensureOpeningGreeting(
               aiResult.response?.trim() ||
                 `Qual profissional prefere? ${teamNames}, ou Sem Preferência.`,
-              isFirstReply,
+              shouldGreet,
+              undefined,
+              openingGreeting,
             );
             await sock.sendMessage(remoteJid, { text: reply });
             memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
@@ -937,7 +966,9 @@ export async function startWhatsApp(email: string, res: Response | null) {
             multiBarber && pendingBarberName ? ` com ${pendingBarberName}` : '';
           const reply = ensureOpeningGreeting(
             `Posso confirmar ${when}${profBit}? Responda *sim* para marcar.`,
-            isFirstReply,
+            shouldGreet,
+            undefined,
+            openingGreeting,
           );
           log.info(WA, 'aguardando confirmação do cliente', {
             email,
@@ -974,7 +1005,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
                   greeting: openingGreeting,
                 });
               } else {
-                text = ensureOpeningGreeting(text, isFirstReply);
+                text = ensureOpeningGreeting(text, shouldGreet, undefined, openingGreeting);
               }
               await sock.sendMessage(remoteJid, { text });
               memoryCache[cacheKey].messages.push({ role: 'assistant', content: text });
@@ -987,6 +1018,19 @@ export async function startWhatsApp(email: string, res: Response | null) {
           } catch (sendError) {
               log.error(WA, 'erro ao enviar resposta WhatsApp', sendError, { email, remoteJid });
           }
+        } else if (shouldGreet && !willCreateAppointment && !proposedIso) {
+          const reply = ensureOpeningGreeting(
+            'Em que posso ajudar?',
+            true,
+            undefined,
+            openingGreeting,
+          );
+          await sock.sendMessage(remoteJid, { text: reply });
+          memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+          await supabase
+            .from('profiles')
+            .update({ messages_answered: (p.messages_answered || 0) + 1 })
+            .eq('email', email);
         }
 
         // --- 🎯 AGENDAMENTO (só após sim) ---
