@@ -58,11 +58,14 @@ export function templatesPromptBlock(templates: ResponseTemplates): string {
 
         REGRAS OBRIGATÓRIAS SOBRE ESSE ESTILO:
         - Use só como direção de tom, carinho e personalidade — NUNCA copie o texto literal.
-        - Cada resposta deve parecer improvisada por uma pessoa real: varíe palavras, ordem e comprimento.
+        - Cada resposta deve parecer improvisada por uma pessoa real: varíe palavras e ordem.
         - Evite soar robótica, repetitiva ou "de formulário".
         - Adapte ao contexto da mensagem do cliente (histórico, humor, urgência).
         - Pode misturar informalidade leve se o dono pedir; mantenha educação e clareza.
-        - Continue curto (1–2 frases), mas natural — como secretária no WhatsApp, não como FAQ.
+        - LIMITE RÍGIDO DE TAMANHO (mesmo com estilo personalizado): no máximo 1–2 frases curtas
+          (ideal ≤160 caracteres; máximo ~220). O estilo muda o JEITO de falar, NÃO o comprimento.
+        - Proibido: textos longos, vários parágrafos ou "ensaios" por causa do estilo do dono.
+        - Natural e curto — como secretária no WhatsApp, não como FAQ nem carta.
         `;
 }
 

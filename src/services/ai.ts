@@ -259,8 +259,7 @@ export const analyzeMessage = async (
         ESTILO DO CAMPO "response" (obrigatório):
         - Cordial, humana e natural — como secretária real no WhatsApp, nunca robótica ou de FAQ.
         - Varie o jeito de falar a cada mensagem (sinônimos, ordem, ritmo); não repita a mesma fórmula.
-        - Mínimo de caracteres: directo ao ponto, sem rodeios nem repetições.
-        - Ideal: 1–2 frases curtas (≤160 caracteres; máximo ~220).
+        - SEMPRE 1–2 frases curtas (ideal ≤160 caracteres; máximo ~220), mesmo se houver ESTILO DE CONVERSA DO DONO.
         - Cordialidade enxuta: "Olá", "Por favor", "Obrigada" quando couber — sem bajulação.
         - Proibido: elogios longos ("excelente profissional", "ótima escolha"), parágrafos, repetir o pedido do cliente.
         - Proibido: respostas que pareçam copiadas de um template ou menu.
