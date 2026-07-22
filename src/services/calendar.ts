@@ -5,8 +5,8 @@ import { supabase } from '../lib/supabase';
 import { formatTimeBR } from '../lib/dateTimeBR';
 import {
   BR_TZ,
-  collapseSlotsToRanges,
   dayWindowsFromWorkingHours,
+  formatAvailabilityByPeriod,
   startOfDayBR,
 } from '../lib/dateTimeBR';
 import dayjs from 'dayjs';
@@ -479,8 +479,8 @@ export async function listFreeBarbersAtSlot(
 }
 
 /**
- * Resume horários livres do dia em intervalos (ex.: "9h–11h30, 14h–17h").
- * Usa working_hours + eventos ocupados (+ profissional no multi).
+ * Resume horários livres do dia por período (Manhã / Tarde / Noite),
+ * fácil de ler no WhatsApp.
  */
 export async function buildFreeRangesSummary(
     email: string,
@@ -555,7 +555,7 @@ export async function buildFreeRangesSummary(
     }
 
     if (!freeStarts.length) return 'nenhum horário livre neste dia';
-    return collapseSlotsToRanges(freeStarts, step);
+    return formatAvailabilityByPeriod(freeStarts);
 }
 
 const DEFAULT_DAY_START_H = 8;

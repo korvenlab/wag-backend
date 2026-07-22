@@ -37,6 +37,7 @@ import {
 import { supabase } from '../lib/supabase';
 import { log } from '../lib/logger';
 import {
+  formatAvailabilityWhatsAppMessage,
   formatDateTimeBR,
   formatHourCompact,
   isAffirmativeBooking,
@@ -725,7 +726,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
         );
         const freeRangesLabeled =
           freeRangesSummary && !/nenhum horário livre/i.test(freeRangesSummary)
-            ? `${dayLabel}: ${freeRangesSummary}`
+            ? `${dayLabel}:\n${freeRangesSummary}`
             : freeRangesSummary;
 
         const aiResult = await analyzeMessage(
@@ -938,23 +939,20 @@ export async function startWhatsApp(email: string, res: Response | null) {
           try {
               let text = aiResult.response;
               const asksAvailability =
-                /horario|horário|disponiv|livre|hoje|amanh/i.test(textMessage) &&
-                !isAskingProfessionalAvailability(textMessage);
+                /horario|horário|disponiv|livre|hoje|amanh|agendar|marcar|corte|vaga/i.test(
+                  textMessage,
+                ) && !isAskingProfessionalAvailability(textMessage);
               const hasUsefulRanges =
                 !!freeRangesSummary &&
                 !/nenhum horário livre/i.test(freeRangesSummary);
 
-              const aiMentionsWrongToday =
-                requestedDay.explicit &&
-                dayLabel !== 'Hoje' &&
-                /\bhoje\b/i.test(text) &&
-                !new RegExp(dayLabel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(text);
-              const aiMissingRanges = !/[–-]/.test(text);
-
-              if (asksAvailability && hasUsefulRanges && (aiMissingRanges || aiMentionsWrongToday)) {
-                text = `${dayLabel}: ${freeRangesSummary}. Qual horário prefere?`;
+              // Sempre usa layout organizado (Manhã/Tarde) para listar vagas — mais claro no WhatsApp.
+              if (asksAvailability && hasUsefulRanges) {
+                text = formatAvailabilityWhatsAppMessage(dayLabel, freeRangesSummary);
               } else if (asksAvailability && !hasUsefulRanges) {
-                text = `${dayLabel} não há horários livres. Quer tentar outro dia?`;
+                text = formatAvailabilityWhatsAppMessage(dayLabel, freeRangesSummary, {
+                  empty: true,
+                });
               }
               await sock.sendMessage(remoteJid, { text });
               memoryCache[cacheKey].messages.push({ role: 'assistant', content: text });

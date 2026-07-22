@@ -284,3 +284,67 @@ export function collapseSlotsToRanges(
     .map((r) => `${formatHourCompact(r.from)}–${formatHourCompact(r.to)}`)
     .join(', ');
 }
+
+/** HH:mm (ex.: 08:00, 14:30) — legível no WhatsApp. */
+export function formatHourClock(value: string | Date | dayjs.Dayjs): string {
+  const d = dayjs.isDayjs(value) ? value.tz(BR_TZ) : dayjs(value).tz(BR_TZ);
+  return d.format('HH:mm');
+}
+
+type DayPeriod = 'Manhã' | 'Tarde' | 'Noite';
+
+function periodOfHour(hour: number): DayPeriod {
+  if (hour < 12) return 'Manhã';
+  if (hour < 18) return 'Tarde';
+  return 'Noite';
+}
+
+/**
+ * Organiza horários livres por período, fácil de ler no WhatsApp:
+ * Manhã: 08:00 / 09:00 / 10:00
+ * Tarde: 13:00 / 14:00 / 15:00
+ */
+export function formatAvailabilityByPeriod(
+  slotStarts: dayjs.Dayjs[],
+  maxPerPeriod = 6,
+): string {
+  if (!slotStarts.length) return 'nenhum horário livre neste dia';
+
+  const buckets: Record<DayPeriod, dayjs.Dayjs[]> = {
+    Manhã: [],
+    Tarde: [],
+    Noite: [],
+  };
+
+  for (const s of slotStarts) {
+    buckets[periodOfHour(s.tz(BR_TZ).hour())].push(s);
+  }
+
+  const lines: string[] = [];
+  for (const period of ['Manhã', 'Tarde', 'Noite'] as DayPeriod[]) {
+    const slots = buckets[period];
+    if (!slots.length) continue;
+    const shown = slots.slice(0, maxPerPeriod);
+    const times = shown.map((s) => formatHourClock(s)).join(' / ');
+    const extra = slots.length > maxPerPeriod ? ' …' : '';
+    lines.push(`${period}: ${times}${extra}`);
+  }
+
+  return lines.join('\n') || 'nenhum horário livre neste dia';
+}
+
+/**
+ * Mensagem completa de disponibilidade (rótulo do dia + períodos + CTA).
+ */
+export function formatAvailabilityWhatsAppMessage(
+  dayLabel: string,
+  periodBody: string,
+  options?: { askPreference?: boolean; empty?: boolean },
+): string {
+  const ask = options?.askPreference !== false;
+  if (options?.empty || /nenhum horário livre/i.test(periodBody)) {
+    return `${dayLabel} não há horários livres.\nQuer tentar outro dia?`;
+  }
+  const cta = ask ? '\nQual horário prefere?' : '';
+  return `${dayLabel}:\n${periodBody}${cta}`;
+}

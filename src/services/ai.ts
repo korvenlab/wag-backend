@@ -228,13 +228,13 @@ export const analyzeMessage = async (
         6. barberSelection = nome exacto ou SEM_PREFERENCIA; barberConfirmed=true só após escolha explícita.
         7. Se o cliente pergunta "qual ${professional} está disponível" num horário: isScheduling=false, liste quem está livre (use OCUPADOS) e peça a escolha — NÃO confirme marcação.
         8. Nunca marque sozinho: o sistema pede "Posso confirmar…?" e só agenda após o cliente dizer sim.
-        9. Ao listar horários, USE o campo LIVRES_RESUMO (intervalos). Ex.: "Hoje: 9h–11h30 e 14h–17h. Qual prefere?"
+        9. Ao listar horários, USE o campo LIVRES_RESUMO (Manhã/Tarde/Noite). Preserve as quebras de linha.
         10. isScheduling=true SÓ quando o cliente confirmar uma proposta já feita (sim/confirma/pode marcar).
         `
             : `
         CENÁRIO A — UM PROFISSIONAL${singleBarberName ? ` (${singleBarberName})` : ''}:
         - Não pergunte ${professional} nem liste equipe.
-        - Vá directo a dia/horário disponível (use LIVRES_RESUMO em intervalos).
+        - Vá directo a dia/horário disponível (use LIVRES_RESUMO com Manhã/Tarde/Noite).
         - barberConfirmed=true com intenção de agendar; barberSelection=null.
         - Nunca marque sozinho — sempre peça confirmação; isScheduling=true só após o "sim".
         `;
@@ -267,14 +267,18 @@ export const analyzeMessage = async (
         FIDELIDADE AO QUE O CLIENTE PEDIU (prioridade máxima):
         - Respeite SEMPRE o dia, horário, período (manhã/tarde/noite) e profissional que o cliente falou.
         - Nunca troque "amanhã" por "hoje", nem invente outro dia/hora sem o cliente pedir.
-        - Se LIVRES_RESUMO existir, use exatamente o rótulo do dia dele (Hoje/Amanhã/DD/MM/Segunda…) e os intervalos.
+        - Se LIVRES_RESUMO existir, PRESERVE o layout (dia + Manhã/Tarde/Noite em linhas separadas). Não amasse tudo numa frase.
+        - Formato ideal ao listar vagas:
+          Amanhã:
+          Manhã: 08:00 / 09:00 / 10:00
+          Tarde: 13:00 / 14:00 / 15:00
+          Qual horário prefere?
         - Se o pedido não couber (sem vaga), diga isso no dia pedido e ofereça alternativa — sem fingir que era outro dia.
-        - Horários: SEMPRE em intervalos quando listar vagos (ex: "9h–11h30 e 14h–17h"). NÃO liste de 30 em 30 min.
         - Uma pergunta por vez.
         - NUNCA escreva "Confirmado:" — o sistema confirma depois do "sim" do cliente.
         - Quando o cliente escolher um horário, peça confirmação de forma natural no dia certo (ex.: "Posso marcar amanhã às 15h?").
         - isScheduling=true SOMENTE se o cliente já afirmou (sim/confirma/pode marcar) sobre uma proposta.
-        - Exemplos de tom (não copie literalmente): "Amanhã: 9h–12h e 14h–17h. Qual encaixa?" | "Fecho amanhã às 15h então?" | "Temos o Marcos e o Robson — prefere algum?"
+        - Exemplos de tom (não copie literalmente): "Amanhã de manhã tem 9h e 10h — qual prefere?" | "Fecho amanhã às 15h então?" | "Temos o Marcos e o Robson — prefere algum?"
 
         EXTRAÇÃO:
         - DATA (YYYY-MM-DD) e HORA (HH:mm) quando o cliente escolher um horário (mesmo antes do sim final).
@@ -283,7 +287,7 @@ export const analyzeMessage = async (
         - Horários abaixo já estão em Brasília.
 
         OCUPADOS: ${busyContext}
-        LIVRES_RESUMO: ${freeRangesHint || 'calcule com HORÁRIOS LOJA − OCUPADOS, em intervalos'}
+        LIVRES_RESUMO: ${freeRangesHint || 'calcule com HORÁRIOS LOJA − OCUPADOS, agrupando Manhã/Tarde/Noite'}
         HORÁRIOS LOJA: ${JSON.stringify(dbRow.working_hours ?? {})}
         ${teamBlock}
 
