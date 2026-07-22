@@ -42,6 +42,8 @@ import {
   isAffirmativeBooking,
   isAskingProfessionalAvailability,
   isNegativeBooking,
+  resolveAvailabilityDayFromMessage,
+  startOfDayBR,
 } from '../lib/dateTimeBR';
 import {
   cancelAppointmentReminder,
@@ -678,8 +680,11 @@ export async function startWhatsApp(email: string, res: Response | null) {
           nome: b.nome,
           google_calendar_email: b.google_calendar_email,
         }));
-        const dayIsoForRanges = dayjs().tz('America/Sao_Paulo').format('YYYY-MM-DD');
-        let busySlots = await getSchedulingBusyContext(email, new Date().toISOString(), {
+        const requestedDay = resolveAvailabilityDayFromMessage(textMessage);
+        const dayIsoForRanges = requestedDay.dayIso;
+        const dayLabel = requestedDay.label;
+        const dayStartIso = startOfDayBR(dayIsoForRanges).toISOString();
+        let busySlots = await getSchedulingBusyContext(email, dayStartIso, {
           multiBarber,
           barberName: semPreferencia ? null : schedForBusy.selectedBarberName,
           semPreferencia,
@@ -688,7 +693,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
         if (multiBarber && semPreferencia && schedForBusy.barberConfirmed) {
           const hints = await buildSemPreferenciaHintsForAi(
             email,
-            new Date().toISOString(),
+            dayStartIso,
             p.service_duration ?? 30,
             barberRefs,
           );
@@ -714,6 +719,10 @@ export async function startWhatsApp(email: string, res: Response | null) {
             barbers: barberRefs,
           },
         );
+        const freeRangesLabeled =
+          freeRangesSummary && !/nenhum horário livre/i.test(freeRangesSummary)
+            ? `${dayLabel}: ${freeRangesSummary}`
+            : freeRangesSummary;
 
         const aiResult = await analyzeMessage(
           formattedHistory,
@@ -727,7 +736,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
             service_duration: p.service_duration,
             business_niche: p.business_niche,
             business_niche_custom: p.business_niche_custom,
-            free_ranges_summary: freeRangesSummary || null,
+            free_ranges_summary: freeRangesLabeled || null,
             response_templates: templates,
           },
           activeBarbeiros.map((b) => ({ id: b.id, nome: b.nome })),
@@ -932,11 +941,9 @@ export async function startWhatsApp(email: string, res: Response | null) {
                 !/nenhum horário livre/i.test(freeRangesSummary);
 
               if (asksAvailability && hasUsefulRanges && !/[–-]/.test(text)) {
-                text = `Hoje: ${freeRangesSummary}. Qual horário prefere?`;
+                text = `${dayLabel}: ${freeRangesSummary}. Qual horário prefere?`;
               } else if (asksAvailability && !hasUsefulRanges) {
-                text = multiBarber
-                  ? 'Hoje não há horários livres. Quer tentar outro dia?'
-                  : 'Hoje não há horários livres. Quer tentar outro dia?';
+                text = `${dayLabel} não há horários livres. Quer tentar outro dia?`;
               }
               await sock.sendMessage(remoteJid, { text });
               memoryCache[cacheKey].messages.push({ role: 'assistant', content: text });

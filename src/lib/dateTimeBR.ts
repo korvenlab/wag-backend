@@ -59,6 +59,66 @@ export function isNegativeBooking(message: string): boolean {
   );
 }
 
+export type AvailabilityDayRequest = {
+  /** YYYY-MM-DD em America/Sao_Paulo */
+  dayIso: string;
+  /** Rótulo curto para resposta: Hoje | Amanhã | DD/MM */
+  label: string;
+};
+
+/**
+ * Interpreta o dia pedido na mensagem (hoje / amanhã / DD/MM).
+ * Sem menção explícita → hoje (padrão ao listar disponibilidade).
+ */
+export function resolveAvailabilityDayFromMessage(
+  message: string,
+  now: dayjs.Dayjs = dayjs().tz(BR_TZ),
+): AvailabilityDayRequest {
+  const m = message.toLowerCase().normalize('NFD').replace(/\p{M}/gu, '');
+  const today = now.startOf('day');
+
+  if (/\bdepois\s+de\s+amanha\b/.test(m)) {
+    const day = today.add(2, 'day');
+    return { dayIso: day.format('YYYY-MM-DD'), label: day.format('DD/MM') };
+  }
+
+  if (/\bamanha\b/.test(m)) {
+    const day = today.add(1, 'day');
+    return { dayIso: day.format('YYYY-MM-DD'), label: 'Amanhã' };
+  }
+
+  if (/\bhoje\b/.test(m)) {
+    return { dayIso: today.format('YYYY-MM-DD'), label: 'Hoje' };
+  }
+
+  const dm = m.match(/\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b/);
+  if (dm) {
+    const dd = Number(dm[1]);
+    const mm = Number(dm[2]);
+    let yyyy = dm[3] ? Number(dm[3]) : today.year();
+    if (yyyy < 100) yyyy += 2000;
+    const parsed = dayjs.tz(
+      `${yyyy}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`,
+      'YYYY-MM-DD',
+      BR_TZ,
+    );
+    if (parsed.isValid() && parsed.date() === dd && parsed.month() + 1 === mm) {
+      let day = parsed.startOf('day');
+      if (!dm[3] && day.isBefore(today, 'day')) {
+        day = day.add(1, 'year');
+      }
+      const label = day.isSame(today, 'day')
+        ? 'Hoje'
+        : day.isSame(today.add(1, 'day'), 'day')
+          ? 'Amanhã'
+          : day.format('DD/MM');
+      return { dayIso: day.format('YYYY-MM-DD'), label };
+    }
+  }
+
+  return { dayIso: today.format('YYYY-MM-DD'), label: 'Hoje' };
+}
+
 /**
  * Confirmação explícita de horário (não só menção genérica).
  * Ex.: "pode ser 9h", "quero as 14h", "confirma 16h".

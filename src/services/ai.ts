@@ -264,7 +264,8 @@ export const analyzeMessage = async (
         - Proibido: elogios longos ("excelente profissional", "ótima escolha"), parágrafos, repetir o pedido do cliente.
         - Proibido: respostas que pareçam copiadas de um template ou menu.
         - Horários: SEMPRE em intervalos quando listar vagos (ex: "9h–11h30 e 14h–17h"). NÃO liste de 30 em 30 min.
-        - Use LIVRES_RESUMO quando existir — copie/adapte, não invente horários fora disso.
+        - Use LIVRES_RESUMO quando existir — copie o rótulo do dia (Hoje/Amanhã/DD/MM) e os intervalos; NÃO troque o dia pedido pelo cliente.
+        - Se o cliente pediu "amanhã", responda com Amanhã (nunca diga Hoje). Se pediu "hoje", use Hoje.
         - Uma pergunta por vez.
         - NUNCA escreva "Confirmado:" — o sistema confirma depois do "sim" do cliente.
         - Quando o cliente escolher um horário, peça confirmação de forma natural (ex.: "Posso marcar DD/MM às HHh pra você?").
