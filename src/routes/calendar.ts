@@ -2,8 +2,10 @@ import { Router, Request, Response } from 'express';
 import { supabase } from '../lib/supabase';
 import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 import { profileHasWagooAccess } from '../lib/profileAccess';
+import { profileSubscriptionTier } from '../lib/profileMultiBarber';
 import { listAllBarbeirosForUser } from '../lib/barbeiros';
 import { syncCalendarShareSlug } from '../lib/storeSlug';
+import { tierSupportsCsvExport } from '../lib/wagooSubscription';
 import { listCalendarEvents, type CalendarEventDto } from '../services/calendar';
 
 const router = Router();
@@ -14,6 +16,40 @@ function frontendBaseUrl(): string {
 
 function publicShareUrl(slug: string): string {
   return `${frontendBaseUrl()}/calendario/publico/${encodeURIComponent(slug)}`;
+}
+
+function csvEscape(value: string): string {
+  if (/[",\n\r]/.test(value)) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
+}
+
+function eventsToCsv(events: CalendarEventDto[]): string {
+  const header = [
+    'data_inicio',
+    'data_fim',
+    'cliente',
+    'telefone',
+    'profissional',
+    'titulo',
+    'origem',
+  ];
+  const lines = [header.join(',')];
+  for (const ev of events) {
+    lines.push(
+      [
+        csvEscape(ev.start),
+        csvEscape(ev.end),
+        csvEscape(ev.clientName ?? ''),
+        csvEscape(ev.clientPhone ?? ''),
+        csvEscape(ev.barberName ?? ''),
+        csvEscape(ev.summary),
+        csvEscape(ev.source),
+      ].join(','),
+    );
+  }
+  return lines.join('\n');
 }
 
 function filterEventsByBarber(
@@ -37,7 +73,9 @@ function filterEventsByBarber(
 async function loadProfileForOwner(userId: string) {
   return supabase
     .from('profiles')
-    .select('id, email, store_name, has_paid, complimentary_access_until, googleAuth, calendar_share_token')
+    .select(
+      'id, email, store_name, has_paid, complimentary_access_until, googleAuth, calendar_share_token, subscription_tier, multi_barber_plan',
+    )
     .eq('id', userId)
     .maybeSingle();
 }
@@ -102,6 +140,73 @@ router.get('/events', async (req: Request, res: Response) => {
     });
   } catch {
     res.status(500).json({ error: 'Erro ao carregar calendário.' });
+  }
+});
+
+/** CSV de agendamentos — Pro / Pro+ (contabilidade / analytics). */
+router.get('/events/export', async (req: Request, res: Response) => {
+  try {
+    const auth = await getUserFromBearerHeader(supabase, req.headers.authorization);
+    if (!auth.ok) {
+      return res.status(401).json({
+        error:
+          auth.reason === 'missing_token'
+            ? 'Envie Authorization: Bearer com o access_token da sessão.'
+            : 'Sessão inválida ou expirada.',
+      });
+    }
+
+    const { data: profile, error } = await loadProfileForOwner(auth.user.id);
+    if (error) return res.status(500).json({ error: error.message });
+    if (!profile) return res.status(404).json({ error: 'Perfil não encontrado' });
+
+    const row = profile as Record<string, unknown>;
+    if (
+      !profileHasWagooAccess({
+        has_paid: row.has_paid,
+        complimentary_access_until: row.complimentary_access_until,
+      })
+    ) {
+      return res.status(403).json({ error: 'Assinatura activa necessária.' });
+    }
+
+    const tier = profileSubscriptionTier({
+      subscription_tier: row.subscription_tier,
+      has_paid: row.has_paid,
+      multi_barber_plan: row.multi_barber_plan as boolean | null | undefined,
+    });
+    if (!tierSupportsCsvExport(tier)) {
+      return res.status(403).json({
+        error: 'Exportação CSV está disponível nos planos Pro e Pro+.',
+      });
+    }
+
+    const from = String(req.query.from ?? '').trim();
+    const to = String(req.query.to ?? '').trim();
+    if (!from || !to) {
+      return res.status(400).json({ error: 'Parâmetros from e to (ISO) são obrigatórios.' });
+    }
+
+    const googleAuth = row.googleAuth as Record<string, unknown> | null | undefined;
+    if (!googleAuth?.refreshToken) {
+      return res.status(400).json({
+        error: 'Conecte o Google Agenda para exportar agendamentos.',
+      });
+    }
+
+    const email = String(profile.email).toLowerCase().trim();
+    const events = await listCalendarEvents(email, from, to);
+    const csv = eventsToCsv(events);
+    const stamp = new Date().toISOString().slice(0, 10);
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="wagoo-agendamentos-${stamp}.csv"`,
+    );
+    res.send(`\uFEFF${csv}`);
+  } catch {
+    res.status(500).json({ error: 'Erro ao exportar agendamentos.' });
   }
 });
 

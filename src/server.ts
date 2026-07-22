@@ -17,6 +17,7 @@ import { syncCalendarShareSlug } from './lib/storeSlug';
 import { pushAdminEvent } from './services/adminEvents';
 import { startWhatsApp, autoReconnectAll, disconnectWhatsApp, installWhatsAppProcessSafetyNet } from './services/whatsapp';
 import { clampRemindBeforeMinutes, startReminderWorker } from './services/reminders';
+import { normalizeResponseTemplates } from './lib/responseTemplates';
 import { generateAuthUrl, getTokensFromCode } from './services/googleAuth';
 import { getUserFromBearerHeader } from './lib/supabaseAuthUser';
 import { supabase } from './lib/supabase';
@@ -275,6 +276,41 @@ app.post('/api/settings/reminders', async (req: Request, res: Response) => {
     reminders_enabled: remindersEnabled,
     remind_before_minutes: remindBeforeMinutes,
   });
+});
+
+app.get('/api/settings/templates', async (req: Request, res: Response) => {
+  const authed = await requireBearerUser(req, res);
+  if (!authed) return;
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('response_templates')
+    .eq('id', authed.user.id)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: 'Perfil não encontrado' });
+
+  res.json({
+    response_templates: normalizeResponseTemplates(data.response_templates),
+  });
+});
+
+app.post('/api/settings/templates', async (req: Request, res: Response) => {
+  const authed = await requireBearerUser(req, res);
+  if (!authed) return;
+
+  const templates = normalizeResponseTemplates(
+    req.body.responseTemplates ?? req.body.response_templates ?? req.body,
+  );
+
+  const { error } = await supabase
+    .from('profiles')
+    .update({ response_templates: templates })
+    .eq('id', authed.user.id);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true, response_templates: templates });
 });
 
 app.post('/api/settings/store', async (req: Request, res: Response) => {

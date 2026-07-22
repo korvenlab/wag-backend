@@ -90,6 +90,11 @@ export function tierSupportsReminders(tier: WagooSubscriptionTier | null): boole
   return tier === 'pro' || tier === 'pro_plus';
 }
 
+/** Export CSV de agendamentos (analytics) — só Pro e Pro+. */
+export function tierSupportsCsvExport(tier: WagooSubscriptionTier | null): boolean {
+  return tier === 'pro' || tier === 'pro_plus';
+}
+
 export function syncLegacyFlagsFromTier(tier: WagooSubscriptionTier | null): {
   has_paid: boolean;
   multi_barber_plan: boolean;

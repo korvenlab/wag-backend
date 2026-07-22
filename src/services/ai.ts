@@ -4,6 +4,7 @@ import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
 import { resolveNicheVocabulary } from '../lib/businessNiche';
+import { templatesPromptBlock, type ResponseTemplates } from '../lib/responseTemplates';
 import { log } from '../lib/logger';
 import { isAskingProfessionalAvailability } from '../lib/dateTimeBR';
 
@@ -160,6 +161,7 @@ export const analyzeMessage = async (
         business_niche?: string | null,
         business_niche_custom?: string | null,
         free_ranges_summary?: string | null,
+        response_templates?: ResponseTemplates | null,
     },
     activeBarbeiros: ActiveBarbeiroForAi[] = [],
     schedulingState: SchedulingBarberState = { barberConfirmed: false, selectedBarberName: null },
@@ -242,6 +244,7 @@ export const analyzeMessage = async (
             : busySlots.join(', ') || 'nenhum';
 
         const freeRangesHint = dbRow.free_ranges_summary?.trim() || '';
+        const templatesBlock = templatesPromptBlock(dbRow.response_templates ?? {});
 
         const prompt = `
         Você é o Wagoo, secretária virtual da "${storeLabel}" (${businessType}) no WhatsApp.
@@ -252,20 +255,22 @@ export const analyzeMessage = async (
         - Singular: "${professional}" | Plural: "${professionals}"
         - Nunca diga "barbeiro", "barbeiros" ou "barbearia" salvo se o nicho for barbearia.
         - Nunca invente outro tipo de negócio.
-
+        ${templatesBlock}
         ESTILO DO CAMPO "response" (obrigatório):
-        - Cordial e profissional, como secretária educada — nunca seca ou robótica.
+        - Cordial, humana e natural — como secretária real no WhatsApp, nunca robótica ou de FAQ.
+        - Varie o jeito de falar a cada mensagem (sinônimos, ordem, ritmo); não repita a mesma fórmula.
         - Mínimo de caracteres: directo ao ponto, sem rodeios nem repetições.
         - Ideal: 1–2 frases curtas (≤160 caracteres; máximo ~220).
         - Cordialidade enxuta: "Olá", "Por favor", "Obrigada" quando couber — sem bajulação.
         - Proibido: elogios longos ("excelente profissional", "ótima escolha"), parágrafos, repetir o pedido do cliente.
+        - Proibido: respostas que pareçam copiadas de um template ou menu.
         - Horários: SEMPRE em intervalos quando listar vagos (ex: "9h–11h30 e 14h–17h"). NÃO liste de 30 em 30 min.
         - Use LIVRES_RESUMO quando existir — copie/adapte, não invente horários fora disso.
         - Uma pergunta por vez.
         - NUNCA escreva "Confirmado:" — o sistema confirma depois do "sim" do cliente.
-        - Quando o cliente escolher um horário, peça confirmação: "Posso confirmar DD/MM às HHh?" (isScheduling=false nessa mensagem).
+        - Quando o cliente escolher um horário, peça confirmação de forma natural (ex.: "Posso marcar DD/MM às HHh pra você?").
         - isScheduling=true SOMENTE se o cliente já afirmou (sim/confirma/pode marcar) sobre uma proposta.
-        - Exemplos: "Hoje: 9h–12h e 14h–17h30. Qual prefere?" | "Posso confirmar amanhã às 15h?" | "Temos Marcos e Robson. Algum preferido?"
+        - Exemplos de tom (não copie literalmente): "Hoje sobra de manhã e de tarde — qual encaixa melhor?" | "Fecho amanhã às 15h então?" | "Temos o Marcos e o Robson — prefere algum?"
 
         EXTRAÇÃO:
         - DATA (YYYY-MM-DD) e HORA (HH:mm) quando o cliente escolher um horário (mesmo antes do sim final).

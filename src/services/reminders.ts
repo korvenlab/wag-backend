@@ -122,7 +122,100 @@ function buildReminderText(row: {
     row.barber_name && !row.barber_name.toLowerCase().includes('sem prefer')
       ? ` com ${row.barber_name}`
       : '';
-  return `${hello} Lembrete: seu horário é ${when}${prof}. Te esperamos!`;
+  return (
+    `${hello} Lembrete: seu horário é ${when}${prof}. Te esperamos!\n\n` +
+    `Confirma que vem? Se não puder, avisa a gente.`
+  );
+}
+
+function normalizePresenceReply(text: string): 'confirmed' | 'declined' | null {
+  const t = text
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+  if (!t) return null;
+
+  const declined =
+    /^(nao|n|negativo|cancelar|desmarcar|nao vou|nao posso|impossivel)\b/.test(t) ||
+    /\b(nao posso|nao vou|nao consigo|cancele|desmarque)\b/.test(t);
+  if (declined) return 'declined';
+
+  const confirmed =
+    /^(sim|s|ok|confirmo|confirmado|pode|claro|vou|estarei|positivo)\b/.test(t) ||
+    /\b(confirmar|confirmo|estarei la|estarei lá|vou sim)\b/.test(t);
+  if (confirmed) return 'confirmed';
+
+  return null;
+}
+
+/**
+ * Se o cliente respondeu ao lembrete (SIM/NÃO), trata aqui e não segue para a IA.
+ * Funciona mesmo com IA pausada.
+ */
+export async function tryHandlePresenceConfirmation(input: {
+  userId: string;
+  clientPhone: string;
+  text: string;
+  sendReply: (text: string) => Promise<void>;
+}): Promise<boolean> {
+  const phone = input.clientPhone.replace(/\D/g, '');
+  if (!phone) return false;
+
+  const intent = normalizePresenceReply(input.text);
+  if (!intent) return false;
+
+  const nowIso = new Date().toISOString();
+  const { data: row, error } = await supabase
+    .from('appointment_reminders')
+    .select('id, starts_at, client_name, barber_name')
+    .eq('user_id', input.userId)
+    .eq('client_phone', phone)
+    .eq('presence_status', 'pending')
+    .not('sent_at', 'is', null)
+    .gte('starts_at', nowIso)
+    .order('starts_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    log.error(TAG, 'falha ao buscar lembrete pendente de presença', error);
+    return false;
+  }
+  if (!row) return false;
+
+  const { error: upErr } = await supabase
+    .from('appointment_reminders')
+    .update({
+      presence_status: intent,
+      presence_replied_at: new Date().toISOString(),
+    })
+    .eq('id', row.id)
+    .eq('presence_status', 'pending');
+
+  if (upErr) {
+    log.error(TAG, 'falha ao gravar presença', upErr, { id: row.id });
+    return false;
+  }
+
+  const when = formatDateTimeBR(row.starts_at as string);
+  const firstName = String(row.client_name || '')
+    .trim()
+    .split(/\s+/)[0];
+  const hello = firstName ? `${firstName}, ` : '';
+
+  if (intent === 'confirmed') {
+    await input.sendReply(
+      `${hello}presença confirmada para ${when}. Te esperamos!`,
+    );
+  } else {
+    await input.sendReply(
+      `${hello}registramos que você não poderá vir em ${when}. Se quiser remarcar, é só pedir um novo horário.`,
+    );
+  }
+
+  log.info(TAG, 'presença respondida', { id: row.id, intent, phone });
+  return true;
 }
 
 async function processDueReminders(): Promise<void> {
@@ -198,7 +291,11 @@ async function processDueReminders(): Promise<void> {
       await sock.sendMessage(jid, { text });
       const { error: upErr } = await supabase
         .from('appointment_reminders')
-        .update({ sent_at: new Date().toISOString() })
+        .update({
+          sent_at: new Date().toISOString(),
+          presence_status: 'pending',
+          presence_replied_at: null,
+        })
         .eq('id', row.id)
         .is('sent_at', null);
 

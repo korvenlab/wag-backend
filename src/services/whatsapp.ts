@@ -46,7 +46,14 @@ import {
 import {
   cancelAppointmentReminder,
   enqueueAppointmentReminder,
+  tryHandlePresenceConfirmation,
 } from './reminders';
+import {
+  normalizeResponseTemplates,
+  resolveAfterBookingReply,
+  resolveCancelReply,
+  type ResponseTemplates,
+} from '../lib/responseTemplates';
 import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
@@ -585,7 +592,24 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
       try {
         const { data: p } = await supabase.from('profiles').select('*').eq('email', email).single();
-        if (!p || !profileHasWagooAccess(p as { has_paid?: boolean; complimentary_access_until?: string | null }) || !p.is_ai_enabled) return;
+        if (!p || !profileHasWagooAccess(p as { has_paid?: boolean; complimentary_access_until?: string | null })) {
+          return;
+        }
+
+        const clientPhoneDigits = remoteJid.split('@')[0].replace(/\D/g, '');
+        const presenceHandled = await tryHandlePresenceConfirmation({
+          userId: p.id as string,
+          clientPhone: clientPhoneDigits,
+          text: textMessage,
+          sendReply: async (text) => {
+            await sock.sendMessage(remoteJid, { text });
+          },
+        });
+        if (presenceHandled) return;
+
+        if (!p.is_ai_enabled) return;
+
+        const templates: ResponseTemplates = normalizeResponseTemplates(p.response_templates);
 
         const sessionExists = !!memoryCache[cacheKey];
         const isExpired = sessionExists && (now - memoryCache[cacheKey].lastUpdate > SESSION_EXPIRATION);
@@ -704,6 +728,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
             business_niche: p.business_niche,
             business_niche_custom: p.business_niche_custom,
             free_ranges_summary: freeRangesSummary || null,
+            response_templates: templates,
           },
           activeBarbeiros.map((b) => ({ id: b.id, nome: b.nome })),
           {
@@ -737,7 +762,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
                     }
                     const eventDate = formatDateTimeBR(event.start.dateTime);
                     await sock.sendMessage(remoteJid, { 
-                        text: `Agendamento de ${eventDate} cancelado.`
+                        text: resolveCancelReply(templates, eventDate),
                     });
                     delete memoryCache[cacheKey]; 
                     return;
@@ -1025,9 +1050,12 @@ export async function startWhatsApp(email: string, res: Response | null) {
                     const confirmDate = formatDateTimeBR(bookingIso);
                     const profLine =
                       multiBarber && finalBarberName
-                        ? `\nProfissional: ${finalBarberName}`
+                        ? ` com ${finalBarberName}`
                         : '';
-                    const confirmText = `Confirmado: ${confirmDate}.${profLine}\nAté lá!`;
+                    const confirmText = resolveAfterBookingReply(
+                      templates,
+                      `Anotei: ${confirmDate}${profLine}. Te esperamos!`,
+                    );
                     await sock.sendMessage(remoteJid, { text: confirmText });
                     memoryCache[cacheKey].messages.push({ role: 'assistant', content: confirmText });
                     await supabase.from('profiles').update({
