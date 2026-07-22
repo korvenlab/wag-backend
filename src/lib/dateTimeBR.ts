@@ -62,13 +62,25 @@ export function isNegativeBooking(message: string): boolean {
 export type AvailabilityDayRequest = {
   /** YYYY-MM-DD em America/Sao_Paulo */
   dayIso: string;
-  /** Rótulo curto para resposta: Hoje | Amanhã | DD/MM */
+  /** Rótulo curto para resposta: Hoje | Amanhã | DD/MM | Segunda… */
   label: string;
+  /** true se o cliente mencionou o dia de forma explícita */
+  explicit: boolean;
 };
 
+const WEEKDAY_ALIASES: Array<{ re: RegExp; dayjsDay: number; label: string }> = [
+  { re: /\bdomingo\b/, dayjsDay: 0, label: 'Domingo' },
+  { re: /\bsegunda(?:-feira)?\b/, dayjsDay: 1, label: 'Segunda' },
+  { re: /\bterca(?:-feira)?\b/, dayjsDay: 2, label: 'Terça' },
+  { re: /\bquarta(?:-feira)?\b/, dayjsDay: 3, label: 'Quarta' },
+  { re: /\bquinta(?:-feira)?\b/, dayjsDay: 4, label: 'Quinta' },
+  { re: /\bsexta(?:-feira)?\b/, dayjsDay: 5, label: 'Sexta' },
+  { re: /\bsabado\b/, dayjsDay: 6, label: 'Sábado' },
+];
+
 /**
- * Interpreta o dia pedido na mensagem (hoje / amanhã / DD/MM).
- * Sem menção explícita → hoje (padrão ao listar disponibilidade).
+ * Interpreta o dia pedido na mensagem (hoje / amanhã / DD/MM / dia da semana).
+ * Sem menção explícita → hoje, com explicit=false.
  */
 export function resolveAvailabilityDayFromMessage(
   message: string,
@@ -79,16 +91,33 @@ export function resolveAvailabilityDayFromMessage(
 
   if (/\bdepois\s+de\s+amanha\b/.test(m)) {
     const day = today.add(2, 'day');
-    return { dayIso: day.format('YYYY-MM-DD'), label: day.format('DD/MM') };
+    return { dayIso: day.format('YYYY-MM-DD'), label: day.format('DD/MM'), explicit: true };
   }
 
   if (/\bamanha\b/.test(m)) {
     const day = today.add(1, 'day');
-    return { dayIso: day.format('YYYY-MM-DD'), label: 'Amanhã' };
+    return { dayIso: day.format('YYYY-MM-DD'), label: 'Amanhã', explicit: true };
   }
 
   if (/\bhoje\b/.test(m)) {
-    return { dayIso: today.format('YYYY-MM-DD'), label: 'Hoje' };
+    return { dayIso: today.format('YYYY-MM-DD'), label: 'Hoje', explicit: true };
+  }
+
+  for (const wd of WEEKDAY_ALIASES) {
+    if (!wd.re.test(m)) continue;
+    let day: dayjs.Dayjs;
+    if (today.day() === wd.dayjsDay) {
+      day = today;
+    } else {
+      const add = (wd.dayjsDay - today.day() + 7) % 7;
+      day = today.add(add === 0 ? 7 : add, 'day');
+    }
+    const label = day.isSame(today, 'day')
+      ? 'Hoje'
+      : day.isSame(today.add(1, 'day'), 'day')
+        ? 'Amanhã'
+        : wd.label;
+    return { dayIso: day.format('YYYY-MM-DD'), label, explicit: true };
   }
 
   const dm = m.match(/\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b/);
@@ -112,11 +141,30 @@ export function resolveAvailabilityDayFromMessage(
         : day.isSame(today.add(1, 'day'), 'day')
           ? 'Amanhã'
           : day.format('DD/MM');
-      return { dayIso: day.format('YYYY-MM-DD'), label };
+      return { dayIso: day.format('YYYY-MM-DD'), label, explicit: true };
     }
   }
 
-  return { dayIso: today.format('YYYY-MM-DD'), label: 'Hoje' };
+  return { dayIso: today.format('YYYY-MM-DD'), label: 'Hoje', explicit: false };
+}
+
+/**
+ * Usa o dia da mensagem atual; se não for explícito, olha as últimas falas do cliente.
+ */
+export function resolveAvailabilityDayFromThread(
+  currentMessage: string,
+  recentUserMessages: string[],
+  now: dayjs.Dayjs = dayjs().tz(BR_TZ),
+): AvailabilityDayRequest {
+  const fromCurrent = resolveAvailabilityDayFromMessage(currentMessage, now);
+  if (fromCurrent.explicit) return fromCurrent;
+
+  for (const msg of recentUserMessages) {
+    const d = resolveAvailabilityDayFromMessage(msg, now);
+    if (d.explicit) return d;
+  }
+
+  return fromCurrent;
 }
 
 /**

@@ -263,14 +263,18 @@ export const analyzeMessage = async (
         - Cordialidade enxuta: "Olá", "Por favor", "Obrigada" quando couber — sem bajulação.
         - Proibido: elogios longos ("excelente profissional", "ótima escolha"), parágrafos, repetir o pedido do cliente.
         - Proibido: respostas que pareçam copiadas de um template ou menu.
+
+        FIDELIDADE AO QUE O CLIENTE PEDIU (prioridade máxima):
+        - Respeite SEMPRE o dia, horário, período (manhã/tarde/noite) e profissional que o cliente falou.
+        - Nunca troque "amanhã" por "hoje", nem invente outro dia/hora sem o cliente pedir.
+        - Se LIVRES_RESUMO existir, use exatamente o rótulo do dia dele (Hoje/Amanhã/DD/MM/Segunda…) e os intervalos.
+        - Se o pedido não couber (sem vaga), diga isso no dia pedido e ofereça alternativa — sem fingir que era outro dia.
         - Horários: SEMPRE em intervalos quando listar vagos (ex: "9h–11h30 e 14h–17h"). NÃO liste de 30 em 30 min.
-        - Use LIVRES_RESUMO quando existir — copie o rótulo do dia (Hoje/Amanhã/DD/MM) e os intervalos; NÃO troque o dia pedido pelo cliente.
-        - Se o cliente pediu "amanhã", responda com Amanhã (nunca diga Hoje). Se pediu "hoje", use Hoje.
         - Uma pergunta por vez.
         - NUNCA escreva "Confirmado:" — o sistema confirma depois do "sim" do cliente.
-        - Quando o cliente escolher um horário, peça confirmação de forma natural (ex.: "Posso marcar DD/MM às HHh pra você?").
+        - Quando o cliente escolher um horário, peça confirmação de forma natural no dia certo (ex.: "Posso marcar amanhã às 15h?").
         - isScheduling=true SOMENTE se o cliente já afirmou (sim/confirma/pode marcar) sobre uma proposta.
-        - Exemplos de tom (não copie literalmente): "Hoje sobra de manhã e de tarde — qual encaixa melhor?" | "Fecho amanhã às 15h então?" | "Temos o Marcos e o Robson — prefere algum?"
+        - Exemplos de tom (não copie literalmente): "Amanhã: 9h–12h e 14h–17h. Qual encaixa?" | "Fecho amanhã às 15h então?" | "Temos o Marcos e o Robson — prefere algum?"
 
         EXTRAÇÃO:
         - DATA (YYYY-MM-DD) e HORA (HH:mm) quando o cliente escolher um horário (mesmo antes do sim final).

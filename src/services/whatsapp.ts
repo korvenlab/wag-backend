@@ -42,7 +42,7 @@ import {
   isAffirmativeBooking,
   isAskingProfessionalAvailability,
   isNegativeBooking,
-  resolveAvailabilityDayFromMessage,
+  resolveAvailabilityDayFromThread,
   startOfDayBR,
 } from '../lib/dateTimeBR';
 import {
@@ -680,7 +680,11 @@ export async function startWhatsApp(email: string, res: Response | null) {
           nome: b.nome,
           google_calendar_email: b.google_calendar_email,
         }));
-        const requestedDay = resolveAvailabilityDayFromMessage(textMessage);
+        const recentUserMsgs = (memoryCache[cacheKey]?.messages || [])
+          .filter((x: { role?: string }) => x.role === 'user')
+          .map((x: { content?: string }) => String(x.content || ''))
+          .slice(-6);
+        const requestedDay = resolveAvailabilityDayFromThread(textMessage, recentUserMsgs);
         const dayIsoForRanges = requestedDay.dayIso;
         const dayLabel = requestedDay.label;
         const dayStartIso = startOfDayBR(dayIsoForRanges).toISOString();
@@ -940,7 +944,14 @@ export async function startWhatsApp(email: string, res: Response | null) {
                 !!freeRangesSummary &&
                 !/nenhum horário livre/i.test(freeRangesSummary);
 
-              if (asksAvailability && hasUsefulRanges && !/[–-]/.test(text)) {
+              const aiMentionsWrongToday =
+                requestedDay.explicit &&
+                dayLabel !== 'Hoje' &&
+                /\bhoje\b/i.test(text) &&
+                !new RegExp(dayLabel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(text);
+              const aiMissingRanges = !/[–-]/.test(text);
+
+              if (asksAvailability && hasUsefulRanges && (aiMissingRanges || aiMentionsWrongToday)) {
                 text = `${dayLabel}: ${freeRangesSummary}. Qual horário prefere?`;
               } else if (asksAvailability && !hasUsefulRanges) {
                 text = `${dayLabel} não há horários livres. Quer tentar outro dia?`;
