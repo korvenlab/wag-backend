@@ -251,7 +251,12 @@ export const analyzeMessage = async (
         const templatesBlock = templatesPromptBlock(dbRow.response_templates ?? {});
         const emojiBlock = dbRow.ai_use_emojis
           ? `
-        EMOJIS: permitidos com moderação (no máximo 1 por mensagem, só se soar natural). Nunca em lista de horários.
+        EMOJIS (ativos — use de forma natural e amigável):
+        - Prefira incluir emoji na maioria das respostas curtas (cumprimento, confirmação, pergunta).
+        - Tom WhatsApp humano: 😊 🙂 👍 🙏 ✨ 👋 — encaixe no final da frase ou no cumprimento.
+        - Moderação: 1–2 por mensagem costuma bastar; no máximo 3. Nunca encha a mensagem de emoji.
+        - NUNCA coloque emoji dentro da lista de horários (Manhã/Tarde/Noite).
+        - Exemplos de tom: "Bom dia! 😊\\n\\nQual horário prefere?" | "Posso confirmar amanhã às 15h? 👍"
         `
           : `
         EMOJIS: proibidos. Não use nenhum emoji, emoticon ou símbolo decorativo.

@@ -686,7 +686,9 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
         // Só saudação → retribuir na hora (sem chamar a IA).
         if (userGreeting && isPrimarilyGreeting(textMessage)) {
-          const reply = `${userGreeting}! Em que posso ajudar?`;
+          const reply = p.ai_use_emojis
+            ? `${userGreeting}! 😊 Em que posso ajudar?`
+            : `${userGreeting}! Em que posso ajudar?`;
           log.info(WA, 'retribuindo saudação', { email, greeting: userGreeting });
           await sock.sendMessage(remoteJid, { text: reply });
           memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
