@@ -1060,7 +1060,8 @@ export async function startWhatsApp(email: string, res: Response | null) {
                     memoryCache[cacheKey].messages.push({ role: 'assistant', content: confirmText });
                     await supabase.from('profiles').update({
                         messages_answered: (p.messages_answered || 0) + 1,
-                        appointments_count: (p.appointments_count || 0) + 1
+                        appointments_made: (p.appointments_made || 0) + 1,
+                        appointments_count: (p.appointments_count || 0) + 1,
                     }).eq('email', email);
                     delete memoryCache[cacheKey];
                 } else if (aiResult.response) {
