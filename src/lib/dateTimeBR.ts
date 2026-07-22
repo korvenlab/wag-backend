@@ -100,6 +100,51 @@ export function formatTimeBR(value: string | Date): string {
   return dayjs(value).tz(BR_TZ).format('HH:mm');
 }
 
+/** Negrito no WhatsApp: *texto* (um asterisco de cada lado). */
+export function waBold(text: string): string {
+  const t = String(text ?? '').trim();
+  if (!t) return t;
+  if (t.startsWith('*') && t.endsWith('*') && t.length >= 3) return t;
+  return `*${t.replace(/\*/g, '')}*`;
+}
+
+/**
+ * Destaca horários, datas e nomes pessoais com negrito WhatsApp (*…*).
+ * Idempotente: não duplica asteriscos já aplicados.
+ */
+export function applyWhatsAppEmphasis(
+  text: string,
+  personalNames: string[] = [],
+): string {
+  if (!text) return text;
+  let out = text;
+
+  out = out.replace(/(?<!\*)\b(\d{1,2}:\d{2})\b(?!\*)/g, '*$1*');
+  out = out.replace(/(?<!\*)\b(\d{1,2}h(?:\d{2})?)\b(?!\*)/gi, '*$1*');
+  out = out.replace(
+    /(?<!\*)\b(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\b(?!\*)/g,
+    '*$1*',
+  );
+  out = out.replace(
+    /(?<!\*)\b(hoje|amanh[aã]|depois de amanh[aã])\b(?!\*)/gi,
+    (m) => `*${m}*`,
+  );
+  out = out.replace(
+    /(?<!\*)\b(segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo)(?:-feira)?\b(?!\*)/gi,
+    (m) => `*${m}*`,
+  );
+
+  const names = [...new Set(personalNames.map((n) => n.trim()).filter((n) => n.length >= 2))];
+  names.sort((a, b) => b.length - a.length);
+  for (const name of names) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?<!\\*)\\b(${escaped})\\b(?!\\*)`, 'gi');
+    out = out.replace(re, '*$1*');
+  }
+
+  return out;
+}
+
 /**
  * Cliente perguntando quem está livre / quais profissionais — NÃO é confirmação de marca.
  */
@@ -409,7 +454,7 @@ export function formatAvailabilityByPeriod(
     const slots = buckets[period];
     if (!slots.length) continue;
     const shown = slots.slice(0, maxPerPeriod);
-    const times = shown.map((s) => formatHourClock(s)).join(' / ');
+    const times = shown.map((s) => waBold(formatHourClock(s))).join(' / ');
     const extra = slots.length > maxPerPeriod ? ' …' : '';
     lines.push(`${period}: ${times}${extra}`);
   }
@@ -428,9 +473,10 @@ export function formatAvailabilityWhatsAppMessage(
   const ask = options?.askPreference !== false;
   const greet = options?.greeting?.trim();
   const prefix = greet ? `${greet}!\n\n` : '';
+  const day = waBold(dayLabel);
   if (options?.empty || /nenhum horário livre/i.test(periodBody)) {
-    return `${prefix}${dayLabel} não há horários livres.\nQuer tentar outro dia?`;
+    return `${prefix}${day} não há horários livres.\nQuer tentar outro dia?`;
   }
   const cta = ask ? '\n\nQual horário prefere?' : '';
-  return `${prefix}${dayLabel}:\n${periodBody}${cta}`;
+  return `${prefix}${day}:\n${periodBody}${cta}`;
 }

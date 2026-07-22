@@ -3,7 +3,7 @@ import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
 import { supabase } from '../lib/supabase';
 import { log } from '../lib/logger';
-import { formatDateTimeBR } from '../lib/dateTimeBR';
+import { applyWhatsAppEmphasis, formatDateTimeBR } from '../lib/dateTimeBR';
 import { profileSubscriptionTier } from '../lib/profileMultiBarber';
 import { tierSupportsReminders } from '../lib/wagooSubscription';
 
@@ -117,15 +117,19 @@ function buildReminderText(row: {
 }): string {
   const when = formatDateTimeBR(row.starts_at);
   const name = row.client_name?.trim();
-  const hello = name ? `Oi, ${name.split(' ')[0]}!` : 'Oi!';
+  const firstName = name ? name.split(' ')[0] : null;
+  const hello = firstName ? `Oi, ${firstName}!` : 'Oi!';
   const prof =
     row.barber_name && !row.barber_name.toLowerCase().includes('sem prefer')
       ? ` com ${row.barber_name}`
       : '';
-  return (
+  const body =
     `${hello} Lembrete: seu horário é ${when}${prof}. Te esperamos!\n\n` +
-    `Confirma que vem? Se não puder, avisa a gente.`
-  );
+    `Confirma que vem? Se não puder, avisa a gente.`;
+  return applyWhatsAppEmphasis(body, [
+    ...(firstName ? [firstName] : []),
+    ...(row.barber_name ? [row.barber_name] : []),
+  ]);
 }
 
 function normalizePresenceReply(text: string): 'confirmed' | 'declined' | null {

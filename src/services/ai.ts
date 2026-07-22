@@ -296,19 +296,27 @@ export const analyzeMessage = async (
         - Respeite SEMPRE o dia, horário, período (manhã/tarde/noite) e profissional que o cliente falou.
         - Nunca troque "amanhã" por "hoje", nem invente outro dia/hora sem o cliente pedir.
         - Se LIVRES_RESUMO existir, PRESERVE o layout (dia + Manhã/Tarde/Noite). Deixe UMA linha em branco entre Manhã, Tarde e Noite. Não amasse tudo numa frase.
-        - Formato ideal ao listar vagas:
-          Amanhã:
-          Manhã: 08:00 / 09:00 / 10:00
+        - Formato ideal ao listar vagas (horários e dia em *negrito* WhatsApp):
+          *Amanhã*:
+          Manhã: *08:00* / *09:00* / *10:00*
 
-          Tarde: 13:00 / 14:00 / 15:00
+          Tarde: *13:00* / *14:00* / *15:00*
 
           Qual horário prefere?
         - Se o pedido não couber (sem vaga), diga isso no dia pedido e ofereça alternativa — sem fingir que era outro dia.
         - Uma pergunta por vez.
         - NUNCA escreva "Confirmado:" — o sistema confirma depois do "sim" do cliente.
-        - Quando o cliente escolher um horário, peça confirmação de forma natural no dia certo (ex.: "Posso marcar amanhã às 15h?").
+        - Quando o cliente escolher um horário, peça confirmação de forma natural no dia certo (ex.: "Posso marcar *amanhã* às *15h*?").
         - isScheduling=true SOMENTE se o cliente já afirmou (sim/confirma/pode marcar) sobre uma proposta.
-        - Exemplos de tom (não copie literalmente): "Amanhã de manhã tem 9h e 10h — qual prefere?" | "Fecho amanhã às 15h então?" | "Temos o Marcos e o Robson — prefere algum?"
+        - Exemplos de tom (não copie literalmente): "*Amanhã* de manhã tem *9h* e *10h* — qual prefere?" | "Fecho *amanhã* às *15h* então?" | "Temos o *Marcos* e o *Robson* — prefere algum?"
+
+        NEGRITO WHATSAPP (obrigatório no campo "response"):
+        - Sempre destaque com *asteriscos* (um de cada lado) horários, datas e nomes de pessoas.
+        - Horários: *08:00*, *15h*, *14:30*
+        - Datas/dias: *hoje*, *amanhã*, *22/07*, *segunda*
+        - Nomes de profissionais/clientes: *Marcos*, *Ana*
+        - Não use **markdown duplo** — no WhatsApp o negrito é *assim*.
+        - Não coloque negrito em palavras comuns (só horário, data e nome).
 
         EXTRAÇÃO:
         - DATA (YYYY-MM-DD) e HORA (HH:mm) quando o cliente escolher um horário (mesmo antes do sim final).
@@ -327,7 +335,7 @@ export const analyzeMessage = async (
         MENSAGEM:
         "${currentMessage}"
 
-        JSON válido apenas (sem markdown):
+        JSON válido apenas (sem markdown de código; *negrito* WhatsApp no campo response é obrigatório):
         {
             "isScheduling": boolean,
             "isCancelling": boolean,
@@ -335,7 +343,7 @@ export const analyzeMessage = async (
             "extractedTime": "HH:mm ou null",
             "barberSelection": "nome exacto, SEM_PREFERENCIA ou null",
             "barberConfirmed": boolean,
-            "response": "Resposta curta, cordial, em português do Brasil"
+            "response": "Resposta curta, cordial, em português do Brasil, com *horários* *datas* e *nomes* em negrito"
         }`;
 
         const parsed = await callGeminiWithFallback(prompt);

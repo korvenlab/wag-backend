@@ -37,6 +37,7 @@ import {
 import { supabase } from '../lib/supabase';
 import { log } from '../lib/logger';
 import {
+  applyWhatsAppEmphasis,
   detectUserGreeting,
   ensureOpeningGreeting,
   formatAvailabilityWhatsAppMessage,
@@ -684,11 +685,22 @@ export async function startWhatsApp(email: string, res: Response | null) {
           ? userGreeting || greetingForNowBR()
           : null;
 
+        const emphasizeWa = (
+          text: string,
+          ...extraNames: Array<string | null | undefined>
+        ) =>
+          applyWhatsAppEmphasis(text, [
+            ...activeBarbeiros.map((b) => b.nome),
+            ...extraNames.filter((n): n is string => !!n?.trim()),
+          ]);
+
         // Só saudação → retribuir na hora (sem chamar a IA).
         if (userGreeting && isPrimarilyGreeting(textMessage)) {
-          const reply = p.ai_use_emojis
-            ? `${userGreeting}! 😊 Em que posso ajudar?`
-            : `${userGreeting}! Em que posso ajudar?`;
+          const reply = emphasizeWa(
+            p.ai_use_emojis
+              ? `${userGreeting}! 😊 Em que posso ajudar?`
+              : `${userGreeting}! Em que posso ajudar?`,
+          );
           log.info(WA, 'retribuindo saudação', { email, greeting: userGreeting });
           await sock.sendMessage(remoteJid, { text: reply });
           memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
@@ -810,14 +822,14 @@ export async function startWhatsApp(email: string, res: Response | null) {
                     }
                     const eventDate = formatDateTimeBR(event.start.dateTime);
                     await sock.sendMessage(remoteJid, { 
-                        text: resolveCancelReply(templates, eventDate),
+                        text: emphasizeWa(resolveCancelReply(templates, eventDate)),
                     });
                     delete memoryCache[cacheKey]; 
                     return;
                 }
             } else {
                 await sock.sendMessage(remoteJid, { 
-                    text: 'Não encontrei agendamento futuro no seu número.'
+                    text: emphasizeWa('Não encontrei agendamento futuro no seu número.')
                 });
                 return;
             }
@@ -871,13 +883,16 @@ export async function startWhatsApp(email: string, res: Response | null) {
               barberRefs,
             );
             const timeLabel = formatHourCompact(slotIso);
-            const reply = ensureOpeningGreeting(
-              free.length > 0
-                ? `Às ${timeLabel} estão disponíveis: ${free.join(', ')}. Qual prefere?`
-                : `Às ${timeLabel} nenhum profissional está livre. Quer outro horário?`,
-              shouldGreet,
-              undefined,
-              openingGreeting,
+            const reply = emphasizeWa(
+              ensureOpeningGreeting(
+                free.length > 0
+                  ? `Às ${timeLabel} estão disponíveis: ${free.join(', ')}. Qual prefere?`
+                  : `Às ${timeLabel} nenhum profissional está livre. Quer outro horário?`,
+                shouldGreet,
+                undefined,
+                openingGreeting,
+              ),
+              ...free,
             );
             log.info(WA, 'resposta de disponibilidade de profissionais', {
               email,
@@ -894,12 +909,14 @@ export async function startWhatsApp(email: string, res: Response | null) {
           }
 
           const teamNames = activeBarbeiros.map((b) => b.nome).join(', ');
-          const reply = ensureOpeningGreeting(
-            aiResult.response?.trim() ||
-              `Temos: ${teamNames}. Qual horário e profissional prefere?`,
-            shouldGreet,
-            undefined,
-            openingGreeting,
+          const reply = emphasizeWa(
+            ensureOpeningGreeting(
+              aiResult.response?.trim() ||
+                `Temos: ${teamNames}. Qual horário e profissional prefere?`,
+              shouldGreet,
+              undefined,
+              openingGreeting,
+            ),
           );
           await sock.sendMessage(remoteJid, { text: reply });
           memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
@@ -911,7 +928,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
         // Cliente recusou a proposta pendente.
         if (pending && isNegativeBooking(textMessage)) {
           memoryCache[cacheKey].scheduling!.pendingConfirmation = null;
-          const reply = 'Sem problema. Qual outro horário prefere?';
+          const reply = emphasizeWa('Sem problema. Qual outro horário prefere?');
           await sock.sendMessage(remoteJid, { text: reply });
           memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
           log.info(WA, 'cliente recusou confirmação pendente', { email });
@@ -937,12 +954,14 @@ export async function startWhatsApp(email: string, res: Response | null) {
           if (multiBarber && !memoryCache[cacheKey].scheduling?.barberConfirmed) {
             log.warn(WA, 'proposta sem profissional — pedindo escolha', { email });
             const teamNames = activeBarbeiros.map((b) => b.nome).join(', ');
-            const reply = ensureOpeningGreeting(
-              aiResult.response?.trim() ||
-                `Qual profissional prefere? ${teamNames}, ou Sem Preferência.`,
-              shouldGreet,
-              undefined,
-              openingGreeting,
+            const reply = emphasizeWa(
+              ensureOpeningGreeting(
+                aiResult.response?.trim() ||
+                  `Qual profissional prefere? ${teamNames}, ou Sem Preferência.`,
+                shouldGreet,
+                undefined,
+                openingGreeting,
+              ),
             );
             await sock.sendMessage(remoteJid, { text: reply });
             memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
@@ -966,11 +985,14 @@ export async function startWhatsApp(email: string, res: Response | null) {
           const when = formatDateTimeBR(proposedIso);
           const profBit =
             multiBarber && pendingBarberName ? ` com ${pendingBarberName}` : '';
-          const reply = ensureOpeningGreeting(
-            `Posso confirmar ${when}${profBit}? Responda *sim* para marcar.`,
-            shouldGreet,
-            undefined,
-            openingGreeting,
+          const reply = emphasizeWa(
+            ensureOpeningGreeting(
+              `Posso confirmar ${when}${profBit}? Responda *sim* para marcar.`,
+              shouldGreet,
+              undefined,
+              openingGreeting,
+            ),
+            pendingBarberName,
           );
           log.info(WA, 'aguardando confirmação do cliente', {
             email,
@@ -1009,6 +1031,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
               } else {
                 text = ensureOpeningGreeting(text, shouldGreet, undefined, openingGreeting);
               }
+              text = emphasizeWa(text);
               await sock.sendMessage(remoteJid, { text });
               memoryCache[cacheKey].messages.push({ role: 'assistant', content: text });
               
@@ -1021,11 +1044,13 @@ export async function startWhatsApp(email: string, res: Response | null) {
               log.error(WA, 'erro ao enviar resposta WhatsApp', sendError, { email, remoteJid });
           }
         } else if (shouldGreet && !willCreateAppointment && !proposedIso) {
-          const reply = ensureOpeningGreeting(
-            'Em que posso ajudar?',
-            true,
-            undefined,
-            openingGreeting,
+          const reply = emphasizeWa(
+            ensureOpeningGreeting(
+              'Em que posso ajudar?',
+              true,
+              undefined,
+              openingGreeting,
+            ),
           );
           await sock.sendMessage(remoteJid, { text: reply });
           memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
@@ -1065,7 +1090,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
               if (!assigned) {
                 memoryCache[cacheKey].scheduling!.pendingConfirmation = null;
                 await sock.sendMessage(remoteJid, {
-                  text: 'Horário indisponível. Quer outro dia ou horário?',
+                  text: emphasizeWa('Horário indisponível. Quer outro dia ou horário?'),
                 });
                 return;
               }
@@ -1086,9 +1111,12 @@ export async function startWhatsApp(email: string, res: Response | null) {
               if (!isFree) {
                 memoryCache[cacheKey].scheduling!.pendingConfirmation = null;
                 await sock.sendMessage(remoteJid, {
-                  text: multiBarber && barberName
-                    ? `Horário indisponível para ${barberName}. Outro horário ou profissional?`
-                    : 'Horário indisponível. Quer tentar outro?',
+                  text: emphasizeWa(
+                    multiBarber && barberName
+                      ? `Horário indisponível para ${barberName}. Outro horário ou profissional?`
+                      : 'Horário indisponível. Quer tentar outro?',
+                    typeof barberName === 'string' ? barberName : null,
+                  ),
                 });
                 return;
               }
@@ -1136,9 +1164,13 @@ export async function startWhatsApp(email: string, res: Response | null) {
                       multiBarber && finalBarberName
                         ? ` com ${finalBarberName}`
                         : '';
-                    const confirmText = resolveAfterBookingReply(
-                      templates,
-                      `Anotei: ${confirmDate}${profLine}. Te esperamos!`,
+                    const confirmText = emphasizeWa(
+                      resolveAfterBookingReply(
+                        templates,
+                        `Anotei: ${confirmDate}${profLine}. Te esperamos!`,
+                      ),
+                      typeof finalBarberName === 'string' ? finalBarberName : null,
+                      clientName,
                     );
                     await sock.sendMessage(remoteJid, { text: confirmText });
                     memoryCache[cacheKey].messages.push({ role: 'assistant', content: confirmText });
@@ -1149,7 +1181,9 @@ export async function startWhatsApp(email: string, res: Response | null) {
                     }).eq('email', email);
                     delete memoryCache[cacheKey];
                 } else if (aiResult.response) {
-                    await sock.sendMessage(remoteJid, { text: aiResult.response });
+                    await sock.sendMessage(remoteJid, {
+                      text: emphasizeWa(aiResult.response),
+                    });
                 }
             }
         }
