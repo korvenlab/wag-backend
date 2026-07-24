@@ -117,7 +117,8 @@ interface ChatContext {
 }
 
 const memoryCache: Record<string, ChatContext> = {};
-const SESSION_EXPIRATION = 10 * 60 * 60 * 1000; 
+/** Após inatividade, a sessão fecha — evita a IA responder papo aleatório por horas. */
+const SESSION_EXPIRATION = 45 * 60 * 1000;
 const MAX_HISTORY = 14;
 
 /** Evita processar a mesma mensagem 2x (@lid + @s.whatsapp.net ou retry do Baileys). */
@@ -621,17 +622,64 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
         const sessionExists = !!memoryCache[cacheKey];
         const isExpired = sessionExists && (now - memoryCache[cacheKey].lastUpdate > SESSION_EXPIRATION);
-        const activeSession = sessionExists && !isExpired;
+        if (sessionExists && isExpired) {
+          delete memoryCache[cacheKey];
+        }
+        const activeSession = !!memoryCache[cacheKey];
 
         const userGreetingEarly = detectUserGreeting(textMessage);
-        if (!activeSession && !hasSchedulingIntent(textMessage) && !userGreetingEarly) {
-            return; 
+        const schedulingIntent = hasSchedulingIntent(textMessage);
+
+        // Sem sessão: só entra por pedido de agenda OU saudação pura (sem abrir sessão de 45min).
+        if (!activeSession && !schedulingIntent && !userGreetingEarly) {
+            return;
+        }
+
+        const activeBarbeiros = await listActiveBarbeirosForUser(p.id);
+        const multiBarber = isMultiBarberTeam(
+          activeBarbeiros.map((b) => ({ id: b.id, nome: b.nome })),
+        );
+
+        const emphasizeWa = (
+          text: string,
+          ...extraNames: Array<string | null | undefined>
+        ) =>
+          applyWhatsAppEmphasis(text, [
+            ...activeBarbeiros.map((b) => b.nome),
+            ...extraNames.filter((n): n is string => !!n?.trim()),
+          ]);
+
+        // Saudação pura (Oi / Bom dia) → responde e NÃO abre sessão de agendamento.
+        // Assim "Oi" seguido de papo aleatório não chama a IA.
+        if (
+          !activeSession &&
+          userGreetingEarly &&
+          isPrimarilyGreeting(textMessage) &&
+          !schedulingIntent
+        ) {
+          const reply = emphasizeWa(
+            p.ai_use_emojis
+              ? `${userGreetingEarly}! 😊 Em que posso ajudar?`
+              : `${userGreetingEarly}! Em que posso ajudar?`,
+          );
+          log.info(WA, 'retribuindo saudação (sem abrir sessão)', {
+            email,
+            greeting: userGreetingEarly,
+          });
+          await sock.sendMessage(remoteJid, { text: reply });
+          await supabase
+            .from('profiles')
+            .update({ messages_answered: (p.messages_answered || 0) + 1 })
+            .eq('email', email);
+          return;
+        }
+
+        if (!activeSession && !schedulingIntent) {
+          return;
         }
 
         if (!activeSession) {
-            log.info(WA, userGreetingEarly && !hasSchedulingIntent(textMessage)
-              ? 'saudação detectada — abrindo conversa'
-              : 'intenção de agendamento detectada', { cacheKey });
+            log.info(WA, 'intenção de agendamento detectada — abrindo conversa', { cacheKey });
             memoryCache[cacheKey] = {
               lastUpdate: now,
               messages: [],
@@ -641,11 +689,6 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
         memoryCache[cacheKey].lastUpdate = now;
         memoryCache[cacheKey].messages.push({ role: 'user', content: textMessage });
-
-        const activeBarbeiros = await listActiveBarbeirosForUser(p.id);
-        const multiBarber = isMultiBarberTeam(
-          activeBarbeiros.map((b) => ({ id: b.id, nome: b.nome })),
-        );
 
         if (!memoryCache[cacheKey].scheduling) {
           memoryCache[cacheKey].scheduling = {
@@ -685,16 +728,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
           ? userGreeting || greetingForNowBR()
           : null;
 
-        const emphasizeWa = (
-          text: string,
-          ...extraNames: Array<string | null | undefined>
-        ) =>
-          applyWhatsAppEmphasis(text, [
-            ...activeBarbeiros.map((b) => b.nome),
-            ...extraNames.filter((n): n is string => !!n?.trim()),
-          ]);
-
-        // Só saudação → retribuir na hora (sem chamar a IA).
+        // Saudação pura no meio da sessão → só retribuir (sem Gemini).
         if (userGreeting && isPrimarilyGreeting(textMessage)) {
           const reply = emphasizeWa(
             p.ai_use_emojis

@@ -46,16 +46,70 @@ export type SchedulingBarberState = {
 export const isMultiBarberTeam = (activeBarbeiros: ActiveBarbeiroForAi[]): boolean =>
   activeBarbeiros.length > 1;
 
+/**
+ * Gate para ABRIR conversa com a IA (mensagem sem sessão activa).
+ * Tem de ser estrito: "hoje"/"amanhã"/qualquer dígito sozinhos NÃO bastam
+ * (ex.: "vou na academia hoje" não é pedido de horário).
+ * Dentro de sessão activa, o WhatsApp aceita "19", "Marcos", "sim" sem isto.
+ */
 export const hasSchedulingIntent = (message: string): boolean => {
     if (!message) return false;
-    const lowerMsg = message.toLowerCase().trim();
-    const keywords = [
-      'horário', 'horario', 'agendar', 'marcar', 'vaga', 'disponível', 'disponivel',
-      'amanhã', 'amanha', 'hoje', 'agenda', 'reservar', 'sessão', 'marcado', 'cancelar',
-      'desmarcar', 'mudar', 'trocar', 'barbeiro', 'profissional', 'corte', 'cabelo',
-      'manicure', 'unha', 'unhas', 'escova', 'barba', 'estética', 'estetica',
+    const m = message
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .trim();
+    if (!m) return false;
+
+    const strong = [
+      'agendar',
+      'marcar',
+      'marcacao',
+      'horario',
+      'agenda',
+      'vaga',
+      'disponivel',
+      'reservar',
+      'desmarcar',
+      'cancelar',
+      'reagendar',
+      'remarcar',
+      'remarcacao',
     ];
-    return keywords.some(keyword => lowerMsg.includes(keyword)) || /\d/.test(lowerMsg);
+    if (strong.some((k) => m.includes(k))) return true;
+
+    const services = [
+      'barbeiro',
+      'profissional',
+      'corte',
+      'cabelo',
+      'barba',
+      'manicure',
+      'unha',
+      'unhas',
+      'escova',
+      'estetica',
+      'sessao',
+    ];
+    if (services.some((k) => m.includes(k))) return true;
+
+    const hasDayWord =
+      /\b(hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo)\b/.test(m);
+    const hasClock =
+      /\b([01]?\d|2[0-3])\s*h([0-5]\d)?\b/.test(m) ||
+      /\b([01]?\d|2[0-3]):[0-5]\d\b/.test(m);
+    const hasIntentVerb =
+      /\b(quero|queria|preciso|da pra|da para)\b/.test(m) ||
+      /\btem\s+(vaga|horario|hora|disponibilidade)\b/.test(m) ||
+      /\bpode\s+(marcar|agendar|ser)\b/.test(m);
+
+    // "quero cortar amanhã" / "tem vaga hoje às 15h"
+    if (hasDayWord && (hasClock || hasIntentVerb || services.some((k) => m.includes(k)))) {
+      return true;
+    }
+    if (hasClock && hasIntentVerb) return true;
+
+    return false;
 };
 
 type AiJsonPayload = {

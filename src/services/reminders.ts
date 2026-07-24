@@ -293,10 +293,11 @@ async function processDueReminders(): Promise<void> {
 
     try {
       await sock.sendMessage(jid, { text });
+      const sentAt = new Date().toISOString();
       const { error: upErr } = await supabase
         .from('appointment_reminders')
         .update({
-          sent_at: new Date().toISOString(),
+          sent_at: sentAt,
           presence_status: 'pending',
           presence_replied_at: null,
         })
@@ -304,7 +305,21 @@ async function processDueReminders(): Promise<void> {
         .is('sent_at', null);
 
       if (upErr) {
-        log.error(TAG, 'enviado mas falhou ao marcar sent_at', upErr, { id: row.id });
+        // Evita reenvio em loop se colunas extras falharem (schema cache / migration).
+        const { error: fallbackErr } = await supabase
+          .from('appointment_reminders')
+          .update({ sent_at: sentAt })
+          .eq('id', row.id)
+          .is('sent_at', null);
+
+        if (fallbackErr) {
+          log.error(TAG, 'enviado mas falhou ao marcar sent_at', upErr, {
+            id: row.id,
+            fallback: fallbackErr,
+          });
+        } else {
+          log.error(TAG, 'enviado; sent_at ok sem presence_*', upErr, { id: row.id });
+        }
       } else {
         log.info(TAG, 'lembrete enviado', { email: profile.email, phone, id: row.id });
       }
