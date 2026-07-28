@@ -367,6 +367,7 @@ app.post('/api/settings/store', async (req: Request, res: Response) => {
         : null;
   }
   if (servicePrices !== undefined || service_prices !== undefined) {
+    // Tabela de preços: disponível em Basic, Pro e Pro+ (sem gate de plano).
     updatePayload.service_prices = normalizeServicePrices(
       servicePrices ?? service_prices,
     );
