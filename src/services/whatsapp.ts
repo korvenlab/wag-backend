@@ -62,6 +62,7 @@ import {
   resolveCancelReply,
   type ResponseTemplates,
 } from '../lib/responseTemplates';
+import { normalizeServicePrices } from '../lib/servicePrices';
 import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
@@ -628,7 +629,11 @@ export async function startWhatsApp(email: string, res: Response | null) {
         const activeSession = !!memoryCache[cacheKey];
 
         const userGreetingEarly = detectUserGreeting(textMessage);
-        const schedulingIntent = hasSchedulingIntent(textMessage);
+        const pricedServices = normalizeServicePrices(p.service_prices);
+        const schedulingIntent = hasSchedulingIntent(
+          textMessage,
+          pricedServices.map((s) => s.name),
+        );
 
         // Sem sessão: só entra por pedido de agenda OU saudação pura (sem abrir sessão de 45min).
         if (!activeSession && !schedulingIntent && !userGreetingEarly) {
@@ -817,6 +822,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
             service_duration: p.service_duration,
             business_niche: p.business_niche,
             business_niche_custom: p.business_niche_custom,
+            service_prices: p.service_prices,
             free_ranges_summary: freeRangesLabeled || null,
             response_templates: templates,
             is_first_reply: isFirstReply,

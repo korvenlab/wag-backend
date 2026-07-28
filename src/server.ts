@@ -22,6 +22,7 @@ import { generateAuthUrl, getTokensFromCode } from './services/googleAuth';
 import { getUserFromBearerHeader } from './lib/supabaseAuthUser';
 import { supabase } from './lib/supabase';
 import { isBusinessNicheId } from './lib/businessNiche';
+import { normalizeServicePrices } from './lib/servicePrices';
 import { requireBearerUser, sanitizeProfileForClient } from './lib/requireAuth';
 import { createGoogleOAuthState, verifyGoogleOAuthState } from './lib/googleOAuthState';
 import { log } from './lib/logger';
@@ -328,7 +329,13 @@ app.post('/api/settings/store', async (req: Request, res: Response) => {
   const authed = await requireBearerUser(req, res);
   if (!authed) return;
 
-  const { storeName, businessNiche, businessNicheCustom } = req.body;
+  const {
+    storeName,
+    businessNiche,
+    businessNicheCustom,
+    servicePrices,
+    service_prices,
+  } = req.body;
 
   if (businessNiche !== undefined && businessNiche !== null && !isBusinessNicheId(businessNiche)) {
     return res.status(400).json({
@@ -358,6 +365,11 @@ app.post('/api/settings/store', async (req: Request, res: Response) => {
       businessNiche === 'outro'
         ? String(businessNicheCustom).trim()
         : null;
+  }
+  if (servicePrices !== undefined || service_prices !== undefined) {
+    updatePayload.service_prices = normalizeServicePrices(
+      servicePrices ?? service_prices,
+    );
   }
 
   if (Object.keys(updatePayload).length === 0) {

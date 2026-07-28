@@ -5,6 +5,12 @@ import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
 import { resolveNicheVocabulary } from '../lib/businessNiche';
 import { templatesPromptBlock, type ResponseTemplates } from '../lib/responseTemplates';
+import {
+  messageMentionsPricedService,
+  normalizeServicePrices,
+  servicePricesPromptBlock,
+  type ServicePrice,
+} from '../lib/servicePrices';
 import { log } from '../lib/logger';
 import { isAskingProfessionalAvailability } from '../lib/dateTimeBR';
 
@@ -51,8 +57,12 @@ export const isMultiBarberTeam = (activeBarbeiros: ActiveBarbeiroForAi[]): boole
  * Tem de ser estrito: "hoje"/"amanhã"/qualquer dígito sozinhos NÃO bastam
  * (ex.: "vou na academia hoje" não é pedido de horário).
  * Dentro de sessão activa, o WhatsApp aceita "19", "Marcos", "sim" sem isto.
+ * `knownServiceNames` = nomes da tabela de preços do perfil (abre se o cliente citar o serviço).
  */
-export const hasSchedulingIntent = (message: string): boolean => {
+export const hasSchedulingIntent = (
+  message: string,
+  knownServiceNames: string[] = [],
+): boolean => {
     if (!message) return false;
     const m = message
       .toLowerCase()
@@ -75,8 +85,29 @@ export const hasSchedulingIntent = (message: string): boolean => {
       'reagendar',
       'remarcar',
       'remarcacao',
+      // Preços / valores
+      'preco',
+      'precos',
+      'valor',
+      'valores',
+      'tabela',
+      'cardapio',
+      'custa',
+      'quanto fica',
+      'quanto e',
+      'quanto custa',
     ];
     if (strong.some((k) => m.includes(k))) return true;
+    if (/\bquanto\b/.test(m) && /\b(custa|fica|sai|cobram|cobra)\b/.test(m)) return true;
+
+    if (
+      messageMentionsPricedService(
+        message,
+        knownServiceNames.map((name) => ({ name, price: '1' })),
+      )
+    ) {
+      return true;
+    }
 
     const services = [
       'barbeiro',
@@ -90,6 +121,17 @@ export const hasSchedulingIntent = (message: string): boolean => {
       'escova',
       'estetica',
       'sessao',
+      'coloracao',
+      'progressiva',
+      'hidratacao',
+      'luzes',
+      'mechas',
+      'pedicure',
+      'alongamento',
+      'depilacao',
+      'sobrancelha',
+      'massagem',
+      'peeling',
     ];
     if (services.some((k) => m.includes(k))) return true;
 
@@ -103,7 +145,6 @@ export const hasSchedulingIntent = (message: string): boolean => {
       /\btem\s+(vaga|horario|hora|disponibilidade)\b/.test(m) ||
       /\bpode\s+(marcar|agendar|ser)\b/.test(m);
 
-    // "quero cortar amanhã" / "tem vaga hoje às 15h"
     if (hasDayWord && (hasClock || hasIntentVerb || services.some((k) => m.includes(k)))) {
       return true;
     }
@@ -214,6 +255,7 @@ export const analyzeMessage = async (
         service_duration: number,
         business_niche?: string | null,
         business_niche_custom?: string | null,
+        service_prices?: ServicePrice[] | unknown,
         free_ranges_summary?: string | null,
         response_templates?: ResponseTemplates | null,
         is_first_reply?: boolean,
@@ -303,6 +345,8 @@ export const analyzeMessage = async (
 
         const freeRangesHint = dbRow.free_ranges_summary?.trim() || '';
         const templatesBlock = templatesPromptBlock(dbRow.response_templates ?? {});
+        const prices = normalizeServicePrices(dbRow.service_prices);
+        const pricesBlock = servicePricesPromptBlock(prices, niche.label);
         const emojiBlock = dbRow.ai_use_emojis
           ? `
         EMOJIS (ativos — use de forma natural e amigável):
@@ -335,6 +379,7 @@ export const analyzeMessage = async (
         - Singular: "${professional}" | Plural: "${professionals}"
         - Nunca diga "barbeiro", "barbeiros" ou "barbearia" salvo se o nicho for barbearia.
         - Nunca invente outro tipo de negócio.
+        ${pricesBlock}
         ${templatesBlock}
         ${emojiBlock}
         ${firstReplyBlock}
