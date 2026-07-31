@@ -26,6 +26,70 @@ type BookingServiceRow = {
   sort_order: number;
 };
 
+type PublishMissing = 'store_name' | 'services' | 'working_hours';
+
+const MISSING_LABELS: Record<PublishMissing, string> = {
+  store_name: 'Falta o nome do negócio',
+  services: 'Falta adicionar pelo menos 1 serviço',
+  working_hours:
+    'Falta definir horário de funcionamento (ative manhã/tarde/noite em algum dia)',
+};
+
+function hoursHaveOpenWindow(hours: unknown): boolean {
+  if (!hours || typeof hours !== 'object') return false;
+  return Object.values(hours as Record<string, Record<string, unknown>>).some(
+    (d) =>
+      Boolean(d?.isTurno1Active) ||
+      Boolean(d?.isTurno2Active) ||
+      Boolean(d?.isTurno3Active),
+  );
+}
+
+async function collectPublishMissing(
+  userId: string,
+  overrides: {
+    store_name?: string;
+    working_hours?: unknown;
+  } = {},
+): Promise<{ missing: PublishMissing[]; messages: string[] }> {
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('store_name, working_hours')
+    .eq('id', userId)
+    .maybeSingle();
+
+  const { count: serviceCount } = await supabase
+    .from('booking_services')
+    .select('id', { count: 'exact', head: true })
+    .eq('profile_id', userId)
+    .eq('active', true);
+
+  const storeName = String(overrides.store_name ?? profile?.store_name ?? '').trim();
+  const hours = overrides.working_hours ?? profile?.working_hours;
+
+  const missing: PublishMissing[] = [];
+  if (storeName.length < 2) missing.push('store_name');
+  if (!serviceCount || serviceCount < 1) missing.push('services');
+  if (!hoursHaveOpenWindow(hours)) missing.push('working_hours');
+
+  return {
+    missing,
+    messages: missing.map((m) => MISSING_LABELS[m]),
+  };
+}
+
+function frontendBase(): string {
+  return (process.env.FRONTEND_URL || 'https://wagoobot.com').replace(/\/$/, '');
+}
+
+function publicUrls(slug: string | null | undefined) {
+  if (!slug) return { publicUrl: null, agendaUrl: null };
+  return {
+    publicUrl: `${frontendBase()}/a/${slug}`,
+    agendaUrl: `${frontendBase()}/a/${slug}/agenda`,
+  };
+}
+
 async function requireAgendaWebOwner(req: Request): Promise<
   | { ok: true; userId: string }
   | { ok: false; status: number; error: string }
@@ -53,7 +117,7 @@ async function requireAgendaWebOwner(req: Request): Promise<
     return {
       ok: false,
       status: 403,
-      error: 'Este recurso é exclusivo do plano Agenda Web.',
+      error: 'Agenda Web disponível nos planos Agenda Web, Basic, Pro e Pro+.',
     };
   }
 
@@ -105,7 +169,6 @@ async function loadPublishedSite(slug: string) {
   return data;
 }
 
-/** Config + serviços + próximos agendamentos (dono). */
 router.get('/me', async (req: Request, res: Response) => {
   const gate = await requireAgendaWebOwner(req);
   if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
@@ -122,32 +185,48 @@ router.get('/me', async (req: Request, res: Response) => {
     return res.status(500).json({ error: error?.message || 'Perfil não encontrado.' });
   }
 
-  const { data: services } = await supabase
-    .from('booking_services')
-    .select('*')
-    .eq('profile_id', gate.userId)
-    .order('sort_order', { ascending: true });
+  const [{ data: services }, { data: providers }, { data: appointments }, publishCheck] =
+    await Promise.all([
+      supabase
+        .from('booking_services')
+        .select('*')
+        .eq('profile_id', gate.userId)
+        .order('sort_order', { ascending: true }),
+      supabase
+        .from('booking_providers')
+        .select('*')
+        .eq('profile_id', gate.userId)
+        .order('sort_order', { ascending: true }),
+      supabase
+        .from('booking_appointments')
+        .select(
+          '*, booking_services(name, duration_minutes, price_brl), booking_providers(id, name)',
+        )
+        .eq('profile_id', gate.userId)
+        .gte('starts_at', dayjs().subtract(1, 'day').toISOString())
+        .order('starts_at', { ascending: true })
+        .limit(50),
+      collectPublishMissing(gate.userId, {
+        store_name: profile.store_name ?? undefined,
+        working_hours: profile.working_hours,
+      }),
+    ]);
 
-  const { data: appointments } = await supabase
-    .from('booking_appointments')
-    .select('*, booking_services(name, duration_minutes, price_brl)')
-    .eq('profile_id', gate.userId)
-    .gte('starts_at', dayjs().subtract(1, 'day').toISOString())
-    .order('starts_at', { ascending: true })
-    .limit(50);
-
-  const frontend = (process.env.FRONTEND_URL || 'https://wagoobot.com').replace(/\/$/, '');
-  const publicUrl = profile.booking_slug ? `${frontend}/a/${profile.booking_slug}` : null;
+  const urls = publicUrls(profile.booking_slug);
 
   res.json({
     profile,
     services: services ?? [],
+    providers: providers ?? [],
     appointments: appointments ?? [],
-    publicUrl,
+    publicUrl: urls.publicUrl,
+    agendaUrl: urls.agendaUrl,
+    publishReady: publishCheck.missing.length === 0,
+    missing: publishCheck.missing,
+    missingMessages: publishCheck.messages,
   });
 });
 
-/** Atualiza dados da vitrine / slug. */
 router.patch('/me', async (req: Request, res: Response) => {
   const gate = await requireAgendaWebOwner(req);
   if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
@@ -157,10 +236,15 @@ router.patch('/me', async (req: Request, res: Response) => {
 
   if (typeof body.store_name === 'string') {
     const name = body.store_name.trim().slice(0, 80);
-    if (name.length < 2) return res.status(400).json({ error: 'Nome da barbearia inválido.' });
+    if (name.length < 2) {
+      return res.status(400).json({
+        error: MISSING_LABELS.store_name,
+        missing: ['store_name'] as PublishMissing[],
+        missingMessages: [MISSING_LABELS.store_name],
+      });
+    }
     patch.store_name = name;
-    const slug = await resolveUniqueBookingSlug(name, gate.userId);
-    patch.booking_slug = slug;
+    patch.booking_slug = await resolveUniqueBookingSlug(name, gate.userId);
   }
   if (typeof body.booking_tagline === 'string') {
     patch.booking_tagline = body.booking_tagline.trim().slice(0, 120);
@@ -181,51 +265,23 @@ router.patch('/me', async (req: Request, res: Response) => {
     patch.working_hours = body.working_hours;
   }
 
-  // Horário padrão se ainda não configurado (necessário para gerar slots).
-  if (patch.booking_published === true || patch.store_name) {
-    const { data: curWh } = await supabase
-      .from('profiles')
-      .select('working_hours')
-      .eq('id', gate.userId)
-      .maybeSingle();
-    const wh = curWh?.working_hours;
-    const empty =
-      !wh ||
-      typeof wh !== 'object' ||
-      Object.keys(wh as object).length === 0;
-    if (empty && !patch.working_hours) {
-      const day = {
-        startTime: '09:00',
-        endTime: '12:00',
-        isTurno1Active: true,
-        startTime2: '14:00',
-        endTime2: '19:00',
-        isTurno2Active: true,
-        startTime3: '19:00',
-        endTime3: '22:00',
-        isTurno3Active: false,
-      };
-      patch.working_hours = {
-        'Segunda-feira': { ...day },
-        'Terça-feira': { ...day },
-        'Quarta-feira': { ...day },
-        'Quinta-feira': { ...day },
-        'Sexta-feira': { ...day },
-        Sábado: {
-          ...day,
-          endTime2: '18:00',
-          isTurno2Active: true,
-        },
-        Domingo: { ...day, isTurno1Active: false, isTurno2Active: false },
-      };
-    }
-  }
-
   if (Object.keys(patch).length === 0) {
     return res.status(400).json({ error: 'Nada para atualizar.' });
   }
 
   if (patch.booking_published === true) {
+    const check = await collectPublishMissing(gate.userId, {
+      store_name: typeof patch.store_name === 'string' ? patch.store_name : undefined,
+      working_hours: patch.working_hours,
+    });
+    if (check.missing.length > 0) {
+      return res.status(400).json({
+        error: `Não deu para publicar. Ainda falta: ${check.messages.join('; ')}.`,
+        missing: check.missing,
+        missingMessages: check.messages,
+      });
+    }
+
     const { data: cur } = await supabase
       .from('profiles')
       .select('booking_slug, store_name')
@@ -234,9 +290,6 @@ router.patch('/me', async (req: Request, res: Response) => {
     const slug = (patch.booking_slug as string) || cur?.booking_slug;
     if (!slug) {
       const name = String(patch.store_name || cur?.store_name || '').trim();
-      if (name.length < 2) {
-        return res.status(400).json({ error: 'Defina o nome da barbearia antes de publicar.' });
-      }
       patch.booking_slug = await resolveUniqueBookingSlug(name, gate.userId);
       if (!patch.store_name) patch.store_name = name;
     }
@@ -253,20 +306,30 @@ router.patch('/me', async (req: Request, res: Response) => {
 
   if (error) return res.status(500).json({ error: error.message });
 
-  const frontend = (process.env.FRONTEND_URL || 'https://wagoobot.com').replace(/\/$/, '');
+  const urls = publicUrls(data?.booking_slug);
+  const publishCheck = await collectPublishMissing(gate.userId, {
+    store_name: data?.store_name ?? undefined,
+    working_hours: data?.working_hours,
+  });
+
   res.json({
     profile: data,
-    publicUrl: data?.booking_slug ? `${frontend}/a/${data.booking_slug}` : null,
+    publicUrl: urls.publicUrl,
+    agendaUrl: urls.agendaUrl,
+    publishReady: publishCheck.missing.length === 0,
+    missing: publishCheck.missing,
+    missingMessages: publishCheck.messages,
   });
 });
 
-/** Upload de imagem (logo ou serviço) via data URL → Storage. */
 router.post('/upload', async (req: Request, res: Response) => {
   const gate = await requireAgendaWebOwner(req);
   if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
 
   const dataUrl = typeof req.body?.dataUrl === 'string' ? req.body.dataUrl : '';
-  const kind = req.body?.kind === 'service' ? 'service' : 'logo';
+  const kindRaw = String(req.body?.kind || 'logo');
+  const kind =
+    kindRaw === 'service' ? 'service' : kindRaw === 'provider' ? 'provider' : 'logo';
   const match = /^data:(image\/(?:png|jpeg|jpg|webp));base64,([A-Za-z0-9+/=]+)$/i.exec(dataUrl);
   if (!match) {
     return res.status(400).json({ error: 'Envie dataUrl de imagem PNG/JPEG/WebP.' });
@@ -288,6 +351,94 @@ router.post('/upload', async (req: Request, res: Response) => {
 
   const { data: pub } = supabase.storage.from('booking-assets').getPublicUrl(path);
   res.json({ url: pub.publicUrl });
+});
+
+/** ——— Providers (profissionais) ——— */
+
+router.post('/providers', async (req: Request, res: Response) => {
+  const gate = await requireAgendaWebOwner(req);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+  const name = String(req.body?.name ?? '').trim().slice(0, 80);
+  if (name.length < 2) return res.status(400).json({ error: 'Informe o nome do profissional.' });
+
+  const bio = String(req.body?.bio ?? '').trim().slice(0, 300);
+  const photoUrl =
+    typeof req.body?.photo_url === 'string'
+      ? req.body.photo_url.trim().slice(0, 500) || null
+      : typeof req.body?.photoUrl === 'string'
+        ? req.body.photoUrl.trim().slice(0, 500) || null
+        : null;
+
+  const { count } = await supabase
+    .from('booking_providers')
+    .select('id', { count: 'exact', head: true })
+    .eq('profile_id', gate.userId);
+
+  const { data, error } = await supabase
+    .from('booking_providers')
+    .insert({
+      profile_id: gate.userId,
+      name,
+      bio,
+      photo_url: photoUrl,
+      sort_order: count ?? 0,
+      active: true,
+    })
+    .select('*')
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+router.patch('/providers/:id', async (req: Request, res: Response) => {
+  const gate = await requireAgendaWebOwner(req);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+  const id = String(req.params.id || '');
+  const body = req.body as Record<string, unknown>;
+  const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
+
+  if (typeof body.name === 'string') {
+    const name = body.name.trim().slice(0, 80);
+    if (name.length < 2) return res.status(400).json({ error: 'Nome inválido.' });
+    patch.name = name;
+  }
+  if (typeof body.bio === 'string') patch.bio = body.bio.trim().slice(0, 300);
+  if (typeof body.photo_url === 'string' || typeof body.photoUrl === 'string') {
+    const u = String(body.photo_url ?? body.photoUrl).trim().slice(0, 500);
+    patch.photo_url = u || null;
+  }
+  if (typeof body.active === 'boolean') patch.active = body.active;
+  if (typeof body.sort_order === 'number') patch.sort_order = body.sort_order;
+
+  const { data, error } = await supabase
+    .from('booking_providers')
+    .update(patch)
+    .eq('id', id)
+    .eq('profile_id', gate.userId)
+    .select('*')
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: 'Profissional não encontrado.' });
+  res.json(data);
+});
+
+router.delete('/providers/:id', async (req: Request, res: Response) => {
+  const gate = await requireAgendaWebOwner(req);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+  const id = String(req.params.id || '');
+  const { error } = await supabase
+    .from('booking_providers')
+    .delete()
+    .eq('id', id)
+    .eq('profile_id', gate.userId);
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true });
 });
 
 router.post('/services', async (req: Request, res: Response) => {
@@ -428,22 +579,98 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
   const site = await loadPublishedSite(slug);
   if (!site) return res.status(404).json({ error: 'Agenda não encontrada ou não publicada.' });
 
-  const { data: services } = await supabase
-    .from('booking_services')
-    .select('id, name, description, price_brl, duration_minutes, image_url')
-    .eq('profile_id', site.id)
-    .eq('active', true)
-    .order('sort_order', { ascending: true });
+  const [{ data: services }, { data: providers }] = await Promise.all([
+    supabase
+      .from('booking_services')
+      .select('id, name, description, price_brl, duration_minutes, image_url')
+      .eq('profile_id', site.id)
+      .eq('active', true)
+      .order('sort_order', { ascending: true }),
+    supabase
+      .from('booking_providers')
+      .select('id, name, photo_url, bio')
+      .eq('profile_id', site.id)
+      .eq('active', true)
+      .order('sort_order', { ascending: true }),
+  ]);
 
   res.setHeader('Cache-Control', 'no-store');
   res.json({
-    store_name: site.store_name || 'Barbearia',
+    store_name: site.store_name || 'Negócio',
     slug: site.booking_slug,
     logo_url: site.booking_logo_url,
     tagline: site.booking_tagline || 'Agende online',
     phone: site.booking_phone,
     address: site.booking_address,
     services: services ?? [],
+    providers: providers ?? [],
+  });
+});
+
+/** Vista pública: dias ocupados / livres (somente booking_appointments). */
+router.get('/public/:slug/calendar', async (req: Request, res: Response) => {
+  const slug = String(req.params.slug || '').trim().toLowerCase();
+  const site = await loadPublishedSite(slug);
+  if (!site) return res.status(404).json({ error: 'Agenda não encontrada.' });
+
+  const from = String(req.query.from || dayjs().tz(BR_TZ).format('YYYY-MM-DD'));
+  const to = String(req.query.to || dayjs().tz(BR_TZ).add(30, 'day').format('YYYY-MM-DD'));
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+    return res.status(400).json({ error: 'Use from= e to= no formato YYYY-MM-DD.' });
+  }
+
+  const rangeStart = dayjs.tz(`${from}T00:00:00`, BR_TZ);
+  const rangeEnd = dayjs.tz(`${to}T23:59:59`, BR_TZ);
+
+  const { data: busy } = await supabase
+    .from('booking_appointments')
+    .select(
+      'id, starts_at, ends_at, status, booking_services(name), booking_providers(name)',
+    )
+    .eq('profile_id', site.id)
+    .eq('status', 'confirmed')
+    .gte('starts_at', rangeStart.toISOString())
+    .lte('starts_at', rangeEnd.toISOString())
+    .order('starts_at', { ascending: true });
+
+  const days: Record<
+    string,
+    { date: string; open: boolean; bookedCount: number; appointments: unknown[] }
+  > = {};
+
+  let cursor = rangeStart.startOf('day');
+  const last = rangeEnd.startOf('day');
+  while (cursor.isBefore(last) || cursor.isSame(last, 'day')) {
+    const key = cursor.format('YYYY-MM-DD');
+    const windows = dayWindowsFromWorkingHours(site.working_hours, key);
+    days[key] = {
+      date: key,
+      open: windows.length > 0,
+      bookedCount: 0,
+      appointments: [],
+    };
+    cursor = cursor.add(1, 'day');
+  }
+
+  for (const row of busy ?? []) {
+    const key = dayjs(row.starts_at).tz(BR_TZ).format('YYYY-MM-DD');
+    if (!days[key]) continue;
+    days[key].bookedCount += 1;
+    days[key].appointments.push({
+      starts_at: row.starts_at,
+      ends_at: row.ends_at,
+      service: (row as { booking_services?: { name?: string } | null }).booking_services?.name,
+      provider: (row as { booking_providers?: { name?: string } | null }).booking_providers?.name,
+    });
+  }
+
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    store_name: site.store_name,
+    slug: site.booking_slug,
+    from,
+    to,
+    days: Object.values(days),
   });
 });
 
@@ -453,7 +680,8 @@ router.get('/public/:slug/slots', async (req: Request, res: Response) => {
   if (!site) return res.status(404).json({ error: 'Agenda não encontrada.' });
 
   const serviceId = String(req.query.serviceId || req.query.service_id || '');
-  const day = String(req.query.day || ''); // YYYY-MM-DD
+  const providerId = String(req.query.providerId || req.query.provider_id || '').trim();
+  const day = String(req.query.day || '');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
     return res.status(400).json({ error: 'Informe day=YYYY-MM-DD.' });
   }
@@ -468,6 +696,17 @@ router.get('/public/:slug/slots', async (req: Request, res: Response) => {
 
   if (!service) return res.status(404).json({ error: 'Serviço não encontrado.' });
 
+  if (providerId) {
+    const { data: provider } = await supabase
+      .from('booking_providers')
+      .select('id')
+      .eq('id', providerId)
+      .eq('profile_id', site.id)
+      .eq('active', true)
+      .maybeSingle();
+    if (!provider) return res.status(404).json({ error: 'Profissional não encontrado.' });
+  }
+
   const duration = (service as BookingServiceRow).duration_minutes;
   const windows = dayWindowsFromWorkingHours(site.working_hours, day);
   if (!windows.length) return res.json({ slots: [] });
@@ -476,13 +715,19 @@ router.get('/public/:slug/slots', async (req: Request, res: Response) => {
   const dayEnd = dayStart.add(1, 'day');
   const now = dayjs().tz(BR_TZ);
 
-  const { data: busy } = await supabase
+  let busyQuery = supabase
     .from('booking_appointments')
-    .select('starts_at, ends_at')
+    .select('starts_at, ends_at, provider_id')
     .eq('profile_id', site.id)
     .eq('status', 'confirmed')
     .lt('starts_at', dayEnd.toISOString())
     .gt('ends_at', dayStart.toISOString());
+
+  if (providerId) {
+    busyQuery = busyQuery.or(`provider_id.eq.${providerId},provider_id.is.null`);
+  }
+
+  const { data: busy } = await busyQuery;
 
   const busyRanges = (busy ?? []).map((b) => ({
     start: dayjs(b.starts_at).tz(BR_TZ),
@@ -515,6 +760,8 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
   if (!site) return res.status(404).json({ error: 'Agenda não encontrada.' });
 
   const serviceId = String(req.body?.serviceId ?? req.body?.service_id ?? '');
+  const providerIdRaw = String(req.body?.providerId ?? req.body?.provider_id ?? '').trim();
+  const providerId = providerIdRaw || null;
   const clientName = String(req.body?.clientName ?? req.body?.client_name ?? '').trim().slice(0, 80);
   const clientPhone = String(req.body?.clientPhone ?? req.body?.client_phone ?? '')
     .replace(/\D/g, '')
@@ -540,6 +787,19 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
 
   if (!service) return res.status(404).json({ error: 'Serviço não encontrado.' });
 
+  let providerName: string | null = null;
+  if (providerId) {
+    const { data: provider } = await supabase
+      .from('booking_providers')
+      .select('id, name')
+      .eq('id', providerId)
+      .eq('profile_id', site.id)
+      .eq('active', true)
+      .maybeSingle();
+    if (!provider) return res.status(404).json({ error: 'Profissional não encontrado.' });
+    providerName = provider.name;
+  }
+
   const duration = (service as BookingServiceRow).duration_minutes;
   const endsAt = startsAt.add(duration, 'minute');
   const day = startsAt.tz(BR_TZ).format('YYYY-MM-DD');
@@ -554,7 +814,7 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
   });
   if (!inWindow) return res.status(400).json({ error: 'Horário fora do funcionamento.' });
 
-  const { data: busy } = await supabase
+  let busyQuery = supabase
     .from('booking_appointments')
     .select('starts_at, ends_at')
     .eq('profile_id', site.id)
@@ -562,6 +822,11 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
     .lt('starts_at', endsAt.toISOString())
     .gt('ends_at', startsAt.toISOString());
 
+  if (providerId) {
+    busyQuery = busyQuery.or(`provider_id.eq.${providerId},provider_id.is.null`);
+  }
+
+  const { data: busy } = await busyQuery;
   if ((busy ?? []).length > 0) {
     return res.status(409).json({ error: 'Horário acabou de ser preenchido. Escolha outro.' });
   }
@@ -571,13 +836,14 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
     .insert({
       profile_id: site.id,
       service_id: serviceId,
+      provider_id: providerId,
       client_name: clientName,
       client_phone: clientPhone,
       starts_at: startsAt.toISOString(),
       ends_at: endsAt.toISOString(),
       status: 'confirmed',
     })
-    .select('id, starts_at, ends_at, client_name, status')
+    .select('id, starts_at, ends_at, client_name, status, provider_id')
     .single();
 
   if (error) return res.status(500).json({ error: error.message });
@@ -589,11 +855,11 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
       price_brl: (service as BookingServiceRow).price_brl,
       duration_minutes: duration,
     },
+    provider: providerName ? { id: providerId, name: providerName } : null,
     store_name: site.store_name,
   });
 });
 
-/** Consulta agendamentos do cliente por telefone. */
 router.get('/public/:slug/my', async (req: Request, res: Response) => {
   const slug = String(req.params.slug || '').trim().toLowerCase();
   const site = await loadPublishedSite(slug);
@@ -604,7 +870,9 @@ router.get('/public/:slug/my', async (req: Request, res: Response) => {
 
   const { data } = await supabase
     .from('booking_appointments')
-    .select('id, starts_at, ends_at, status, client_name, booking_services(name, price_brl, duration_minutes)')
+    .select(
+      'id, starts_at, ends_at, status, client_name, booking_services(name, price_brl, duration_minutes), booking_providers(name)',
+    )
     .eq('profile_id', site.id)
     .eq('client_phone', phone)
     .neq('status', 'cancelled')

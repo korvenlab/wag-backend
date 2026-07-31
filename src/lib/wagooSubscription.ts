@@ -108,8 +108,18 @@ export function tierSupportsCsvExport(tier: WagooSubscriptionTier | null): boole
   return tier === 'pro' || tier === 'pro_plus';
 }
 
-/** Site público de agendamento (wizard) — plano Agenda Web. */
+/** Site público de agendamento — Agenda Web standalone OU planos com IA (Basic/Pro/Pro+). */
 export function tierSupportsPublicBooking(tier: WagooSubscriptionTier | null): boolean {
+  return (
+    tier === 'agenda_web' ||
+    tier === 'basic' ||
+    tier === 'pro' ||
+    tier === 'pro_plus'
+  );
+}
+
+/** Assinatura só Agenda Web (sem dashboard de IA). */
+export function tierIsAgendaWebOnly(tier: WagooSubscriptionTier | null): boolean {
   return tier === 'agenda_web';
 }
 
