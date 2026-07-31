@@ -9,9 +9,10 @@ import feedbackRoutes from './routes/feedback';
 import promoRoutes from './routes/promo';
 import barbeirosRoutes from './routes/barbeiros';
 import calendarRoutes from './routes/calendar';
+import bookingRoutes from './routes/booking';
 import { profileHasWagooAccess } from './lib/profileAccess';
 import { profileHasMultiBarberPlan, profileSubscriptionTier } from './lib/profileMultiBarber';
-import { getMaxBarbeirosSlots, WAGOO_PLANS, tierSupportsReminders } from './lib/wagooSubscription';
+import { getMaxBarbeirosSlots, WAGOO_PLANS, tierSupportsReminders, tierSupportsAi, tierSupportsPublicBooking } from './lib/wagooSubscription';
 import { countBarbeirosForUser } from './lib/barbeiros';
 import { syncCalendarShareSlug } from './lib/storeSlug';
 import { pushAdminEvent } from './services/adminEvents';
@@ -77,12 +78,13 @@ app.use(cors({
 }));
 
 app.use('/api/stripe', stripeRoutes);
-app.use(express.json());
+app.use(express.json({ limit: '4mb' }));
 app.use('/feedback', feedbackRoutes);
 app.use('/api/admin', adminDashboardRoutes);
 app.use('/api/promo', promoRoutes);
 app.use('/api/barbeiros', barbeirosRoutes);
 app.use('/api/calendar', calendarRoutes);
+app.use('/api/booking', bookingRoutes);
 
 // --- 1. ROTA DE PERFIL (somente dono da sessão — Bearer Supabase) ---
 app.get('/api/user/profile', async (req: Request, res: Response) => {
@@ -126,6 +128,8 @@ app.get('/api/user/profile', async (req: Request, res: Response) => {
       max_team_users: maxTeamUsers,
       team_users_used: teamUsersUsed,
       plan_label: tier ? WAGOO_PLANS[tier].label : null,
+      supports_ai: tierSupportsAi(tier),
+      supports_public_booking: tierSupportsPublicBooking(tier),
     });
   } catch {
     res.status(500).json({ error: 'Erro interno' });

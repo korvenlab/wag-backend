@@ -81,7 +81,7 @@ async function createCheckoutForTier(req: Request, res: Response, defaultTier: W
     }
     if (!tier) {
       return res.status(400).json({
-        error: 'planTier inválido. Use: basic, pro ou pro_plus.',
+        error: 'planTier inválido. Use: agenda_web, basic, pro ou pro_plus.',
       });
     }
 
@@ -99,7 +99,11 @@ async function createCheckoutForTier(req: Request, res: Response, defaultTier: W
 
     const frontendUrl = process.env.FRONTEND_URL?.trim().replace(/\/$/, '');
     const successPath =
-      tier === 'basic' ? '/dashboard?checkout=success' : '/dashboard/equipe?checkout=success';
+      tier === 'agenda_web'
+        ? '/dashboard/agenda-web?checkout=success'
+        : tier === 'basic'
+          ? '/dashboard?checkout=success'
+          : '/dashboard/equipe?checkout=success';
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],

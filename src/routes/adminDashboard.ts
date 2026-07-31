@@ -1340,7 +1340,7 @@ async function handleUserSubscriptionTier(req: Request, res: Response): Promise<
       res,
       400,
       'VALIDATION_ERROR',
-      'id e subscriptionTier (basic | pro | pro_plus | none) são obrigatórios.',
+      'id e subscriptionTier (agenda_web | basic | pro | pro_plus | none) são obrigatórios.',
     );
     return;
   }

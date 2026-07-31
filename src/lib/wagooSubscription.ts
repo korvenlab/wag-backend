@@ -1,6 +1,11 @@
-export type WagooSubscriptionTier = 'basic' | 'pro' | 'pro_plus';
+export type WagooSubscriptionTier = 'agenda_web' | 'basic' | 'pro' | 'pro_plus';
 
-export const WAGOO_TIERS: WagooSubscriptionTier[] = ['basic', 'pro', 'pro_plus'];
+export const WAGOO_TIERS: WagooSubscriptionTier[] = [
+  'agenda_web',
+  'basic',
+  'pro',
+  'pro_plus',
+];
 
 export type WagooPlanDefinition = {
   tier: WagooSubscriptionTier;
@@ -12,6 +17,13 @@ export type WagooPlanDefinition = {
 
 /** `maxTeamUsers` = limite de profissionais na equipe (`barbeiros`). */
 export const WAGOO_PLANS: Record<WagooSubscriptionTier, WagooPlanDefinition> = {
+  agenda_web: {
+    tier: 'agenda_web',
+    label: 'Agenda Web',
+    priceBrl: 20,
+    maxTeamUsers: 1,
+    stripePriceEnvKey: 'STRIPE_PRICE_ID_AGENDA_WEB',
+  },
   basic: {
     tier: 'basic',
     label: 'Basic',
@@ -38,6 +50,7 @@ export const WAGOO_PLANS: Record<WagooSubscriptionTier, WagooPlanDefinition> = {
 export function normalizeSubscriptionTier(raw: unknown): WagooSubscriptionTier | null {
   if (raw == null || raw === '') return null;
   const s = String(raw).trim().toLowerCase().replace(/-/g, '_');
+  if (s === 'agenda_web' || s === 'agendaweb' || s === 'agenda') return 'agenda_web';
   if (s === 'proplus' || s === 'pro_plus' || s === 'pro+') return 'pro_plus';
   if (s === 'pro') return 'pro';
   if (s === 'basic') return 'basic';
@@ -93,6 +106,16 @@ export function tierSupportsReminders(tier: WagooSubscriptionTier | null): boole
 /** Export CSV de agendamentos (analytics) — só Pro e Pro+. */
 export function tierSupportsCsvExport(tier: WagooSubscriptionTier | null): boolean {
   return tier === 'pro' || tier === 'pro_plus';
+}
+
+/** Site público de agendamento (wizard) — plano Agenda Web. */
+export function tierSupportsPublicBooking(tier: WagooSubscriptionTier | null): boolean {
+  return tier === 'agenda_web';
+}
+
+/** WhatsApp + IA + Google Calendar — planos Basic / Pro / Pro+. */
+export function tierSupportsAi(tier: WagooSubscriptionTier | null): boolean {
+  return tier === 'basic' || tier === 'pro' || tier === 'pro_plus';
 }
 
 export function syncLegacyFlagsFromTier(tier: WagooSubscriptionTier | null): {
