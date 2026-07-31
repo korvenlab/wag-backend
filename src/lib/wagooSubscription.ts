@@ -98,9 +98,12 @@ export function tierSupportsMultiBarberAi(tier: WagooSubscriptionTier | null): b
   return getMaxBarbeirosSlots(tier) > 1;
 }
 
-/** Lembretes WhatsApp antes do horário — só Pro e Pro+. */
+/**
+ * Lembretes WhatsApp (script, sem IA) — Agenda Web + Pro + Pro+.
+ * Basic fica de fora (upsell).
+ */
 export function tierSupportsReminders(tier: WagooSubscriptionTier | null): boolean {
-  return tier === 'pro' || tier === 'pro_plus';
+  return tier === 'agenda_web' || tier === 'pro' || tier === 'pro_plus';
 }
 
 /** Export CSV de agendamentos (analytics) — só Pro e Pro+. */

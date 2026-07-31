@@ -110,6 +110,117 @@ export async function cancelAppointmentReminder(
   }
 }
 
+/** Chave estável na fila de lembretes para agendamentos da Agenda Web. */
+export function bookingReminderEventId(appointmentId: string): string {
+  return `booking:${appointmentId}`;
+}
+
+function buildBookingConfirmationText(input: {
+  clientName: string;
+  storeName: string;
+  startsAtIso: string;
+  serviceNames: string;
+  providerName?: string | null;
+}): string {
+  const when = formatDateTimeBR(input.startsAtIso);
+  const firstName = input.clientName.trim().split(/\s+/)[0] || null;
+  const hello = firstName ? `Oi, ${firstName}!` : 'Oi!';
+  const store = input.storeName.trim() || 'nós';
+  const services = input.serviceNames.trim();
+  const prof =
+    input.providerName && !input.providerName.toLowerCase().includes('sem prefer')
+      ? ` com ${input.providerName}`
+      : '';
+  const body =
+    `${hello} Seu horário em *${store}* está confirmado.\n\n` +
+    `📅 ${when}${prof}\n` +
+    (services ? `✂️ ${services}\n` : '') +
+    `\nTe esperamos! Se precisar remarcar, fale conosco.`;
+  return applyWhatsAppEmphasis(body, [
+    ...(firstName ? [firstName] : []),
+    store,
+    ...(input.providerName ? [input.providerName] : []),
+  ]);
+}
+
+/**
+ * Confirmação imediata + enfileira lembrete (script Baileys, sem IA).
+ * No-op se WhatsApp offline / lembretes desligados conforme regras do plano.
+ */
+export async function notifyWebBookingCreated(input: {
+  ownerUserId: string;
+  appointmentId: string;
+  clientName: string;
+  clientPhone: string;
+  startsAtIso: string;
+  storeName: string;
+  serviceNames: string;
+  providerName?: string | null;
+}): Promise<void> {
+  const phone = input.clientPhone.replace(/\D/g, '');
+  if (!phone || !input.appointmentId) return;
+
+  const { data: profile, error } = await supabase
+    .from('profiles')
+    .select(
+      'id, email, reminders_enabled, remind_before_minutes, subscription_tier, has_paid, multi_barber_plan',
+    )
+    .eq('id', input.ownerUserId)
+    .maybeSingle();
+
+  if (error || !profile?.email) {
+    if (error) log.error(TAG, 'notifyWebBooking — perfil', error);
+    return;
+  }
+
+  const { sessions } = await import('./whatsapp');
+  const sock = sessions[profile.email as string];
+  if (sock?.user) {
+    const jid = `${phone}@s.whatsapp.net`;
+    const text = buildBookingConfirmationText({
+      clientName: input.clientName,
+      storeName: input.storeName,
+      startsAtIso: input.startsAtIso,
+      serviceNames: input.serviceNames,
+      providerName: input.providerName,
+    });
+    try {
+      await sock.sendMessage(jid, { text });
+      log.info(TAG, 'confirmação Agenda Web enviada', {
+        email: profile.email,
+        phone,
+        appointmentId: input.appointmentId,
+      });
+    } catch (err) {
+      log.error(TAG, 'falha ao enviar confirmação Agenda Web', err, {
+        email: profile.email,
+        phone,
+      });
+    }
+  } else {
+    log.info(TAG, 'confirmação Agenda Web pulada — WA offline', {
+      email: profile.email,
+    });
+  }
+
+  await enqueueAppointmentReminder({
+    profile: {
+      id: profile.id as string,
+      email: profile.email as string,
+      reminders_enabled: profile.reminders_enabled as boolean | null,
+      remind_before_minutes: profile.remind_before_minutes as number | null,
+      subscription_tier: profile.subscription_tier,
+      has_paid: profile.has_paid,
+      multi_barber_plan: profile.multi_barber_plan as boolean | null,
+    },
+    googleEventId: bookingReminderEventId(input.appointmentId),
+    clientPhone: phone,
+    clientName: input.clientName,
+    barberName: input.providerName ?? null,
+    startsAtIso: input.startsAtIso,
+  });
+}
+
 function buildReminderText(row: {
   client_name: string | null;
   barber_name: string | null;

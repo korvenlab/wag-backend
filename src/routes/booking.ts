@@ -8,6 +8,11 @@ import { profileSubscriptionTier } from '../lib/profileMultiBarber';
 import { tierSupportsPublicBooking } from '../lib/wagooSubscription';
 import { dayWindowsFromWorkingHours, BR_TZ } from '../lib/dateTimeBR';
 import { slugifyStoreName } from '../lib/storeSlug';
+import {
+  bookingReminderEventId,
+  cancelAppointmentReminder,
+  notifyWebBookingCreated,
+} from '../services/reminders';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -578,10 +583,13 @@ router.patch('/appointments/:id', async (req: Request, res: Response) => {
 
   if (error) return res.status(500).json({ error: error.message });
   if (!data) return res.status(404).json({ error: 'Agendamento não encontrado.' });
+
+  if (status === 'cancelled') {
+    void cancelAppointmentReminder(gate.userId, bookingReminderEventId(String(data.id)));
+  }
+
   res.json(data);
 });
-
-/** ——— Público ——— */
 
 router.get('/public/:slug', async (req: Request, res: Response) => {
   const slug = String(req.params.slug || '').trim().toLowerCase();
@@ -895,6 +903,17 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
     .single();
 
   if (error) return res.status(500).json({ error: error.message });
+
+  void notifyWebBookingCreated({
+    ownerUserId: site.id as string,
+    appointmentId: data.id as string,
+    clientName,
+    clientPhone,
+    startsAtIso: data.starts_at as string,
+    storeName: String(site.store_name || 'Negócio'),
+    serviceNames,
+    providerName,
+  });
 
   res.status(201).json({
     appointment: data,

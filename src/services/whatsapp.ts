@@ -1250,10 +1250,11 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
 export async function autoReconnectAll() {
   log.step(WA, 'autoReconnectAll iniciado');
+  // Qualquer conta com sessão salva (IA ou Agenda Web só lembretes/confirmação).
   const { data: profiles, error } = await supabase
     .from('profiles')
-    .select('email, has_paid, complimentary_access_until, is_ai_enabled')
-    .eq('is_ai_enabled', true);
+    .select('email, has_paid, complimentary_access_until, whatsapp_session')
+    .not('whatsapp_session', 'is', null);
 
   if (error) {
     log.error(WA, 'autoReconnectAll — falha ao listar profiles', error);

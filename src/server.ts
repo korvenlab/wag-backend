@@ -267,7 +267,7 @@ app.post('/api/settings/reminders', async (req: Request, res: Response) => {
 
   if (!tierSupportsReminders(tier)) {
     return res.status(403).json({
-      error: 'Lembretes estão disponíveis nos planos Pro e Pro+.',
+      error: 'Lembretes estão disponíveis nos planos Agenda Web, Pro e Pro+.',
     });
   }
 
