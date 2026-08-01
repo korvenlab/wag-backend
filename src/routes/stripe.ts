@@ -8,7 +8,6 @@ import { setProfileSubscriptionTierByUserId } from '../lib/setSubscriptionTier';
 import { supabase } from '../lib/supabase';
 import {
   normalizeSubscriptionTier,
-  parsePlanTierFromStripeMetadata,
   resolveStripePriceId,
   resolveTierFromStripeSubscription,
   WAGOO_PLANS,
