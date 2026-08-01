@@ -792,12 +792,15 @@ router.get('/public/:slug/slots', async (req: Request, res: Response) => {
     .maybeSingle();
 
   if (ownerCal?.email && ownerCal.googleAuth) {
-    const gBusy = await listGoogleBusyRangesForDay(String(ownerCal.email), day);
-    for (const g of gBusy) {
-      busyRanges.push({
-        start: dayjs(g.startIso).tz(BR_TZ),
-        end: dayjs(g.endIso).tz(BR_TZ),
-      });
+    const ga = ownerCal.googleAuth as { refreshToken?: string | null };
+    if (ga.refreshToken) {
+      const gBusy = await listGoogleBusyRangesForDay(String(ownerCal.email), day);
+      for (const g of gBusy) {
+        busyRanges.push({
+          start: dayjs(g.startIso).tz(BR_TZ),
+          end: dayjs(g.endIso).tz(BR_TZ),
+        });
+      }
     }
   }
 
@@ -924,9 +927,12 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
     .eq('id', site.id)
     .maybeSingle();
 
-  if (ownerCal?.email && ownerCal.googleAuth) {
+  const googleAuth = ownerCal?.googleAuth as { refreshToken?: string | null } | null | undefined;
+  const canSyncGoogle = Boolean(ownerCal?.email && googleAuth?.refreshToken);
+
+  if (canSyncGoogle) {
     const freeOnGoogle = await checkAvailability(
-      String(ownerCal.email),
+      String(ownerCal!.email),
       startsAt.toISOString(),
       duration,
     );
@@ -959,10 +965,10 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
   if (error) return res.status(500).json({ error: error.message });
 
   let googleEventId: string | null = null;
-  if (ownerCal?.email && ownerCal.googleAuth) {
+  if (canSyncGoogle) {
     try {
       const created = await createEvent(
-        String(ownerCal.email),
+        String(ownerCal!.email),
         clientName,
         clientPhone,
         startsAt.toISOString(),
@@ -983,7 +989,17 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
           log.error('BOOKING', 'falha ao gravar google_event_id', upErr, {
             appointmentId: data.id,
           });
+        } else {
+          log.info('BOOKING', 'evento Google criado', {
+            appointmentId: data.id,
+            googleEventId: created.id,
+          });
         }
+      } else {
+        log.warn('BOOKING', 'createEvent retornou null — Google não sincronizou', {
+          appointmentId: data.id,
+          email: ownerCal?.email,
+        });
       }
     } catch (err) {
       log.error('BOOKING', 'falha ao criar evento Google', err, {
