@@ -63,6 +63,18 @@ import {
   type ResponseTemplates,
 } from '../lib/responseTemplates';
 import { normalizeServicePrices } from '../lib/servicePrices';
+import {
+  catalogToServicePrices,
+  matchCatalogService,
+  formatCatalogListForWhatsApp,
+  buildAiBookingNotes,
+  type CatalogService,
+} from '../lib/bookingCatalog';
+import {
+  createBookingDepositCheckout,
+  profileRequiresDeposit,
+} from './bookingDepositCheckout';
+import { BOOKING_PAYMENT_HOLD_MINUTES } from '../lib/connectFees';
 import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
@@ -108,16 +120,29 @@ interface ChatContext {
     barberConfirmed: boolean;
     selectedBarberName: string | null;
     selectedBarberEmail: string | null;
-    /** Aguardando "sim" do cliente antes de criar no Google Calendar. */
+    /** Aguardando "sim" do cliente antes de criar no Google Calendar / link de sinal. */
     pendingConfirmation?: {
       dateIso: string;
       barberName: string | null;
       barberEmail: string | null;
+      serviceId?: string | null;
+      serviceName?: string | null;
+      durationMinutes?: number | null;
     } | null;
   };
 }
 
 const memoryCache: Record<string, ChatContext> = {};
+
+/** Limpa proposta pendente da IA após pagamento do sinal (idempotente). */
+export function clearAiSchedulingPending(email: string, clientPhone: string): void {
+  const phone = String(clientPhone || '').replace(/\D/g, '');
+  if (!email || !phone) return;
+  const key = `${email}:${phone}`;
+  if (memoryCache[key]?.scheduling) {
+    memoryCache[key].scheduling!.pendingConfirmation = null;
+  }
+}
 /** Após inatividade, a sessão fecha — evita a IA responder papo aleatório por horas. */
 const SESSION_EXPIRATION = 45 * 60 * 1000;
 const MAX_HISTORY = 14;
@@ -629,7 +654,19 @@ export async function startWhatsApp(email: string, res: Response | null) {
         const activeSession = !!memoryCache[cacheKey];
 
         const userGreetingEarly = detectUserGreeting(textMessage);
-        const pricedServices = normalizeServicePrices(p.service_prices);
+        const { data: catalogRows } = await supabase
+          .from('booking_services')
+          .select('id, name, price_brl, duration_minutes, active')
+          .eq('profile_id', p.id)
+          .or('active.is.null,active.eq.true')
+          .order('name', { ascending: true });
+        const catalog: CatalogService[] = ((catalogRows || []) as CatalogService[]).filter(
+          (s) => s.active !== false && Number(s.price_brl) >= 0,
+        );
+        const pricedServices = catalog.length
+          ? catalogToServicePrices(catalog)
+          : normalizeServicePrices(p.service_prices);
+        const requiresDeposit = profileRequiresDeposit(p);
         const schedulingIntent = hasSchedulingIntent(
           textMessage,
           pricedServices.map((s) => s.name),
@@ -822,7 +859,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
             service_duration: p.service_duration,
             business_niche: p.business_niche,
             business_niche_custom: p.business_niche_custom,
-            service_prices: p.service_prices,
+            service_prices: pricedServices,
             free_ranges_summary: freeRangesLabeled || null,
             response_templates: templates,
             is_first_reply: isFirstReply,
@@ -965,6 +1002,38 @@ export async function startWhatsApp(email: string, res: Response | null) {
 
         const pending = memoryCache[cacheKey].scheduling?.pendingConfirmation ?? null;
 
+        // Com sinal ligado: se já há horário pendente sem serviço, tenta casar o serviço nesta mensagem.
+        if (
+          pending &&
+          requiresDeposit &&
+          !pending.serviceId &&
+          !isAffirmativeBooking(textMessage) &&
+          !isNegativeBooking(textMessage)
+        ) {
+          const picked =
+            matchCatalogService(textMessage, catalog) ||
+            (catalog.length === 1 ? catalog[0] : null);
+          if (picked) {
+            memoryCache[cacheKey].scheduling!.pendingConfirmation = {
+              ...pending,
+              serviceId: picked.id,
+              serviceName: picked.name,
+              durationMinutes: picked.duration_minutes,
+            };
+            const when = formatDateTimeBR(pending.dateIso);
+            const profBit =
+              multiBarber && pending.barberName ? ` com ${pending.barberName}` : '';
+            const reply = emphasizeWa(
+              `Posso confirmar *${picked.name}* ${when}${profBit}? Responda *sim* para receber o link do sinal.`,
+              pending.barberName,
+              picked.name,
+            );
+            await sock.sendMessage(remoteJid, { text: reply });
+            memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+            return;
+          }
+        }
+
         // Cliente recusou a proposta pendente.
         if (pending && isNegativeBooking(textMessage)) {
           memoryCache[cacheKey].scheduling!.pendingConfirmation = null;
@@ -1016,28 +1085,72 @@ export async function startWhatsApp(email: string, res: Response | null) {
             ? sched.selectedBarberEmail
             : activeBarbeiros[0]?.google_calendar_email ?? null;
 
+          const historyBlob = [
+            ...memoryCache[cacheKey].messages.map((m) => m.content),
+            textMessage,
+          ].join('\n');
+          let matchedSvc =
+            matchCatalogService(historyBlob, catalog) ||
+            (requiresDeposit && catalog.length === 1 ? catalog[0] : null);
+
+          if (requiresDeposit && !matchedSvc) {
+            memoryCache[cacheKey].scheduling!.pendingConfirmation = {
+              dateIso: proposedIso,
+              barberName: pendingBarberName,
+              barberEmail: pendingBarberEmail,
+              serviceId: null,
+              serviceName: null,
+              durationMinutes: null,
+            };
+            const list =
+              catalog.length > 0
+                ? formatCatalogListForWhatsApp(catalog)
+                : '_Nenhum serviço cadastrado ainda — fale com o salão._';
+            const reply = emphasizeWa(
+              ensureOpeningGreeting(
+                `Qual serviço você quer?\n\n${list}`,
+                shouldGreet,
+                undefined,
+                openingGreeting,
+              ),
+            );
+            await sock.sendMessage(remoteJid, { text: reply });
+            memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+            return;
+          }
+
           memoryCache[cacheKey].scheduling!.pendingConfirmation = {
             dateIso: proposedIso,
             barberName: pendingBarberName,
             barberEmail: pendingBarberEmail,
+            serviceId: matchedSvc?.id ?? null,
+            serviceName: matchedSvc?.name ?? null,
+            durationMinutes: matchedSvc?.duration_minutes ?? null,
           };
 
           const when = formatDateTimeBR(proposedIso);
           const profBit =
             multiBarber && pendingBarberName ? ` com ${pendingBarberName}` : '';
+          const svcBit = matchedSvc ? ` *${matchedSvc.name}*` : '';
+          const confirmHint = requiresDeposit
+            ? ` Responda *sim* para receber o link do sinal.`
+            : ` Responda *sim* para marcar.`;
           const reply = emphasizeWa(
             ensureOpeningGreeting(
-              `Posso confirmar ${when}${profBit}? Responda *sim* para marcar.`,
+              `Posso confirmar${svcBit} ${when}${profBit}?${confirmHint}`,
               shouldGreet,
               undefined,
               openingGreeting,
             ),
             pendingBarberName,
+            matchedSvc?.name,
           );
           log.info(WA, 'aguardando confirmação do cliente', {
             email,
             proposedIso,
             barber: pendingBarberName,
+            service: matchedSvc?.name ?? null,
+            requiresDeposit,
           });
           await sock.sendMessage(remoteJid, { text: reply });
           memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
@@ -1120,11 +1233,44 @@ export async function startWhatsApp(email: string, res: Response | null) {
             let finalBarberName = barberName;
             let finalBarberEmail = barberEmail;
 
+            let matchedSvc: CatalogService | null =
+              (pending.serviceId
+                ? catalog.find((s) => s.id === pending.serviceId) || null
+                : null) ||
+              matchCatalogService(
+                [...memoryCache[cacheKey].messages.map((m) => m.content), textMessage].join(
+                  '\n',
+                ),
+                catalog,
+              ) ||
+              (requiresDeposit && catalog.length === 1 ? catalog[0] : null);
+
+            if (requiresDeposit && !matchedSvc) {
+              const list =
+                catalog.length > 0
+                  ? formatCatalogListForWhatsApp(catalog)
+                  : '_Cadastre os serviços no painel para cobrar o sinal._';
+              const reply = emphasizeWa(
+                `Antes de confirmar, qual serviço?\n\n${list}`,
+              );
+              await sock.sendMessage(remoteJid, { text: reply });
+              memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+              return;
+            }
+
+            const durationMin = Math.max(
+              5,
+              Number(matchedSvc?.duration_minutes) ||
+                Number(pending.durationMinutes) ||
+                Number(p.service_duration) ||
+                30,
+            );
+
             if (semPref && multiBarber) {
               const assigned = await resolveSemPreferenciaBooking(
                 email,
                 bookingIso,
-                p.service_duration ?? 30,
+                durationMin,
                 barberRefs,
               );
               if (!assigned) {
@@ -1140,7 +1286,7 @@ export async function startWhatsApp(email: string, res: Response | null) {
               const isFree = await checkSchedulingAvailability(
                 email,
                 bookingIso,
-                p.service_duration ?? 30,
+                durationMin,
                 {
                   multiBarber,
                   barberName: pending.barberName ?? null,
@@ -1165,13 +1311,84 @@ export async function startWhatsApp(email: string, res: Response | null) {
             {
                 const clientName = msg.pushName || "Cliente WhatsApp";
                 const clientPhone = remoteJid.split('@')[0].replace(/\D/g, '');
+
+                if (requiresDeposit && matchedSvc) {
+                  const endsAtIso = dayjs(bookingIso)
+                    .add(durationMin, 'minute')
+                    .toISOString();
+                  const depositPercent = Number(p.booking_deposit_percent) || 30;
+                  const pay = await createBookingDepositCheckout({
+                    profileId: String(p.id),
+                    stripeConnectAccountId: String(p.stripe_connect_account_id),
+                    storeName: String(p.store_name || 'Agendamento'),
+                    bookingSlug: p.booking_slug ? String(p.booking_slug) : null,
+                    serviceId: matchedSvc.id,
+                    providerId: null,
+                    clientName,
+                    clientPhone,
+                    startsAtIso: bookingIso,
+                    endsAtIso,
+                    totalPriceBrl: Number(matchedSvc.price_brl) || 0,
+                    depositPercent,
+                    serviceLabel: matchedSvc.name,
+                    notes: buildAiBookingNotes({
+                      barberName:
+                        typeof finalBarberName === 'string' ? finalBarberName : null,
+                      barberEmail:
+                        typeof finalBarberEmail === 'string' ? finalBarberEmail : null,
+                    }),
+                    source: 'ai',
+                    extraMetadata: {
+                      barber_name:
+                        typeof finalBarberName === 'string' ? finalBarberName : '',
+                    },
+                  });
+
+                  if (!pay.ok) {
+                    await sock.sendMessage(remoteJid, {
+                      text: emphasizeWa(
+                        pay.error ||
+                          'Não consegui gerar o link de pagamento. Tente outro horário.',
+                      ),
+                    });
+                    return;
+                  }
+
+                  memoryCache[cacheKey].scheduling!.pendingConfirmation = null;
+                  const when = formatDateTimeBR(bookingIso);
+                  const payText = emphasizeWa(
+                    `Perfeito! Para confirmar *${matchedSvc.name}* em ${when}, pague o sinal neste link (válido por ${BOOKING_PAYMENT_HOLD_MINUTES} min):\n\n${pay.checkoutUrl}\n\nAssim que o pagamento cair, confirmo o horário aqui.`,
+                    matchedSvc.name,
+                  );
+                  await sock.sendMessage(remoteJid, { text: payText });
+                  memoryCache[cacheKey].messages.push({
+                    role: 'assistant',
+                    content: payText,
+                  });
+                  await supabase
+                    .from('profiles')
+                    .update({ messages_answered: (p.messages_answered || 0) + 1 })
+                    .eq('email', email);
+                  log.info(WA, 'link de sinal enviado (IA)', {
+                    email,
+                    appointmentId: pay.appointmentId,
+                    service: matchedSvc.name,
+                  });
+                  return;
+                }
+
                 const created = await createEvent(
                   email,
                   clientName,
                   clientPhone,
                   bookingIso,
-                  p.service_duration,
-                  { barberName: finalBarberName, barberEmail: finalBarberEmail },
+                  durationMin,
+                  {
+                    barberName: finalBarberName,
+                    barberEmail: finalBarberEmail,
+                    serviceNames: matchedSvc?.name,
+                    source: 'ai',
+                  },
                 );
 
                 if (created) {
@@ -1204,13 +1421,15 @@ export async function startWhatsApp(email: string, res: Response | null) {
                       multiBarber && finalBarberName
                         ? ` com ${finalBarberName}`
                         : '';
+                    const svcLine = matchedSvc ? ` (${matchedSvc.name})` : '';
                     const confirmText = emphasizeWa(
                       resolveAfterBookingReply(
                         templates,
-                        `Anotei: ${confirmDate}${profLine}. Te esperamos!`,
+                        `Anotei: ${confirmDate}${profLine}${svcLine}. Te esperamos!`,
                       ),
                       typeof finalBarberName === 'string' ? finalBarberName : null,
                       clientName,
+                      matchedSvc?.name,
                     );
                     await sock.sendMessage(remoteJid, { text: confirmText });
                     memoryCache[cacheKey].messages.push({ role: 'assistant', content: confirmText });

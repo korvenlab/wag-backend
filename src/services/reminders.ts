@@ -156,6 +156,8 @@ export async function notifyWebBookingCreated(input: {
   storeName: string;
   serviceNames: string;
   providerName?: string | null;
+  /** Quando true, só enfileira lembrete (mensagem WA já foi enviada). */
+  skipWhatsApp?: boolean;
 }): Promise<void> {
   const phone = input.clientPhone.replace(/\D/g, '');
   if (!phone || !input.appointmentId) return;
@@ -173,34 +175,36 @@ export async function notifyWebBookingCreated(input: {
     return;
   }
 
-  const { sessions } = await import('./whatsapp');
-  const sock = sessions[profile.email as string];
-  if (sock?.user) {
-    const jid = `${phone}@s.whatsapp.net`;
-    const text = buildBookingConfirmationText({
-      clientName: input.clientName,
-      storeName: input.storeName,
-      startsAtIso: input.startsAtIso,
-      serviceNames: input.serviceNames,
-      providerName: input.providerName,
-    });
-    try {
-      await sock.sendMessage(jid, { text });
-      log.info(TAG, 'confirmação Agenda Web enviada', {
-        email: profile.email,
-        phone,
-        appointmentId: input.appointmentId,
+  if (!input.skipWhatsApp) {
+    const { sessions } = await import('./whatsapp');
+    const sock = sessions[profile.email as string];
+    if (sock?.user) {
+      const jid = `${phone}@s.whatsapp.net`;
+      const text = buildBookingConfirmationText({
+        clientName: input.clientName,
+        storeName: input.storeName,
+        startsAtIso: input.startsAtIso,
+        serviceNames: input.serviceNames,
+        providerName: input.providerName,
       });
-    } catch (err) {
-      log.error(TAG, 'falha ao enviar confirmação Agenda Web', err, {
+      try {
+        await sock.sendMessage(jid, { text });
+        log.info(TAG, 'confirmação Agenda Web enviada', {
+          email: profile.email,
+          phone,
+          appointmentId: input.appointmentId,
+        });
+      } catch (err) {
+        log.error(TAG, 'falha ao enviar confirmação Agenda Web', err, {
+          email: profile.email,
+          phone,
+        });
+      }
+    } else {
+      log.info(TAG, 'confirmação Agenda Web pulada — WA offline', {
         email: profile.email,
-        phone,
       });
     }
-  } else {
-    log.info(TAG, 'confirmação Agenda Web pulada — WA offline', {
-      email: profile.email,
-    });
   }
 
   await enqueueAppointmentReminder({

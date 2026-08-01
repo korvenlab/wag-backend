@@ -96,5 +96,6 @@ export function servicePricesPromptBlock(
         4. NÃO invente preço que não esteja acima. Se não achar o serviço: diga que não tem esse valor cadastrado e cite opções próximas da lista.
         5. Pedido de preço NÃO agenda sozinho — se couber, ofereça marcar horário depois numa frase curta.
         6. Use *negrito* WhatsApp nos valores e nomes dos serviços.
+        7. Ao agendar, prefira o nome exacto do serviço desta lista (ajuda a confirmar o horário certo).
         `;
 }

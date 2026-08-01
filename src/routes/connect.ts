@@ -5,10 +5,12 @@ import { stripe, frontendBaseUrl } from '../lib/stripeClient';
 import {
   BOOKING_PAYMENT_HOLD_MINUTES,
   WAGOO_APPLICATION_FEE_PERCENT,
-  brlToCents,
-  centsToBrl,
-  computeApplicationFeeCents,
+  STRIPE_PIX_FEE_PERCENT,
+  STRIPE_CARD_FEE_PERCENT,
+  STRIPE_CARD_FEE_FIXED_BRL,
+  FEE_COPY,
   computeDepositBrl,
+  buildFeeSchedulePayload,
 } from '../lib/connectFees';
 import { log } from '../lib/logger';
 
@@ -98,14 +100,21 @@ router.get('/status', async (req: Request, res: Response) => {
     deposit_percent: Number(profile.booking_deposit_percent) || 30,
     wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
     hold_minutes: BOOKING_PAYMENT_HOLD_MINUTES,
+    fees: {
+      wagoo_percent: WAGOO_APPLICATION_FEE_PERCENT,
+      stripe_pix_percent: STRIPE_PIX_FEE_PERCENT,
+      stripe_card_percent: STRIPE_CARD_FEE_PERCENT,
+      stripe_card_fixed_brl: STRIPE_CARD_FEE_FIXED_BRL,
+      summary: FEE_COPY.summary,
+    },
     tip:
       !profile.stripe_connect_account_id
-        ? 'Conecte sua conta Stripe para receber sinais dos clientes.'
+        ? 'Conecte sua conta para receber o dinheiro dos clientes.'
         : !ready
-          ? 'Conclua a verificação na Stripe (documento e dados bancários) para liberar cobranças.'
+          ? 'Falta terminar o cadastro (documentos e conta bancária) para liberar os recebimentos.'
           : profile.booking_deposit_enabled
-            ? 'Sinal ativo: o horário só é confirmado depois que o cliente pagar.'
-            : 'Conta pronta. O sinal é opcional — sem ele, o cliente agenda e confirma na hora, sem pagar.',
+            ? 'Sinal ligado: o horário só confirma depois que o cliente pagar.'
+            : 'Tudo pronto. O sinal é opcional — você decide se quer cobrar na hora do agendamento.',
   });
 });
 
@@ -254,8 +263,8 @@ router.patch('/deposit-settings', express.json(), async (req: Request, res: Resp
 });
 
 /**
- * Preview de taxas para o painel (exemplo com valor de serviço).
- * Cliente paga o sinal; Wagoo recebe 2%; Stripe cobra a taxa de cartão/Pix na conta Connect.
+ * Preview de taxas para o painel.
+ * Wagoo = 2% sempre; Stripe = Pix 1,19% ou cartão 3,99% + R$ 0,39.
  */
 router.get('/fee-preview', async (req: Request, res: Response) => {
   const auth = await requireUser(req);
@@ -267,19 +276,17 @@ router.get('/fee-preview', async (req: Request, res: Response) => {
     req.query.deposit_percent ?? profile?.booking_deposit_percent ?? 30,
   );
   const deposit = computeDepositBrl(total, percent);
-  const depositCents = brlToCents(deposit);
-  const feeCents = computeApplicationFeeCents(depositCents);
-  const toShopCents = depositCents - feeCents;
+  const schedule = buildFeeSchedulePayload(deposit);
 
   res.json({
     total_brl: total,
     deposit_percent: percent,
-    deposit_brl: deposit,
+    ...schedule,
+    // Campos legados (compat) — líquido estimado via Pix (mais barato)
     wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
-    wagoo_fee_brl: centsToBrl(feeCents),
-    shop_receives_brl: centsToBrl(toShopCents),
-    note:
-      'A taxa de processamento da Stripe (cartão/Pix) é descontada à parte do valor que o salão recebe. A Wagoo cobra apenas 2% do sinal via application_fee.',
+    wagoo_fee_brl: schedule.wagoo.fee_brl,
+    shop_receives_brl: schedule.stripe.pix.shop_receives_brl,
+    note: FEE_COPY.summary,
   });
 });
 

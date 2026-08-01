@@ -2,7 +2,8 @@ import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 import timezone from 'dayjs/plugin/timezone';
 import { supabase } from '../lib/supabase';
-import { BR_TZ } from '../lib/dateTimeBR';
+import { BR_TZ, formatDateTimeBR, applyWhatsAppEmphasis } from '../lib/dateTimeBR';
+import { parseAiBookingNotes } from '../lib/bookingCatalog';
 import { notifyWebBookingCreated } from './reminders';
 import { createEvent } from './calendar';
 import { log } from '../lib/logger';
@@ -55,18 +56,32 @@ export async function fulfillBookingDepositPayment(opts: {
   if (upErr) return { ok: false, error: upErr.message };
 
   const [{ data: owner }, { data: provider }, { data: service }] = await Promise.all([
-    supabase.from('profiles').select('email, googleAuth, store_name').eq('id', appt.profile_id).maybeSingle(),
+    supabase
+      .from('profiles')
+      .select('email, googleAuth, store_name, response_templates')
+      .eq('id', appt.profile_id)
+      .maybeSingle(),
     appt.provider_id
       ? supabase.from('booking_providers').select('name').eq('id', appt.provider_id).maybeSingle()
       : Promise.resolve({ data: null }),
-    supabase.from('booking_services').select('name, duration_minutes').eq('id', appt.service_id).maybeSingle(),
+    supabase
+      .from('booking_services')
+      .select('name, duration_minutes')
+      .eq('id', appt.service_id)
+      .maybeSingle(),
   ]);
+
+  const aiMeta = parseAiBookingNotes(appt.notes as string | null);
+  const isAiSource = aiMeta.source === 'ai';
 
   const serviceNames =
     (appt.notes && String(appt.notes).startsWith('Serviços:')
       ? String(appt.notes).replace(/^Serviços:\s*/, '')
       : service?.name) || 'Serviço';
-  const providerName = provider?.name ? String(provider.name) : null;
+  const providerName =
+    provider?.name
+      ? String(provider.name)
+      : aiMeta.barberName || null;
   const duration = Math.max(
     5,
     dayjs(appt.ends_at).diff(dayjs(appt.starts_at), 'minute') ||
@@ -85,8 +100,9 @@ export async function fulfillBookingDepositPayment(opts: {
         duration,
         {
           barberName: providerName || undefined,
-          serviceNames,
-          source: 'agenda_web',
+          barberEmail: aiMeta.barberEmail || undefined,
+          serviceNames: service?.name || serviceNames,
+          source: isAiSource ? 'ai' : 'agenda_web',
         },
       );
       if (created?.id) {
@@ -100,6 +116,47 @@ export async function fulfillBookingDepositPayment(opts: {
     }
   }
 
+  if (isAiSource && owner?.email) {
+    try {
+      const { clearAiSchedulingPending, sessions } = await import('./whatsapp');
+      clearAiSchedulingPending(String(owner.email), String(appt.client_phone));
+
+      const phone = String(appt.client_phone).replace(/\D/g, '');
+      const sock = sessions[String(owner.email)];
+      if (sock?.user && phone) {
+        const when = formatDateTimeBR(String(appt.starts_at));
+        const firstName =
+          String(appt.client_name).trim().split(/\s+/)[0] || null;
+        const hello = firstName ? `Oi, ${firstName}!` : 'Oi!';
+        const svc = service?.name || serviceNames;
+        const prof =
+          providerName && !providerName.toLowerCase().includes('sem prefer')
+            ? ` com ${providerName}`
+            : '';
+        const text = applyWhatsAppEmphasis(
+          `${hello} Pagamento recebido — sinal ok.\n\n` +
+            `Horário *confirmado*: ${when}${prof}\n` +
+            (svc ? `Serviço: *${svc}*\n` : '') +
+            `\nTe esperamos!`,
+          [
+            ...(firstName ? [firstName] : []),
+            ...(providerName ? [providerName] : []),
+            ...(svc ? [svc] : []),
+          ],
+        );
+        await sock.sendMessage(`${phone}@s.whatsapp.net`, { text });
+        log.info('BOOKING_PAY', 'confirmação IA enviada no WhatsApp', {
+          appointmentId: appt.id,
+          phone,
+        });
+      }
+    } catch (err) {
+      log.error('BOOKING_PAY', 'falha ao confirmar IA no WhatsApp', err, {
+        appointmentId: appt.id,
+      });
+    }
+  }
+
   void notifyWebBookingCreated({
     ownerUserId: String(appt.profile_id),
     appointmentId: String(appt.id),
@@ -107,12 +164,32 @@ export async function fulfillBookingDepositPayment(opts: {
     clientPhone: String(appt.client_phone),
     startsAtIso: String(appt.starts_at),
     storeName: String(owner?.store_name || 'Negócio'),
-    serviceNames,
+    serviceNames: service?.name || serviceNames,
     providerName,
+    /** IA já mandou a mensagem de pagamento; Agenda Web manda a confirmação padrão. */
+    skipWhatsApp: isAiSource,
   });
+
+  if (isAiSource) {
+    const { data: stats } = await supabase
+      .from('profiles')
+      .select('appointments_made, appointments_count')
+      .eq('id', appt.profile_id)
+      .maybeSingle();
+    if (stats) {
+      await supabase
+        .from('profiles')
+        .update({
+          appointments_made: (Number(stats.appointments_made) || 0) + 1,
+          appointments_count: (Number(stats.appointments_count) || 0) + 1,
+        })
+        .eq('id', appt.profile_id);
+    }
+  }
 
   log.info('BOOKING_PAY', 'sinal pago — agendamento confirmado', {
     appointmentId: appt.id,
+    source: isAiSource ? 'ai' : 'agenda_web',
     startsAtBr: dayjs(appt.starts_at).tz(BR_TZ).format('DD/MM/YYYY HH:mm'),
   });
 

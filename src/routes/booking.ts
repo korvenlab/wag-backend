@@ -21,16 +21,13 @@ import {
   listGoogleBusyRangesForDay,
 } from '../services/calendar';
 import { log } from '../lib/logger';
-import { stripe, frontendBaseUrl } from '../lib/stripeClient';
 import {
   BOOKING_PAYMENT_HOLD_MINUTES,
   WAGOO_APPLICATION_FEE_PERCENT,
-  brlToCents,
-  centsToBrl,
-  computeApplicationFeeCents,
-  computeDepositBrl,
+  FEE_COPY,
 } from '../lib/connectFees';
 import { expireStalePendingPayments } from '../services/bookingPayments';
+import { createBookingDepositCheckout } from '../services/bookingDepositCheckout';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -760,6 +757,9 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
       percent: depositPercent,
       wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
       hold_minutes: BOOKING_PAYMENT_HOLD_MINUTES,
+      // Taxas são do salão (não acrescidas ao cliente). Expostas para transparência no app do dono;
+      // no link público usamos só o valor do sinal.
+      fees_summary: FEE_COPY.summary,
     },
   });
 });
@@ -1074,16 +1074,61 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
 
   if (requiresDeposit && totalRounded <= 0) {
     return res.status(400).json({
-      error: 'Este horário exige sinal. O salão precisa ter preço nos serviços.',
+      error: 'Este horário exige sinal. Cadastre o preço nos serviços.',
     });
   }
 
-  const depositBrl = requiresDeposit ? computeDepositBrl(totalRounded, depositPercent) : 0;
-  const depositCents = brlToCents(depositBrl);
-  const feeCents = requiresDeposit ? computeApplicationFeeCents(depositCents) : 0;
-  const expiresAt = requiresDeposit
-    ? dayjs().add(BOOKING_PAYMENT_HOLD_MINUTES, 'minute').toISOString()
-    : null;
+  // Fluxo com sinal: Checkout compartilhado (Agenda Web + IA)
+  if (requiresDeposit) {
+    const pay = await createBookingDepositCheckout({
+      profileId: String(site.id),
+      stripeConnectAccountId: String(site.stripe_connect_account_id),
+      storeName: String(site.store_name || 'Agendamento'),
+      bookingSlug: site.booking_slug ? String(site.booking_slug) : null,
+      serviceId: String(primary.id),
+      providerId,
+      clientName,
+      clientPhone,
+      startsAtIso: startsAt.toISOString(),
+      endsAtIso: endsAt.toISOString(),
+      totalPriceBrl: totalRounded,
+      depositPercent,
+      serviceLabel: serviceNames,
+      notes: services.length > 1 ? `Serviços: ${serviceNames}` : '',
+      source: 'agenda_web',
+    });
+
+    if (!pay.ok) {
+      return res.status(502).json({ error: pay.error });
+    }
+
+    const { data: apptRow } = await supabase
+      .from('booking_appointments')
+      .select(
+        'id, starts_at, ends_at, client_name, status, provider_id, payment_status, deposit_amount_brl, price_brl',
+      )
+      .eq('id', pay.appointmentId)
+      .maybeSingle();
+
+    return res.status(201).json({
+      requires_payment: true,
+      checkout_url: pay.checkoutUrl,
+      appointment: apptRow,
+      payment: {
+        total_brl: totalRounded,
+        deposit_percent: depositPercent,
+        ...pay.feeSchedule,
+        hold_minutes: BOOKING_PAYMENT_HOLD_MINUTES,
+      },
+      service: {
+        name: serviceNames,
+        price_brl: totalRounded,
+        duration_minutes: duration,
+      },
+      provider: providerName ? { id: providerId, name: providerName } : null,
+      store_name: site.store_name,
+    });
+  }
 
   const { data, error } = await supabase
     .from('booking_appointments')
@@ -1095,12 +1140,12 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
       client_phone: clientPhone,
       starts_at: startsAt.toISOString(),
       ends_at: endsAt.toISOString(),
-      status: requiresDeposit ? 'pending_payment' : 'confirmed',
+      status: 'confirmed',
       price_brl: totalRounded,
-      deposit_amount_brl: requiresDeposit ? depositBrl : null,
-      application_fee_brl: requiresDeposit ? centsToBrl(feeCents) : null,
-      payment_status: requiresDeposit ? 'pending' : 'not_required',
-      payment_expires_at: expiresAt,
+      deposit_amount_brl: null,
+      application_fee_brl: null,
+      payment_status: 'not_required',
+      payment_expires_at: null,
       notes: services.length > 1 ? `Serviços: ${serviceNames}` : '',
     })
     .select(
@@ -1109,96 +1154,6 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
     .single();
 
   if (error) return res.status(500).json({ error: error.message });
-
-  // Fluxo com sinal: Checkout direto na conta Connect + application_fee 2%
-  if (requiresDeposit) {
-    const base = frontendBaseUrl();
-    const slugEnc = encodeURIComponent(String(site.booking_slug));
-    try {
-      const session = await stripe.checkout.sessions.create(
-        {
-          mode: 'payment',
-          customer_email: undefined,
-          line_items: [
-            {
-              quantity: 1,
-              price_data: {
-                currency: 'brl',
-                unit_amount: depositCents,
-                product_data: {
-                  name: `Sinal — ${site.store_name || 'Agendamento'}`,
-                  description: `${serviceNames} · ${clientName} · ${startsAt.tz(BR_TZ).format('DD/MM HH:mm')}`,
-                },
-              },
-            },
-          ],
-          payment_method_types: ['card'],
-          payment_intent_data: {
-            application_fee_amount: feeCents,
-            metadata: {
-              wagoo_payment: 'booking_deposit',
-              appointment_id: String(data.id),
-              profile_id: String(site.id),
-            },
-          },
-          metadata: {
-            wagoo_payment: 'booking_deposit',
-            appointment_id: String(data.id),
-            profile_id: String(site.id),
-            supabase_user_id: String(site.id),
-          },
-          expires_at: Math.floor(Date.now() / 1000) + BOOKING_PAYMENT_HOLD_MINUTES * 60,
-          success_url: `${base}/a/${slugEnc}?pago=1&appointment=${data.id}`,
-          cancel_url: `${base}/a/${slugEnc}?pagamento=cancelado&appointment=${data.id}`,
-          locale: 'pt-BR',
-        },
-        { stripeAccount: String(site.stripe_connect_account_id) },
-      );
-
-      await supabase
-        .from('booking_appointments')
-        .update({ stripe_checkout_session_id: session.id })
-        .eq('id', data.id);
-
-      if (!session.url) {
-        await supabase
-          .from('booking_appointments')
-          .update({ status: 'cancelled', payment_status: 'failed' })
-          .eq('id', data.id);
-        return res.status(502).json({ error: 'Stripe não retornou URL de pagamento.' });
-      }
-
-      return res.status(201).json({
-        requires_payment: true,
-        checkout_url: session.url,
-        appointment: data,
-        payment: {
-          deposit_brl: depositBrl,
-          total_brl: totalRounded,
-          deposit_percent: depositPercent,
-          wagoo_fee_brl: centsToBrl(feeCents),
-          wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
-          hold_minutes: BOOKING_PAYMENT_HOLD_MINUTES,
-          note: 'A taxa Stripe de cartão é cobrada à parte na conta do salão. A Wagoo recebe 2% do sinal.',
-        },
-        service: {
-          name: serviceNames,
-          price_brl: totalRounded,
-          duration_minutes: duration,
-        },
-        provider: providerName ? { id: providerId, name: providerName } : null,
-        store_name: site.store_name,
-      });
-    } catch (err) {
-      log.error('BOOKING', 'checkout Connect falhou', err, { appointmentId: data.id });
-      await supabase
-        .from('booking_appointments')
-        .update({ status: 'cancelled', payment_status: 'failed' })
-        .eq('id', data.id);
-      const message = err instanceof Error ? err.message : 'Falha ao criar pagamento.';
-      return res.status(502).json({ error: message });
-    }
-  }
 
   let googleEventId: string | null = null;
   if (canSyncGoogle) {
