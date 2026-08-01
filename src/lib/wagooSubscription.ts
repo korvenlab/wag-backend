@@ -154,6 +154,39 @@ export function resolveStripePriceId(tier: WagooSubscriptionTier): string | null
   return null;
 }
 
+/** Resolve plano pelo Price ID da Stripe (env). */
+export function resolveTierFromStripePriceId(
+  priceId: string | null | undefined,
+): WagooSubscriptionTier | null {
+  if (!priceId) return null;
+  const pairs: Array<[WagooSubscriptionTier, string | undefined]> = [
+    ['agenda_web', process.env.STRIPE_PRICE_ID_AGENDA_WEB],
+    ['basic', process.env.STRIPE_PRICE_ID_BASIC || process.env.STRIPE_PRICE_ID],
+    ['pro', process.env.STRIPE_PRICE_ID_PRO || process.env.STRIPE_MULTI_BARBER_PRICE_ID],
+    ['pro_plus', process.env.STRIPE_PRICE_ID_PRO_PLUS],
+  ];
+  for (const [tier, env] of pairs) {
+    if (env?.trim() && env.trim() === priceId) return tier;
+  }
+  return null;
+}
+
+/** Resolve plano pelo Product ID (ex.: prod_UzR9AT2E2c1ov6 → agenda_web). */
+export function resolveTierFromStripeProductId(
+  productId: string | null | undefined,
+): WagooSubscriptionTier | null {
+  if (!productId) return null;
+  const agendaProd = process.env.STRIPE_PRODUCT_ID_AGENDA_WEB?.trim();
+  if (agendaProd && agendaProd === productId) return 'agenda_web';
+  const basicProd = process.env.STRIPE_PRODUCT_ID_BASIC?.trim();
+  if (basicProd && basicProd === productId) return 'basic';
+  const proProd = process.env.STRIPE_PRODUCT_ID_PRO?.trim();
+  if (proProd && proProd === productId) return 'pro';
+  const proPlusProd = process.env.STRIPE_PRODUCT_ID_PRO_PLUS?.trim();
+  if (proPlusProd && proPlusProd === productId) return 'pro_plus';
+  return null;
+}
+
 export function parsePlanTierFromStripeMetadata(
   metadata: Record<string, string> | null | undefined,
 ): WagooSubscriptionTier | null {
@@ -162,4 +195,26 @@ export function parsePlanTierFromStripeMetadata(
   if (fromTier) return fromTier;
   if (metadata.plan_type === 'multi_barber') return 'pro';
   return null;
+}
+
+/** Metadata → price → product (nessa ordem). */
+export function resolveTierFromStripeSubscription(sub: {
+  metadata?: Record<string, string> | null;
+  items?: { data?: Array<{ price?: { id?: string | null; product?: string | { id?: string } | null } | null }> };
+}): WagooSubscriptionTier | null {
+  const fromMeta = parsePlanTierFromStripeMetadata(sub.metadata as Record<string, string> | null);
+  if (fromMeta) return fromMeta;
+
+  const price = sub.items?.data?.[0]?.price;
+  const fromPrice = resolveTierFromStripePriceId(price?.id ?? null);
+  if (fromPrice) return fromPrice;
+
+  const productRaw = price?.product;
+  const productId =
+    typeof productRaw === 'string'
+      ? productRaw
+      : productRaw && typeof productRaw === 'object'
+        ? productRaw.id ?? null
+        : null;
+  return resolveTierFromStripeProductId(productId);
 }

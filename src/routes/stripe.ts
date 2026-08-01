@@ -10,6 +10,7 @@ import {
   normalizeSubscriptionTier,
   parsePlanTierFromStripeMetadata,
   resolveStripePriceId,
+  resolveTierFromStripeSubscription,
   WAGOO_PLANS,
   type WagooSubscriptionTier,
 } from '../lib/wagooSubscription';
@@ -29,7 +30,7 @@ async function applySubscriptionFromStripe(sub: Stripe.Subscription): Promise<vo
   if (!userId) return;
 
   const active = sub.status === 'active' || sub.status === 'trialing';
-  const tier = parsePlanTierFromStripeMetadata(sub.metadata as Record<string, string>);
+  const tier = resolveTierFromStripeSubscription(sub);
 
   if (!active) {
     if (
@@ -235,7 +236,7 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
         try {
           const sub = await stripe.subscriptions.retrieve(session.subscription);
           userId = userId ?? sub.metadata?.supabase_user_id ?? null;
-          tier = parsePlanTierFromStripeMetadata(sub.metadata as Record<string, string>);
+          tier = resolveTierFromStripeSubscription(sub);
         } catch (e) {
           console.error('[stripe webhook] checkout.session.completed retrieve subscription:', e);
         }
