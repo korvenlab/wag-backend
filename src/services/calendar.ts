@@ -157,6 +157,10 @@ export const checkAvailability = async (email: string, dateIso: string, duration
 export type CreateEventOptions = {
     barberName?: string;
     barberEmail?: string | null;
+    /** Nomes dos serviços (Agenda Web / multi-serviço). */
+    serviceNames?: string | null;
+    /** Origem do evento — muda só a descrição. */
+    source?: 'ai' | 'agenda_web';
 };
 
 export type CreateEventResult = {
@@ -181,6 +185,13 @@ export const createEvent = async (
 
         const barberLabel = options.barberName?.trim() || 'Sem Preferência';
         const summary = `[Wagoo] ${clientName} - Barbeiro: ${barberLabel}`;
+        const via =
+          options.source === 'agenda_web'
+            ? 'Agendado via Agenda Web Wagoo.'
+            : 'Agendado via Wagoo IA.';
+        const servicesLine = options.serviceNames?.trim()
+          ? `\nServiços: ${options.serviceNames.trim()}`
+          : '';
 
         const requestBody: {
             summary: string;
@@ -190,7 +201,7 @@ export const createEvent = async (
             attendees?: { email: string }[];
         } = {
             summary,
-            description: `Telefone: ${clientPhone}\nAgendado via Wagoo IA.`,
+            description: `Telefone: ${clientPhone}${servicesLine}\n${via}`,
             start: { dateTime: start.toISOString(), timeZone: 'America/Sao_Paulo' },
             end: { dateTime: end.toISOString(), timeZone: 'America/Sao_Paulo' },
         };
@@ -217,6 +228,36 @@ export const createEvent = async (
         console.error(`❌ Erro ao criar evento para ${email}:`, error);
         return null;
     }
+};
+
+/** Intervalos ocupados no Google Calendar (primary) para um dia YYYY-MM-DD (TZ BR). */
+export const listGoogleBusyRangesForDay = async (
+  email: string,
+  dayYmd: string,
+): Promise<Array<{ startIso: string; endIso: string }>> => {
+  try {
+    const calendar = await getOAuthClient(email);
+    if (!calendar) return [];
+
+    const timeMin = dayjs.tz(`${dayYmd}T00:00:00`, BR_TZ).toISOString();
+    const timeMax = dayjs.tz(`${dayYmd}T00:00:00`, BR_TZ).add(1, 'day').toISOString();
+
+    const response = await calendar.freebusy.query({
+      requestBody: {
+        timeMin,
+        timeMax,
+        items: [{ id: 'primary' }],
+      },
+    });
+
+    const busy = response.data.calendars?.primary?.busy ?? [];
+    return busy
+      .filter((b): b is { start: string; end: string } => Boolean(b.start && b.end))
+      .map((b) => ({ startIso: b.start, endIso: b.end }));
+  } catch (error) {
+    console.error(`❌ Erro freebusy ${email} ${dayYmd}:`, error);
+    return [];
+  }
 };
 
 export type CalendarEventDto = {

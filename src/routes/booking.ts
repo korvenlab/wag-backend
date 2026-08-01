@@ -13,6 +13,13 @@ import {
   cancelAppointmentReminder,
   notifyWebBookingCreated,
 } from '../services/reminders';
+import {
+  checkAvailability,
+  createEvent,
+  deleteEvent,
+  listGoogleBusyRangesForDay,
+} from '../services/calendar';
+import { log } from '../lib/logger';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -578,7 +585,7 @@ router.patch('/appointments/:id', async (req: Request, res: Response) => {
     .update({ status })
     .eq('id', String(req.params.id || ''))
     .eq('profile_id', gate.userId)
-    .select('*')
+    .select('id, status, google_event_id')
     .maybeSingle();
 
   if (error) return res.status(500).json({ error: error.message });
@@ -586,6 +593,17 @@ router.patch('/appointments/:id', async (req: Request, res: Response) => {
 
   if (status === 'cancelled') {
     void cancelAppointmentReminder(gate.userId, bookingReminderEventId(String(data.id)));
+    const eventId = data.google_event_id ? String(data.google_event_id) : '';
+    if (eventId) {
+      const { data: owner } = await supabase
+        .from('profiles')
+        .select('email')
+        .eq('id', gate.userId)
+        .maybeSingle();
+      if (owner?.email) {
+        void deleteEvent(String(owner.email), eventId);
+      }
+    }
   }
 
   res.json(data);
@@ -766,6 +784,23 @@ router.get('/public/:slug/slots', async (req: Request, res: Response) => {
     end: dayjs(b.ends_at).tz(BR_TZ),
   }));
 
+  // Se o dono conectou Google Calendar, respeita também o free/busy da agenda dele.
+  const { data: ownerCal } = await supabase
+    .from('profiles')
+    .select('email, googleAuth')
+    .eq('id', site.id)
+    .maybeSingle();
+
+  if (ownerCal?.email && ownerCal.googleAuth) {
+    const gBusy = await listGoogleBusyRangesForDay(String(ownerCal.email), day);
+    for (const g of gBusy) {
+      busyRanges.push({
+        start: dayjs(g.startIso).tz(BR_TZ),
+        end: dayjs(g.endIso).tz(BR_TZ),
+      });
+    }
+  }
+
   // Grade fixa de 15 min (como barbearias típicas); duração do bloco = soma dos serviços.
   const STEP = 15;
   const slots: string[] = [];
@@ -883,6 +918,25 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
     return res.status(409).json({ error: 'Horário acabou de ser preenchido. Escolha outro.' });
   }
 
+  const { data: ownerCal } = await supabase
+    .from('profiles')
+    .select('email, googleAuth')
+    .eq('id', site.id)
+    .maybeSingle();
+
+  if (ownerCal?.email && ownerCal.googleAuth) {
+    const freeOnGoogle = await checkAvailability(
+      String(ownerCal.email),
+      startsAt.toISOString(),
+      duration,
+    );
+    if (!freeOnGoogle) {
+      return res.status(409).json({
+        error: 'Horário ocupado na Google Agenda. Escolha outro.',
+      });
+    }
+  }
+
   const { data, error } = await supabase
     .from('booking_appointments')
     .insert({
@@ -904,6 +958,40 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
 
   if (error) return res.status(500).json({ error: error.message });
 
+  let googleEventId: string | null = null;
+  if (ownerCal?.email && ownerCal.googleAuth) {
+    try {
+      const created = await createEvent(
+        String(ownerCal.email),
+        clientName,
+        clientPhone,
+        startsAt.toISOString(),
+        duration,
+        {
+          barberName: providerName || undefined,
+          serviceNames,
+          source: 'agenda_web',
+        },
+      );
+      if (created?.id) {
+        googleEventId = created.id;
+        const { error: upErr } = await supabase
+          .from('booking_appointments')
+          .update({ google_event_id: created.id })
+          .eq('id', data.id);
+        if (upErr) {
+          log.error('BOOKING', 'falha ao gravar google_event_id', upErr, {
+            appointmentId: data.id,
+          });
+        }
+      }
+    } catch (err) {
+      log.error('BOOKING', 'falha ao criar evento Google', err, {
+        appointmentId: data.id,
+      });
+    }
+  }
+
   void notifyWebBookingCreated({
     ownerUserId: site.id as string,
     appointmentId: data.id as string,
@@ -916,7 +1004,7 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
   });
 
   res.status(201).json({
-    appointment: data,
+    appointment: { ...data, google_event_id: googleEventId },
     service: {
       name: serviceNames,
       price_brl: Math.round(totalPrice * 100) / 100,
@@ -930,6 +1018,7 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
     })),
     provider: providerName ? { id: providerId, name: providerName } : null,
     store_name: site.store_name,
+    google_synced: Boolean(googleEventId),
   });
 });
 
