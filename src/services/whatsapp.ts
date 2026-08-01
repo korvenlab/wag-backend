@@ -67,6 +67,8 @@ import {
   catalogToServicePrices,
   matchCatalogService,
   formatCatalogListForWhatsApp,
+  formatCatalogPriceReply,
+  isPriceInquiry,
   buildAiBookingNotes,
   type CatalogService,
 } from '../lib/bookingCatalog';
@@ -661,16 +663,20 @@ export async function startWhatsApp(email: string, res: Response | null) {
           .or('active.is.null,active.eq.true')
           .order('name', { ascending: true });
         const catalog: CatalogService[] = ((catalogRows || []) as CatalogService[]).filter(
-          (s) => s.active !== false && Number(s.price_brl) >= 0,
+          (s) => s.active !== false,
         );
+        // Menu Serviços = fonte oficial de preços (com ou sem sinal). Legado só se catálogo vazio.
         const pricedServices = catalog.length
           ? catalogToServicePrices(catalog)
           : normalizeServicePrices(p.service_prices);
         const requiresDeposit = profileRequiresDeposit(p);
-        const schedulingIntent = hasSchedulingIntent(
-          textMessage,
-          pricedServices.map((s) => s.name),
-        );
+        const priceInquiry = isPriceInquiry(textMessage);
+        const schedulingIntent =
+          priceInquiry ||
+          hasSchedulingIntent(
+            textMessage,
+            pricedServices.map((s) => s.name),
+          );
 
         // Sem sessão: só entra por pedido de agenda OU saudação pura (sem abrir sessão de 45min).
         if (!activeSession && !schedulingIntent && !userGreetingEarly) {
@@ -758,6 +764,29 @@ export async function startWhatsApp(email: string, res: Response | null) {
             selectedBarberName: null,
             selectedBarberEmail: null,
           };
+        }
+
+        // Preços do menu Serviços — resposta directa (com ou sem sinal ligado).
+        if (priceInquiry && catalog.length > 0) {
+          const priceBody = formatCatalogPriceReply(textMessage, catalog);
+          if (priceBody) {
+            const reply = emphasizeWa(
+              `${priceBody}\n\nQuer marcar um horário?`,
+              ...catalog.map((s) => s.name),
+            );
+            log.info(WA, 'preços do catálogo enviados', {
+              email,
+              services: catalog.length,
+              matched: matchCatalogService(textMessage, catalog)?.name ?? null,
+            });
+            await sock.sendMessage(remoteJid, { text: reply });
+            memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+            await supabase
+              .from('profiles')
+              .update({ messages_answered: (p.messages_answered || 0) + 1 })
+              .eq('email', email);
+            return;
+          }
         }
 
         const schedulingState = memoryCache[cacheKey].scheduling!;

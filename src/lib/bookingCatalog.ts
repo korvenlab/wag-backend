@@ -16,12 +16,13 @@ function fold(s: string): string {
     .trim();
 }
 
-/** Converte catálogo booking_services → formato legado da IA (preços). */
+/** Converte catálogo booking_services → formato da IA (preços + duração). */
 export function catalogToServicePrices(services: CatalogService[]): ServicePrice[] {
   return normalizeServicePrices(
     services.map((s) => ({
       name: s.name,
       price: `R$ ${Number(s.price_brl).toFixed(2).replace('.', ',')}`,
+      notes: `${s.duration_minutes} min`,
     })),
   );
 }
@@ -33,42 +34,90 @@ export function matchCatalogService(
   text: string,
   services: CatalogService[],
 ): CatalogService | null {
-  if (!text?.trim() || !services.length) return null;
+  const all = matchCatalogServices(text, services);
+  return all[0] ?? null;
+}
+
+/** Todos os serviços do catálogo citados no texto (ordem por relevância). */
+export function matchCatalogServices(
+  text: string,
+  services: CatalogService[],
+): CatalogService[] {
+  if (!text?.trim() || !services.length) return [];
   const m = fold(text);
-  let best: CatalogService | null = null;
-  let bestScore = 0;
+  const scored: { s: CatalogService; score: number }[] = [];
 
   for (const s of services) {
     const name = fold(s.name);
     if (!name) continue;
+    let score = 0;
     if (m.includes(name)) {
-      const score = name.length + 100;
-      if (score > bestScore) {
-        best = s;
-        bestScore = score;
-      }
-      continue;
-    }
-    const tokens = name.split(/[\s/+-]+/).filter((t) => t.length >= 4);
-    for (const t of tokens) {
-      if (m.includes(t) && t.length + 10 > bestScore) {
-        best = s;
-        bestScore = t.length + 10;
+      score = name.length + 100;
+    } else {
+      const tokens = name.split(/[\s/+-]+/).filter((t) => t.length >= 4);
+      for (const t of tokens) {
+        if (m.includes(t)) score = Math.max(score, t.length + 10);
       }
     }
+    if (score > 0) scored.push({ s, score });
   }
-  return best;
+
+  scored.sort((a, b) => b.score - a.score);
+  const seen = new Set<string>();
+  const out: CatalogService[] = [];
+  for (const row of scored) {
+    if (seen.has(row.s.id)) continue;
+    seen.add(row.s.id);
+    out.push(row.s);
+  }
+  return out;
 }
 
-/** Lista curta para WhatsApp: "1. Corte — R$ 50 (30 min)". */
+/** Lista para WhatsApp: "1. Corte — R$ 50 (30 min)". */
 export function formatCatalogListForWhatsApp(services: CatalogService[]): string {
   return services
-    .slice(0, 12)
     .map((s, i) => {
       const price = Number(s.price_brl).toFixed(2).replace('.', ',');
       return `${i + 1}. *${s.name}* — R$ ${price} (${s.duration_minutes} min)`;
     })
     .join('\n');
+}
+
+/** Resposta de preço: serviço(s) pedidos ou tabela completa. */
+export function formatCatalogPriceReply(
+  text: string,
+  services: CatalogService[],
+): string | null {
+  if (!services.length) return null;
+  const matched = matchCatalogServices(text, services);
+  if (matched.length === 1) {
+    const s = matched[0];
+    const price = Number(s.price_brl).toFixed(2).replace('.', ',');
+    return `*${s.name}*: R$ ${price} (${s.duration_minutes} min).`;
+  }
+  if (matched.length > 1) {
+    return matched
+      .map((s) => {
+        const price = Number(s.price_brl).toFixed(2).replace('.', ',');
+        return `*${s.name}*: R$ ${price} (${s.duration_minutes} min)`;
+      })
+      .join('\n');
+  }
+  return `Nossos serviços:\n\n${formatCatalogListForWhatsApp(services)}`;
+}
+
+/** Cliente pedindo preço / tabela / "quanto custa". */
+export function isPriceInquiry(message: string): boolean {
+  if (!message?.trim()) return false;
+  const m = fold(message);
+  if (/\b(preco|precos|valor|valores|tabela|cardapio|custa)\b/.test(m)) {
+    return true;
+  }
+  if (/\bquanto\b/.test(m) && /\b(custa|fica|sai|cobram|cobra|e|sao)\b/.test(m)) {
+    return true;
+  }
+  if (/^(quanto|valores?|precos?)\??$/.test(m)) return true;
+  return false;
 }
 
 export function parseAiBookingNotes(notes: string | null | undefined): {
