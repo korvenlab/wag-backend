@@ -17,6 +17,7 @@ import {
   checkAvailability,
   createEvent,
   deleteEvent,
+  getCalendarEventById,
   listGoogleBusyRangesForDay,
 } from '../services/calendar';
 import { log } from '../lib/logger';
@@ -236,6 +237,58 @@ router.get('/me', async (req: Request, res: Response) => {
     publishReady: publishCheck.missing.length === 0,
     missing: publishCheck.missing,
     missingMessages: publishCheck.messages,
+  });
+});
+
+/** Diagnóstico: o evento existe de fato na Google Agenda da conta conectada? */
+router.get('/google-check', async (req: Request, res: Response) => {
+  const gate = await requireAgendaWebOwner(req);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('email, googleAuth')
+    .eq('id', gate.userId)
+    .maybeSingle();
+
+  const ga = profile?.googleAuth as { refreshToken?: string | null } | null | undefined;
+  const connected = Boolean(profile?.email && ga?.refreshToken);
+
+  const { data: last } = await supabase
+    .from('booking_appointments')
+    .select('id, client_name, starts_at, ends_at, google_event_id, created_at')
+    .eq('profile_id', gate.userId)
+    .not('google_event_id', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  let live: Awaited<ReturnType<typeof getCalendarEventById>> = null;
+  if (connected && last?.google_event_id && profile?.email) {
+    live = await getCalendarEventById(String(profile.email), String(last.google_event_id));
+  }
+
+  res.json({
+    google_connected: connected,
+    wagoo_email: profile?.email ?? null,
+    last_synced_appointment: last
+      ? {
+          id: last.id,
+          client_name: last.client_name,
+          starts_at: last.starts_at,
+          starts_at_br: dayjs(last.starts_at as string)
+            .tz(BR_TZ)
+            .format('DD/MM/YYYY HH:mm'),
+          google_event_id: last.google_event_id,
+        }
+      : null,
+    google_event_live: live,
+    found_on_google: Boolean(live && live.status !== 'cancelled'),
+    tip: live?.htmlLink
+      ? 'Abra o link do evento na conta Google que autorizou o Wagoo.'
+      : connected
+        ? 'Confira o dia/horário do agendamento (pode não ser hoje) na agenda da conta conectada.'
+        : 'Conecte a Google Agenda neste painel para sincronizar.',
   });
 });
 

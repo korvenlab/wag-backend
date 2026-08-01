@@ -166,6 +166,7 @@ export type CreateEventOptions = {
 export type CreateEventResult = {
   id: string;
   startIso: string;
+  htmlLink: string | null;
 };
 
 export const createEvent = async (
@@ -180,8 +181,13 @@ export const createEvent = async (
         const calendar = await getOAuthClient(email);
         if (!calendar) return null;
 
-        const start = parseISO(dateIso);
-        const end = addMinutes(start, durationMin);
+        // Horário local BR sem sufixo Z — senão o Google ignora timeZone e desloca o evento.
+        const startBr = dayjs(dateIso).tz(BR_TZ);
+        const endBr = startBr.add(durationMin, 'minute');
+        if (!startBr.isValid()) {
+            console.error(`❌ dateIso inválido para ${email}: ${dateIso}`);
+            return null;
+        }
 
         const barberLabel = options.barberName?.trim() || 'Sem Preferência';
         const summary = `[Wagoo] ${clientName} - Barbeiro: ${barberLabel}`;
@@ -202,8 +208,14 @@ export const createEvent = async (
         } = {
             summary,
             description: `Telefone: ${clientPhone}${servicesLine}\n${via}`,
-            start: { dateTime: start.toISOString(), timeZone: 'America/Sao_Paulo' },
-            end: { dateTime: end.toISOString(), timeZone: 'America/Sao_Paulo' },
+            start: {
+              dateTime: startBr.format('YYYY-MM-DDTHH:mm:ss'),
+              timeZone: BR_TZ,
+            },
+            end: {
+              dateTime: endBr.format('YYYY-MM-DDTHH:mm:ss'),
+              timeZone: BR_TZ,
+            },
         };
 
         if (options.barberEmail) {
@@ -222,12 +234,46 @@ export const createEvent = async (
             return null;
         }
 
-        console.log(`✅ Evento criado: ${summary} (${eventId})`);
-        return { id: eventId, startIso: start.toISOString() };
+        const htmlLink = inserted.data.htmlLink ?? null;
+        console.log(`✅ Evento criado: ${summary} (${eventId})`, {
+          email,
+          startLocal: startBr.format('YYYY-MM-DD HH:mm'),
+          htmlLink,
+        });
+        return { id: eventId, startIso: startBr.toISOString(), htmlLink };
     } catch (error) {
         console.error(`❌ Erro ao criar evento para ${email}:`, error);
         return null;
     }
+};
+
+/** Confirma se um evento ainda existe na agenda primary do dono. */
+export const getCalendarEventById = async (
+  email: string,
+  eventId: string,
+): Promise<{
+  id: string;
+  summary: string | null;
+  htmlLink: string | null;
+  start: string | null;
+  status: string | null;
+} | null> => {
+  try {
+    const calendar = await getOAuthClient(email);
+    if (!calendar) return null;
+    const res = await calendar.events.get({ calendarId: 'primary', eventId });
+    if (!res.data?.id) return null;
+    return {
+      id: res.data.id,
+      summary: res.data.summary ?? null,
+      htmlLink: res.data.htmlLink ?? null,
+      start: res.data.start?.dateTime || res.data.start?.date || null,
+      status: res.data.status ?? null,
+    };
+  } catch (error) {
+    console.error(`❌ Erro ao buscar evento ${eventId} de ${email}:`, error);
+    return null;
+  }
 };
 
 /** Intervalos ocupados no Google Calendar (primary) para um dia YYYY-MM-DD (TZ BR). */
