@@ -250,8 +250,34 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
   const sig = req.headers['stripe-signature'] as string;
   let event: Stripe.Event;
 
+  // Dois destinos (plataforma + contas conectadas) = dois whsec_ diferentes.
+  const secrets = [
+    process.env.STRIPE_WEBHOOK_SECRET,
+    process.env.STRIPE_CONNECT_WEBHOOK_SECRET,
+  ].filter((s): s is string => Boolean(s && s.trim()));
+
+  if (!secrets.length) {
+    console.error('❌ Nenhum STRIPE_WEBHOOK_SECRET / STRIPE_CONNECT_WEBHOOK_SECRET configurado');
+    return res.status(500).send('Webhook secret não configurado');
+  }
+
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET!);
+    let lastErr: unknown;
+    event = undefined as unknown as Stripe.Event;
+    for (const secret of secrets) {
+      try {
+        event = stripe.webhooks.constructEvent(req.body, sig, secret);
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    if (lastErr || !event) {
+      const message = lastErr instanceof Error ? lastErr.message : String(lastErr);
+      console.error(`❌ Erro de Assinatura no Webhook: ${message}`);
+      return res.status(400).send(`Webhook Error: ${message}`);
+    }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`❌ Erro de Assinatura no Webhook: ${message}`);
