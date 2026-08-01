@@ -6,6 +6,7 @@ import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 import { setProfileHasPaidByUserId } from '../lib/profileHasPaid';
 import { setProfileSubscriptionTierByUserId } from '../lib/setSubscriptionTier';
 import { supabase } from '../lib/supabase';
+import { stripe, frontendBaseUrl } from '../lib/stripeClient';
 import {
   normalizeSubscriptionTier,
   resolveStripePriceId,
@@ -13,16 +14,17 @@ import {
   WAGOO_PLANS,
   type WagooSubscriptionTier,
 } from '../lib/wagooSubscription';
+import connectRoutes from './connect';
+import {
+  fulfillBookingDepositPayment,
+  markBookingPaymentFailed,
+} from '../services/bookingPayments';
+import { log } from '../lib/logger';
 
 dotenv.config();
 const router = express.Router();
 
-const stripeKey = process.env.STRIPE_SECRET_KEY || '';
-if (!stripeKey) {
-  console.error('⚠️ AVISO: A variável STRIPE_SECRET_KEY não está configurada no Render!');
-}
-
-const stripe = new Stripe(stripeKey, { apiVersion: '2023-10-16' });
+router.use('/connect', connectRoutes);
 
 async function applySubscriptionFromStripe(sub: Stripe.Subscription): Promise<void> {
   const userId = sub.metadata?.supabase_user_id;
@@ -54,10 +56,47 @@ async function applySubscriptionFromStripe(sub: Stripe.Subscription): Promise<vo
     return;
   }
 
-  // Legado: sem plan_tier no metadata
   const r = await setProfileHasPaidByUserId(supabase, userId, true);
   if (!r.ok) console.error('[stripe webhook] has_paid (legacy):', r.error);
   else console.log(`✅ has_paid=true (legado) — ${userId}`);
+}
+
+async function handleBookingDepositCheckout(session: Stripe.Checkout.Session): Promise<void> {
+  if (session.metadata?.wagoo_payment !== 'booking_deposit') return;
+
+  const appointmentId = session.metadata?.appointment_id;
+  if (!appointmentId) {
+    log.warn('STRIPE', 'checkout deposit sem appointment_id', { sessionId: session.id });
+    return;
+  }
+
+  const pi =
+    typeof session.payment_intent === 'string'
+      ? session.payment_intent
+      : session.payment_intent?.id ?? null;
+
+  const paid =
+    session.payment_status === 'paid' ||
+    session.status === 'complete';
+
+  if (!paid) {
+    log.info('STRIPE', 'checkout deposit ainda não pago', {
+      appointmentId,
+      payment_status: session.payment_status,
+    });
+    return;
+  }
+
+  const result = await fulfillBookingDepositPayment({
+    appointmentId,
+    paymentIntentId: pi,
+    checkoutSessionId: session.id,
+  });
+  if (!result.ok) {
+    log.error('STRIPE', 'fulfill deposit falhou', result.error, { appointmentId });
+  } else if (!result.already) {
+    pushAdminEvent('wagoo', 'Sinal de agendamento pago (Connect)', 'online');
+  }
 }
 
 async function createCheckoutForTier(req: Request, res: Response, defaultTier: WagooSubscriptionTier) {
@@ -97,7 +136,7 @@ async function createCheckoutForTier(req: Request, res: Response, defaultTier: W
       });
     }
 
-    const frontendUrl = process.env.FRONTEND_URL?.trim().replace(/\/$/, '');
+    const frontendUrl = frontendBaseUrl();
     const successPath =
       tier === 'agenda_web'
         ? '/dashboard/agenda-web?checkout=success'
@@ -132,12 +171,10 @@ router.post('/create-checkout-session', express.json(), (req, res) =>
   createCheckoutForTier(req, res, 'basic'),
 );
 
-/** Retrocompat: checkout antigo do add-on → Plano Pro */
 router.post('/create-multi-barber-checkout-session', express.json(), (req, res) =>
   createCheckoutForTier(req, res, 'pro'),
 );
 
-/** Localiza o customer Stripe do usuário (metadata da assinatura ou e-mail do checkout). */
 async function resolveStripeCustomerId(userId: string, email: string): Promise<string | null> {
   try {
     const found = await stripe.subscriptions.search({
@@ -167,10 +204,6 @@ async function resolveStripeCustomerId(userId: string, email: string): Promise<s
   return customers.data[0]?.id ?? null;
 }
 
-/**
- * Customer Portal da Stripe — cancelar assinatura, trocar cartão, etc.
- * Requer Portal activo no Dashboard Stripe (Settings → Billing → Customer portal).
- */
 router.post('/create-billing-portal-session', express.json(), async (req: Request, res: Response) => {
   try {
     const auth = await getUserFromBearerHeader(supabase, req.headers.authorization);
@@ -195,7 +228,7 @@ router.post('/create-billing-portal-session', express.json(), async (req: Reques
       });
     }
 
-    const frontendUrl = process.env.FRONTEND_URL?.trim().replace(/\/$/, '');
+    const frontendUrl = frontendBaseUrl();
     if (!frontendUrl) {
       return res.status(503).json({ error: 'FRONTEND_URL não configurada no servidor.' });
     }
@@ -225,71 +258,127 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
     return res.status(400).send(`Webhook Error: ${message}`);
   }
 
-  switch (event.type) {
-    case 'checkout.session.completed': {
-      const session = event.data.object as Stripe.Checkout.Session;
-      let userId = session.client_reference_id ?? null;
-      let tier: WagooSubscriptionTier | null = null;
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed':
+      case 'checkout.session.async_payment_succeeded': {
+        const session = event.data.object as Stripe.Checkout.Session;
 
-      if (typeof session.subscription === 'string') {
+        if (session.metadata?.wagoo_payment === 'booking_deposit') {
+          await handleBookingDepositCheckout(session);
+          break;
+        }
+
+        // Assinatura SaaS Wagoo (plataforma)
+        let userId = session.client_reference_id ?? null;
+        let tier: WagooSubscriptionTier | null = null;
+
+        if (typeof session.subscription === 'string') {
+          try {
+            const sub = await stripe.subscriptions.retrieve(session.subscription);
+            userId = userId ?? sub.metadata?.supabase_user_id ?? null;
+            tier = resolveTierFromStripeSubscription(sub);
+          } catch (e) {
+            console.error('[stripe webhook] checkout.session.completed retrieve subscription:', e);
+          }
+        }
+
+        if (userId && tier) {
+          const r = await setProfileSubscriptionTierByUserId(supabase, userId, tier);
+          if (!r.ok) console.error('[stripe webhook] checkout tier:', r.error);
+          else {
+            console.log(`✅ Plano ${tier} ativado: ${userId}`);
+            pushAdminEvent('wagoo', `Pagamento confirmado — ${WAGOO_PLANS[tier].label}`, 'online');
+          }
+        } else if (userId && session.mode === 'subscription') {
+          const r = await setProfileHasPaidByUserId(supabase, userId, true);
+          if (!r.ok) console.error('[stripe webhook] checkout.session.completed profiles:', r.error);
+          else console.log(`✅ Pagamento confirmado (legado): ${userId}`);
+          pushAdminEvent('wagoo', 'Pagamento confirmado — assinatura Wagoo ativa', 'online');
+        }
+        break;
+      }
+
+      case 'checkout.session.async_payment_failed': {
+        const session = event.data.object as Stripe.Checkout.Session;
+        if (session.metadata?.wagoo_payment === 'booking_deposit' && session.metadata.appointment_id) {
+          await markBookingPaymentFailed(session.metadata.appointment_id);
+        }
+        break;
+      }
+
+      case 'account.updated': {
+        const account = event.data.object as Stripe.Account;
+        const userId = account.metadata?.supabase_user_id;
+        if (userId) {
+          await supabase
+            .from('profiles')
+            .update({
+              stripe_connect_account_id: account.id,
+              stripe_connect_charges_enabled: Boolean(account.charges_enabled),
+              stripe_connect_payouts_enabled: Boolean(account.payouts_enabled),
+              stripe_connect_details_submitted: Boolean(account.details_submitted),
+            })
+            .eq('id', userId);
+          log.info('CONNECT', 'account.updated sync', {
+            userId,
+            charges: account.charges_enabled,
+            payouts: account.payouts_enabled,
+          });
+        } else {
+          // Fallback: achar pelo account id
+          await supabase
+            .from('profiles')
+            .update({
+              stripe_connect_charges_enabled: Boolean(account.charges_enabled),
+              stripe_connect_payouts_enabled: Boolean(account.payouts_enabled),
+              stripe_connect_details_submitted: Boolean(account.details_submitted),
+            })
+            .eq('stripe_connect_account_id', account.id);
+        }
+        break;
+      }
+
+      case 'customer.subscription.updated': {
+        const sub = event.data.object as Stripe.Subscription;
+        await applySubscriptionFromStripe(sub);
+        break;
+      }
+
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object as Stripe.Subscription;
+        const userId = sub.metadata?.supabase_user_id;
+        if (!userId) break;
+        const r = await setProfileSubscriptionTierByUserId(supabase, userId, null);
+        if (!r.ok) console.error('[stripe webhook] customer.subscription.deleted:', r.error);
+        else console.log(`🛑 subscription removida — ${userId}`);
+        pushAdminEvent('wagoo', 'Assinatura removida', 'degraded');
+        break;
+      }
+
+      case 'invoice.payment_succeeded': {
+        const inv = event.data.object as Stripe.Invoice;
+        const subId =
+          typeof inv.subscription === 'string' ? inv.subscription : inv.subscription?.id ?? null;
+        if (!subId) break;
         try {
-          const sub = await stripe.subscriptions.retrieve(session.subscription);
-          userId = userId ?? sub.metadata?.supabase_user_id ?? null;
-          tier = resolveTierFromStripeSubscription(sub);
+          const sub = await stripe.subscriptions.retrieve(subId);
+          if (sub.status === 'active' || sub.status === 'trialing') {
+            await applySubscriptionFromStripe(sub);
+          }
         } catch (e) {
-          console.error('[stripe webhook] checkout.session.completed retrieve subscription:', e);
+          console.error('[stripe webhook] invoice.payment_succeeded:', e);
         }
+        break;
       }
 
-      if (userId && tier) {
-        const r = await setProfileSubscriptionTierByUserId(supabase, userId, tier);
-        if (!r.ok) console.error('[stripe webhook] checkout tier:', r.error);
-        else {
-          console.log(`✅ Plano ${tier} ativado: ${userId}`);
-          pushAdminEvent('wagoo', `Pagamento confirmado — ${WAGOO_PLANS[tier].label}`, 'online');
-        }
-      } else if (userId) {
-        const r = await setProfileHasPaidByUserId(supabase, userId, true);
-        if (!r.ok) console.error('[stripe webhook] checkout.session.completed profiles:', r.error);
-        else console.log(`✅ Pagamento confirmado (legado): ${userId}`);
-        pushAdminEvent('wagoo', 'Pagamento confirmado — assinatura Wagoo ativa', 'online');
-      }
-      break;
+      default:
+        break;
     }
-
-    case 'customer.subscription.updated': {
-      const sub = event.data.object as Stripe.Subscription;
-      await applySubscriptionFromStripe(sub);
-      break;
-    }
-
-    case 'customer.subscription.deleted': {
-      const sub = event.data.object as Stripe.Subscription;
-      const userId = sub.metadata?.supabase_user_id;
-      if (!userId) break;
-      const r = await setProfileSubscriptionTierByUserId(supabase, userId, null);
-      if (!r.ok) console.error('[stripe webhook] customer.subscription.deleted:', r.error);
-      else console.log(`🛑 subscription removida — ${userId}`);
-      pushAdminEvent('wagoo', 'Assinatura removida', 'degraded');
-      break;
-    }
-
-    case 'invoice.payment_succeeded': {
-      const inv = event.data.object as Stripe.Invoice;
-      const subId =
-        typeof inv.subscription === 'string' ? inv.subscription : inv.subscription?.id ?? null;
-      if (!subId) break;
-      try {
-        const sub = await stripe.subscriptions.retrieve(subId);
-        if (sub.status === 'active' || sub.status === 'trialing') {
-          await applySubscriptionFromStripe(sub);
-        }
-      } catch (e) {
-        console.error('[stripe webhook] invoice.payment_succeeded:', e);
-      }
-      break;
-    }
+  } catch (err) {
+    log.error('STRIPE', 'webhook handler error', err, { type: event.type });
   }
+
   res.json({ received: true });
 });
 

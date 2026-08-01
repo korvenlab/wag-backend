@@ -21,11 +21,33 @@ import {
   listGoogleBusyRangesForDay,
 } from '../services/calendar';
 import { log } from '../lib/logger';
+import { stripe, frontendBaseUrl } from '../lib/stripeClient';
+import {
+  BOOKING_PAYMENT_HOLD_MINUTES,
+  WAGOO_APPLICATION_FEE_PERCENT,
+  brlToCents,
+  centsToBrl,
+  computeApplicationFeeCents,
+  computeDepositBrl,
+} from '../lib/connectFees';
+import { expireStalePendingPayments } from '../services/bookingPayments';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
 const router = Router();
+
+/** Horários que bloqueiam a grade (confirmados ou sinal em andamento e não expirado). */
+function holdsSlot(
+  row: { status?: string | null; payment_expires_at?: string | null },
+): boolean {
+  if (row.status === 'confirmed') return true;
+  if (row.status === 'pending_payment') {
+    if (!row.payment_expires_at) return true;
+    return dayjs(row.payment_expires_at).isAfter(dayjs());
+  }
+  return false;
+}
 
 type BookingServiceRow = {
   id: string;
@@ -171,7 +193,7 @@ async function loadPublishedSite(slug: string) {
   const { data, error } = await supabase
     .from('profiles')
     .select(
-      'id, store_name, booking_slug, booking_logo_url, booking_cover_url, booking_tagline, booking_phone, booking_address, booking_published, working_hours, subscription_tier',
+      'id, store_name, booking_slug, booking_logo_url, booking_cover_url, booking_tagline, booking_phone, booking_address, booking_published, working_hours, subscription_tier, stripe_connect_account_id, stripe_connect_charges_enabled, booking_deposit_enabled, booking_deposit_percent',
     )
     .eq('booking_slug', slug)
     .maybeSingle();
@@ -180,6 +202,18 @@ async function loadPublishedSite(slug: string) {
   if (!data.booking_published) return null;
   if (!tierSupportsPublicBooking(profileSubscriptionTier(data))) return null;
   return data;
+}
+
+function siteRequiresDeposit(site: {
+  booking_deposit_enabled?: boolean | null;
+  stripe_connect_charges_enabled?: boolean | null;
+  stripe_connect_account_id?: string | null;
+}): boolean {
+  return Boolean(
+    site.booking_deposit_enabled &&
+      site.stripe_connect_charges_enabled &&
+      site.stripe_connect_account_id,
+  );
 }
 
 router.get('/me', async (req: Request, res: Response) => {
@@ -633,12 +667,37 @@ router.patch('/appointments/:id', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Status inválido.' });
   }
 
+  const id = String(req.params.id || '');
+  const { data: current } = await supabase
+    .from('booking_appointments')
+    .select('id, status, payment_status')
+    .eq('id', id)
+    .eq('profile_id', gate.userId)
+    .maybeSingle();
+
+  if (!current) return res.status(404).json({ error: 'Agendamento não encontrado.' });
+
+  // Regra: com sinal, o horário só vira confirmado após pagamento do cliente.
+  if (status === 'confirmed') {
+    if (
+      current.status === 'pending_payment' ||
+      current.payment_status === 'pending' ||
+      current.payment_status === 'failed' ||
+      current.payment_status === 'expired'
+    ) {
+      return res.status(409).json({
+        error:
+          'Este horário só é confirmado depois que o cliente pagar o sinal na Stripe.',
+      });
+    }
+  }
+
   const { data, error } = await supabase
     .from('booking_appointments')
     .update({ status })
-    .eq('id', String(req.params.id || ''))
+    .eq('id', id)
     .eq('profile_id', gate.userId)
-    .select('id, status, google_event_id')
+    .select('id, status, google_event_id, payment_status')
     .maybeSingle();
 
   if (error) return res.status(500).json({ error: error.message });
@@ -683,6 +742,8 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
   ]);
 
   res.setHeader('Cache-Control', 'no-store');
+  const depositRequired = siteRequiresDeposit(site);
+  const depositPercent = Number(site.booking_deposit_percent) || 30;
   res.json({
     store_name: site.store_name || 'Negócio',
     slug: site.booking_slug,
@@ -694,6 +755,12 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
     working_hours: site.working_hours ?? null,
     services: services ?? [],
     providers: providers ?? [],
+    deposit: {
+      required: depositRequired,
+      percent: depositPercent,
+      wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
+      hold_minutes: BOOKING_PAYMENT_HOLD_MINUTES,
+    },
   });
 });
 
@@ -715,10 +782,10 @@ router.get('/public/:slug/calendar', async (req: Request, res: Response) => {
   const { data: busy } = await supabase
     .from('booking_appointments')
     .select(
-      'id, starts_at, ends_at, status, booking_services(name), booking_providers(name)',
+      'id, starts_at, ends_at, status, payment_expires_at, booking_services(name), booking_providers(name)',
     )
     .eq('profile_id', site.id)
-    .eq('status', 'confirmed')
+    .in('status', ['confirmed', 'pending_payment'])
     .gte('starts_at', rangeStart.toISOString())
     .lte('starts_at', rangeEnd.toISOString())
     .order('starts_at', { ascending: true });
@@ -743,6 +810,7 @@ router.get('/public/:slug/calendar', async (req: Request, res: Response) => {
   }
 
   for (const row of busy ?? []) {
+    if (!holdsSlot(row)) continue;
     const key = dayjs(row.starts_at).tz(BR_TZ).format('YYYY-MM-DD');
     if (!days[key]) continue;
     days[key].bookedCount += 1;
@@ -820,9 +888,9 @@ router.get('/public/:slug/slots', async (req: Request, res: Response) => {
 
   let busyQuery = supabase
     .from('booking_appointments')
-    .select('starts_at, ends_at, provider_id')
+    .select('starts_at, ends_at, provider_id, status, payment_expires_at')
     .eq('profile_id', site.id)
-    .eq('status', 'confirmed')
+    .in('status', ['confirmed', 'pending_payment'])
     .lt('starts_at', dayEnd.toISOString())
     .gt('ends_at', dayStart.toISOString());
 
@@ -832,10 +900,12 @@ router.get('/public/:slug/slots', async (req: Request, res: Response) => {
 
   const { data: busy } = await busyQuery;
 
-  const busyRanges = (busy ?? []).map((b) => ({
-    start: dayjs(b.starts_at).tz(BR_TZ),
-    end: dayjs(b.ends_at).tz(BR_TZ),
-  }));
+  const busyRanges = (busy ?? [])
+    .filter((b) => holdsSlot(b))
+    .map((b) => ({
+      start: dayjs(b.starts_at).tz(BR_TZ),
+      end: dayjs(b.ends_at).tz(BR_TZ),
+    }));
 
   // Se o dono conectou Google Calendar, respeita também o free/busy da agenda dele.
   const { data: ownerCal } = await supabase
@@ -957,11 +1027,13 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
   });
   if (!inWindow) return res.status(400).json({ error: 'Horário fora do funcionamento.' });
 
+  void expireStalePendingPayments();
+
   let busyQuery = supabase
     .from('booking_appointments')
-    .select('starts_at, ends_at')
+    .select('starts_at, ends_at, status, payment_expires_at')
     .eq('profile_id', site.id)
-    .eq('status', 'confirmed')
+    .in('status', ['confirmed', 'pending_payment'])
     .lt('starts_at', endsAt.toISOString())
     .gt('ends_at', startsAt.toISOString());
 
@@ -970,7 +1042,7 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
   }
 
   const { data: busy } = await busyQuery;
-  if ((busy ?? []).length > 0) {
+  if ((busy ?? []).some((b) => holdsSlot(b))) {
     return res.status(409).json({ error: 'Horário acabou de ser preenchido. Escolha outro.' });
   }
 
@@ -996,6 +1068,23 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
     }
   }
 
+  const totalRounded = Math.round(totalPrice * 100) / 100;
+  const requiresDeposit = siteRequiresDeposit(site);
+  const depositPercent = Number(site.booking_deposit_percent) || 30;
+
+  if (requiresDeposit && totalRounded <= 0) {
+    return res.status(400).json({
+      error: 'Este horário exige sinal. O salão precisa ter preço nos serviços.',
+    });
+  }
+
+  const depositBrl = requiresDeposit ? computeDepositBrl(totalRounded, depositPercent) : 0;
+  const depositCents = brlToCents(depositBrl);
+  const feeCents = requiresDeposit ? computeApplicationFeeCents(depositCents) : 0;
+  const expiresAt = requiresDeposit
+    ? dayjs().add(BOOKING_PAYMENT_HOLD_MINUTES, 'minute').toISOString()
+    : null;
+
   const { data, error } = await supabase
     .from('booking_appointments')
     .insert({
@@ -1006,16 +1095,110 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
       client_phone: clientPhone,
       starts_at: startsAt.toISOString(),
       ends_at: endsAt.toISOString(),
-      status: 'confirmed',
-      notes:
-        services.length > 1
-          ? `Serviços: ${serviceNames}`
-          : '',
+      status: requiresDeposit ? 'pending_payment' : 'confirmed',
+      price_brl: totalRounded,
+      deposit_amount_brl: requiresDeposit ? depositBrl : null,
+      application_fee_brl: requiresDeposit ? centsToBrl(feeCents) : null,
+      payment_status: requiresDeposit ? 'pending' : 'not_required',
+      payment_expires_at: expiresAt,
+      notes: services.length > 1 ? `Serviços: ${serviceNames}` : '',
     })
-    .select('id, starts_at, ends_at, client_name, status, provider_id')
+    .select(
+      'id, starts_at, ends_at, client_name, status, provider_id, payment_status, deposit_amount_brl, price_brl',
+    )
     .single();
 
   if (error) return res.status(500).json({ error: error.message });
+
+  // Fluxo com sinal: Checkout direto na conta Connect + application_fee 2%
+  if (requiresDeposit) {
+    const base = frontendBaseUrl();
+    const slugEnc = encodeURIComponent(String(site.booking_slug));
+    try {
+      const session = await stripe.checkout.sessions.create(
+        {
+          mode: 'payment',
+          customer_email: undefined,
+          line_items: [
+            {
+              quantity: 1,
+              price_data: {
+                currency: 'brl',
+                unit_amount: depositCents,
+                product_data: {
+                  name: `Sinal — ${site.store_name || 'Agendamento'}`,
+                  description: `${serviceNames} · ${clientName} · ${startsAt.tz(BR_TZ).format('DD/MM HH:mm')}`,
+                },
+              },
+            },
+          ],
+          payment_method_types: ['card'],
+          payment_intent_data: {
+            application_fee_amount: feeCents,
+            metadata: {
+              wagoo_payment: 'booking_deposit',
+              appointment_id: String(data.id),
+              profile_id: String(site.id),
+            },
+          },
+          metadata: {
+            wagoo_payment: 'booking_deposit',
+            appointment_id: String(data.id),
+            profile_id: String(site.id),
+            supabase_user_id: String(site.id),
+          },
+          expires_at: Math.floor(Date.now() / 1000) + BOOKING_PAYMENT_HOLD_MINUTES * 60,
+          success_url: `${base}/a/${slugEnc}?pago=1&appointment=${data.id}`,
+          cancel_url: `${base}/a/${slugEnc}?pagamento=cancelado&appointment=${data.id}`,
+          locale: 'pt-BR',
+        },
+        { stripeAccount: String(site.stripe_connect_account_id) },
+      );
+
+      await supabase
+        .from('booking_appointments')
+        .update({ stripe_checkout_session_id: session.id })
+        .eq('id', data.id);
+
+      if (!session.url) {
+        await supabase
+          .from('booking_appointments')
+          .update({ status: 'cancelled', payment_status: 'failed' })
+          .eq('id', data.id);
+        return res.status(502).json({ error: 'Stripe não retornou URL de pagamento.' });
+      }
+
+      return res.status(201).json({
+        requires_payment: true,
+        checkout_url: session.url,
+        appointment: data,
+        payment: {
+          deposit_brl: depositBrl,
+          total_brl: totalRounded,
+          deposit_percent: depositPercent,
+          wagoo_fee_brl: centsToBrl(feeCents),
+          wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
+          hold_minutes: BOOKING_PAYMENT_HOLD_MINUTES,
+          note: 'A taxa Stripe de cartão é cobrada à parte na conta do salão. A Wagoo recebe 2% do sinal.',
+        },
+        service: {
+          name: serviceNames,
+          price_brl: totalRounded,
+          duration_minutes: duration,
+        },
+        provider: providerName ? { id: providerId, name: providerName } : null,
+        store_name: site.store_name,
+      });
+    } catch (err) {
+      log.error('BOOKING', 'checkout Connect falhou', err, { appointmentId: data.id });
+      await supabase
+        .from('booking_appointments')
+        .update({ status: 'cancelled', payment_status: 'failed' })
+        .eq('id', data.id);
+      const message = err instanceof Error ? err.message : 'Falha ao criar pagamento.';
+      return res.status(502).json({ error: message });
+    }
+  }
 
   let googleEventId: string | null = null;
   if (canSyncGoogle) {
@@ -1073,10 +1256,11 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
   });
 
   res.status(201).json({
+    requires_payment: false,
     appointment: { ...data, google_event_id: googleEventId },
     service: {
       name: serviceNames,
-      price_brl: Math.round(totalPrice * 100) / 100,
+      price_brl: totalRounded,
       duration_minutes: duration,
     },
     services: services.map((s) => ({
@@ -1091,6 +1275,47 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
   });
 });
 
+/** Cliente volta do Checkout — consulta status do pagamento. */
+router.get('/public/:slug/appointments/:id/payment-status', async (req: Request, res: Response) => {
+  const slug = String(req.params.slug || '').trim().toLowerCase();
+  const site = await loadPublishedSite(slug);
+  if (!site) return res.status(404).json({ error: 'Agenda não encontrada.' });
+
+  const id = String(req.params.id || '');
+  const { data } = await supabase
+    .from('booking_appointments')
+    .select('id, status, payment_status, starts_at, deposit_amount_brl, price_brl, client_name')
+    .eq('id', id)
+    .eq('profile_id', site.id)
+    .maybeSingle();
+
+  if (!data) return res.status(404).json({ error: 'Agendamento não encontrado.' });
+  res.json({
+    appointment: data,
+    paid: data.payment_status === 'paid' && data.status === 'confirmed',
+  });
+});
+
+/** Libera o horário se o cliente cancelar o Checkout. */
+router.post('/public/:slug/appointments/:id/cancel-payment', async (req: Request, res: Response) => {
+  const slug = String(req.params.slug || '').trim().toLowerCase();
+  const site = await loadPublishedSite(slug);
+  if (!site) return res.status(404).json({ error: 'Agenda não encontrada.' });
+
+  const id = String(req.params.id || '');
+  const { data, error } = await supabase
+    .from('booking_appointments')
+    .update({ status: 'cancelled', payment_status: 'failed' })
+    .eq('id', id)
+    .eq('profile_id', site.id)
+    .eq('status', 'pending_payment')
+    .select('id')
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ cancelled: Boolean(data) });
+});
+
 router.get('/public/:slug/my', async (req: Request, res: Response) => {
   const slug = String(req.params.slug || '').trim().toLowerCase();
   const site = await loadPublishedSite(slug);
@@ -1102,7 +1327,7 @@ router.get('/public/:slug/my', async (req: Request, res: Response) => {
   const { data } = await supabase
     .from('booking_appointments')
     .select(
-      'id, starts_at, ends_at, status, client_name, notes, booking_services(name, price_brl, duration_minutes), booking_providers(name)',
+      'id, starts_at, ends_at, status, payment_status, client_name, notes, deposit_amount_brl, price_brl, booking_services(name, price_brl, duration_minutes), booking_providers(name)',
     )
     .eq('profile_id', site.id)
     .eq('client_phone', phone)
