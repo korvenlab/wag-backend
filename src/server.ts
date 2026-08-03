@@ -223,6 +223,20 @@ app.post('/api/settings/ai', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Nada para atualizar.' });
   }
 
+  if (patch.is_ai_enabled === true) {
+    const { data: prof } = await supabase
+      .from('profiles')
+      .select('subscription_tier, has_paid, multi_barber_plan')
+      .eq('id', authed.user.id)
+      .maybeSingle();
+    const tier = profileSubscriptionTier(prof);
+    if (!tierSupportsAi(tier)) {
+      return res.status(403).json({
+        error: 'IA no WhatsApp disponível nos planos Basic, Pro e Pro+.',
+      });
+    }
+  }
+
   const { error } = await supabase
     .from('profiles')
     .update(patch)

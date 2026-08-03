@@ -64,7 +64,7 @@ router.post('/redeem', async (req: Request, res: Response) => {
 
     const { data: prof, error: profErr } = await supabase
       .from('profiles')
-      .select('complimentary_access_until')
+      .select('complimentary_access_until, subscription_tier, has_paid, stripe_subscription_id')
       .eq('id', userId)
       .maybeSingle();
 
@@ -83,12 +83,23 @@ router.post('/redeem', async (req: Request, res: Response) => {
 
     const emailNorm = auth.user.email ? String(auth.user.email).trim().toLowerCase() : null;
 
+    /** Cortesia sem assinatura Stripe → trata como Basic (IA + Agenda Web). */
+    const hasStripeSub = Boolean(
+      (prof as { stripe_subscription_id?: string | null } | null)?.stripe_subscription_id,
+    );
+    const currentTier = (prof as { subscription_tier?: string | null } | null)?.subscription_tier;
+    const promoPatch: Record<string, unknown> = {
+      complimentary_access_until: newUntil,
+      is_ai_enabled: true,
+    };
+    if (!hasStripeSub && (!currentTier || currentTier === 'agenda_web')) {
+      promoPatch.subscription_tier = 'basic';
+      promoPatch.has_paid = true;
+    }
+
     const { data: updatedRows, error: upProf } = await supabase
       .from('profiles')
-      .update({
-        complimentary_access_until: newUntil,
-        is_ai_enabled: true,
-      })
+      .update(promoPatch)
       .eq('id', userId)
       .select('id');
 

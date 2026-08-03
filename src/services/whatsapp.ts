@@ -25,6 +25,8 @@ import {
 } from './calendar';
 import { pushAdminEvent } from './adminEvents';
 import { profileHasWagooAccess } from '../lib/profileAccess';
+import { profileSubscriptionTier } from '../lib/profileMultiBarber';
+import { tierSupportsAi } from '../lib/wagooSubscription';
 import { listActiveBarbeirosForUser, resolveBarberFromSelection } from '../lib/barbeiros';
 import {
   bundleLooksComplete,
@@ -644,6 +646,12 @@ export async function startWhatsApp(email: string, res: Response | null) {
         if (presenceHandled) return;
 
         if (!p.is_ai_enabled) return;
+        const aiTier = profileSubscriptionTier(p as {
+          subscription_tier?: string | null;
+          has_paid?: boolean;
+          multi_barber_plan?: boolean | null;
+        });
+        if (!tierSupportsAi(aiTier)) return;
 
         const templates: ResponseTemplates = normalizeResponseTemplates(p.response_templates);
 
