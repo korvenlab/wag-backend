@@ -62,7 +62,6 @@ import {
   resolveCancelReply,
   type ResponseTemplates,
 } from '../lib/responseTemplates';
-import { normalizeServicePrices } from '../lib/servicePrices';
 import {
   catalogToServicePrices,
   matchCatalogService,
@@ -665,10 +664,8 @@ export async function startWhatsApp(email: string, res: Response | null) {
         const catalog: CatalogService[] = ((catalogRows || []) as CatalogService[]).filter(
           (s) => s.active !== false,
         );
-        // Menu Serviços = fonte oficial de preços (com ou sem sinal). Legado só se catálogo vazio.
-        const pricedServices = catalog.length
-          ? catalogToServicePrices(catalog)
-          : normalizeServicePrices(p.service_prices);
+        // Menu Serviços = única fonte de preços da IA (com ou sem sinal).
+        const pricedServices = catalogToServicePrices(catalog);
         const requiresDeposit = profileRequiresDeposit(p);
         const priceInquiry = isPriceInquiry(textMessage);
         const schedulingIntent =
