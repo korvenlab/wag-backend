@@ -599,6 +599,9 @@ export function eventsToCsvWithCommission(opts: {
   lines.push('');
   lines.push('# totais_por_profissional');
   lines.push(
+    '# Preencha ganho_final_brl (profissionais e Loja) e envie de volta no Analytics.',
+  );
+  lines.push(
     [
       'profissional',
       'agendamentos_pagos',
@@ -622,20 +625,63 @@ export function eventsToCsvWithCommission(opts: {
       ].join(','),
     );
   }
+  // Linha pronta para o dono informar o caixa da loja
+  const hasLoja = finalTotals.some((t) => isStoreSpreadsheetRow(t.profissional));
+  if (!hasLoja) {
+    lines.push(['Loja', '', '', '', '', '', 'loja'].join(','));
+  }
 
   return lines.join('\n');
 }
 
-/** Parse CSV simples (`,` ou `;`) com aliases de cabeçalho. */
+function parseMoneyCell(rawVal: string): number | null {
+  const cleaned = String(rawVal || '')
+    .replace(/R\$\s*/i, '')
+    .trim();
+  if (!cleaned) return null;
+  let valorRaw = cleaned;
+  if (cleaned.includes(',') && cleaned.includes('.')) {
+    valorRaw = cleaned.replace(/\./g, '').replace(',', '.');
+  } else if (cleaned.includes(',')) {
+    valorRaw = cleaned.replace(',', '.');
+  }
+  valorRaw = valorRaw.replace(/[^\d.-]/g, '');
+  const valor = Number(valorRaw);
+  if (!Number.isFinite(valor) || valor < 0) return null;
+  return valor;
+}
+
+/**
+ * Lê a planilha de Analytics (layout do export).
+ * Prefere o bloco `# totais_por_profissional`; senão agrega linhas com profissional + ganho.
+ */
 export function parseEarningsUploadCsv(
   text: string,
 ): { ok: true; rows: { profissional: string; valor: number }[] } | { ok: false; error: string } {
   const raw = text.replace(/^\uFEFF/, '').trim();
   if (!raw) return { ok: false, error: 'Arquivo CSV vazio.' };
 
-  const lines = raw.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith('#'));
+  const allLines = raw.split(/\r?\n/);
+  let sectionStart = -1;
+  for (let i = 0; i < allLines.length; i++) {
+    if (/totais_por_profissional/i.test(allLines[i])) {
+      sectionStart = i + 1;
+      break;
+    }
+  }
+
+  const sourceLines =
+    sectionStart >= 0
+      ? allLines.slice(sectionStart)
+      : allLines;
+
+  const lines = sourceLines.filter((l) => l.trim() && !l.trim().startsWith('#'));
   if (lines.length < 2) {
-    return { ok: false, error: 'CSV precisa de cabeçalho e ao menos uma linha de dados.' };
+    return {
+      ok: false,
+      error:
+        'Planilha sem dados. Baixe o relatório, preencha ganho_final_brl e envie de novo.',
+    };
   }
 
   const sep = lines[0].includes(';') && !lines[0].includes(',') ? ';' : ',';
@@ -671,61 +717,68 @@ export function parseEarningsUploadCsv(
     'barber',
     'profissional_nome',
   ]);
-  const valueAliases = new Set([
+  // Prioridade: ganho final (export) → manual → valor simples → comissão
+  const valuePriority = [
+    'ganho_final_brl',
+    'ganho_manual_brl',
     'valor',
     'ganho',
-    'comissao',
-    'comissao_brl',
     'ganho_brl',
     'amount',
     'valor_brl',
-  ]);
+    'comissao_brl',
+    'comissao',
+  ];
 
   let nameIdx = header.findIndex((h) => nameAliases.has(h));
-  let valueIdx = header.findIndex((h) => valueAliases.has(h));
+  let valueIdx = -1;
+  for (const alias of valuePriority) {
+    const idx = header.findIndex((h) => h === alias);
+    if (idx >= 0) {
+      valueIdx = idx;
+      break;
+    }
+  }
   if (nameIdx < 0) nameIdx = 0;
   if (valueIdx < 0) valueIdx = header.length > 1 ? 1 : -1;
   if (valueIdx < 0) {
     return {
       ok: false,
-      error: 'Inclua colunas profissional e valor (ex.: profissional,valor).',
+      error:
+        'Inclua as colunas profissional e ganho_final_brl (ou valor) na planilha.',
     };
   }
 
-  const rows: { profissional: string; valor: number }[] = [];
+  // Último valor por profissional (bloco de totais = 1 linha; detalhe = repete o total)
+  const byName = new Map<string, { profissional: string; valor: number }>();
   for (let i = 1; i < lines.length; i++) {
+    // Nova seção / cabeçalho repetido
     const cells = split(lines[i]);
+    const firstCell = foldName(cells[0] ?? '');
+    if (nameAliases.has(firstCell) && i > 1) continue;
+
     const profissional = (cells[nameIdx] ?? '').trim();
     if (!profissional) continue;
-    const rawVal = String(cells[valueIdx] ?? '')
-      .replace(/R\$\s*/i, '')
-      .trim();
-    let valorRaw = rawVal;
-    if (rawVal.includes(',') && rawVal.includes('.')) {
-      // 1.200,50 → 1200.50
-      valorRaw = rawVal.replace(/\./g, '').replace(',', '.');
-    } else if (rawVal.includes(',')) {
-      valorRaw = rawVal.replace(',', '.');
+    const valor = parseMoneyCell(cells[valueIdx] ?? '');
+    if (valor == null) {
+      // Linha Loja vazia ainda não preenchida — ignora
+      if (isStoreSpreadsheetRow(profissional)) continue;
+      return { ok: false, error: `Valor inválido na linha ${i + 1} (${profissional}).` };
     }
-    valorRaw = valorRaw.replace(/[^\d.-]/g, '');
-    const valor = Number(valorRaw);
-    if (!Number.isFinite(valor) || valor < 0) {
-      return { ok: false, error: `Valor inválido na linha ${i + 1}.` };
-    }
-    rows.push({ profissional, valor });
+    byName.set(foldName(profissional), { profissional, valor });
   }
 
+  const rows = [...byName.values()];
   if (!rows.length) {
-    return { ok: false, error: 'Nenhuma linha válida encontrada no CSV.' };
+    return { ok: false, error: 'Nenhuma linha válida encontrada na planilha.' };
   }
   return { ok: true, rows };
 }
 
 export function earningsTemplateCsv(): string {
   return (
-    '# Abra no Excel. Preencha o que rolou no salão e envie de volta no Analytics.\n' +
-    '# Use a linha Loja para o caixa da loja. As outras linhas são os profissionais.\n' +
-    'profissional,valor\n' +
+    '# Use Baixar planilha no Analytics (mesmo layout do relatório).\n' +
+    'profissional,ganho_final_brl\n' +
     'Loja,5000.00\n' +
     'João Silva,1200.00\n'
   );

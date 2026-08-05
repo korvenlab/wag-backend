@@ -26,7 +26,7 @@ import {
 import { pushAdminEvent } from './adminEvents';
 import { profileHasWagooAccess } from '../lib/profileAccess';
 import { profileSubscriptionTier } from '../lib/profileMultiBarber';
-import { tierSupportsAi } from '../lib/wagooSubscription';
+import { tierSupportsAi, tierSupportsClub } from '../lib/wagooSubscription';
 import { listActiveBarbeirosForUser, resolveBarberFromSelection } from '../lib/barbeiros';
 import {
   bundleLooksComplete,
@@ -1346,10 +1346,16 @@ export async function startWhatsApp(email: string, res: Response | null) {
             {
                 const clientName = msg.pushName || "Cliente WhatsApp";
                 const clientPhone = remoteJid.split('@')[0].replace(/\D/g, '');
-                const clubMember = await findActiveClubMemberByPhone(
-                  String(p.id),
-                  clientPhone,
+                const clubEnabled = tierSupportsClub(
+                  profileSubscriptionTier({
+                    subscription_tier: p.subscription_tier,
+                    has_paid: p.has_paid,
+                    multi_barber_plan: p.multi_barber_plan as boolean | null | undefined,
+                  }),
                 );
+                const clubMember = clubEnabled
+                  ? await findActiveClubMemberByPhone(String(p.id), clientPhone)
+                  : null;
                 const chargeDeposit = requiresDeposit && matchedSvc && !clubMember;
 
                 if (chargeDeposit && matchedSvc) {

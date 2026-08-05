@@ -5,7 +5,7 @@ import { profileHasWagooAccess } from '../lib/profileAccess';
 import { profileSubscriptionTier } from '../lib/profileMultiBarber';
 import { listAllBarbeirosForUser } from '../lib/barbeiros';
 import { syncCalendarShareSlug } from '../lib/storeSlug';
-import { tierSupportsCsvExport } from '../lib/wagooSubscription';
+import { tierSupportsAnalytics } from '../lib/wagooSubscription';
 import {
   eventsToCsvWithCommission,
   type PaidAppointmentForExport,
@@ -192,7 +192,7 @@ router.get('/events/export', async (req: Request, res: Response) => {
       has_paid: row.has_paid,
       multi_barber_plan: row.multi_barber_plan as boolean | null | undefined,
     });
-    if (!tierSupportsCsvExport(tier)) {
+    if (!tierSupportsAnalytics(tier)) {
       return res.status(403).json({
         error: 'Exportação CSV está disponível nos planos Pro e Pro+.',
       });

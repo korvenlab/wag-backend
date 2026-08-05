@@ -5,7 +5,10 @@ import timezone from 'dayjs/plugin/timezone';
 import { supabase } from '../lib/supabase';
 import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 import { profileSubscriptionTier } from '../lib/profileMultiBarber';
-import { tierSupportsPublicBooking } from '../lib/wagooSubscription';
+import {
+  tierSupportsClub,
+  tierSupportsPublicBooking,
+} from '../lib/wagooSubscription';
 import { dayWindowsFromWorkingHours, BR_TZ } from '../lib/dateTimeBR';
 import { slugifyStoreName } from '../lib/storeSlug';
 import {
@@ -196,7 +199,7 @@ async function loadPublishedSite(slug: string) {
   const { data, error } = await supabase
     .from('profiles')
     .select(
-      'id, store_name, booking_slug, booking_logo_url, booking_cover_url, booking_tagline, booking_phone, booking_address, booking_published, working_hours, subscription_tier, stripe_connect_account_id, stripe_connect_charges_enabled, booking_deposit_enabled, booking_deposit_percent, booking_advance_pay_enabled',
+      'id, store_name, booking_slug, booking_logo_url, booking_cover_url, booking_tagline, booking_phone, booking_address, booking_published, working_hours, subscription_tier, multi_barber_plan, has_paid, stripe_connect_account_id, stripe_connect_charges_enabled, booking_deposit_enabled, booking_deposit_percent, booking_advance_pay_enabled',
     )
     .eq('booking_slug', slug)
     .maybeSingle();
@@ -782,9 +785,10 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
     working_hours: site.working_hours ?? null,
     services: services ?? [],
     providers: providers ?? [],
-    club_portal_url: site.booking_slug
-      ? `${frontendBase()}/a/${site.booking_slug}/cliente`
-      : null,
+    club_portal_url:
+      tierSupportsClub(profileSubscriptionTier(site)) && site.booking_slug
+        ? `${frontendBase()}/a/${site.booking_slug}/cliente`
+        : null,
     deposit: {
       required: depositRequired,
       /** Sinal desligado + dono liberou pagamento adiantado opcional. */
@@ -810,9 +814,22 @@ router.get('/public/:slug/club-status', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Informe o telefone com DDD.' });
   }
 
-  const clubPortal = site.booking_slug
-    ? `${frontendBase()}/a/${site.booking_slug}/cliente`
-    : null;
+  const clubEnabled = tierSupportsClub(profileSubscriptionTier(site));
+  const clubPortal =
+    clubEnabled && site.booking_slug
+      ? `${frontendBase()}/a/${site.booking_slug}/cliente`
+      : null;
+
+  if (!clubEnabled) {
+    return res.json({
+      is_club_member: false,
+      member: null,
+      skips_deposit: false,
+      needs_otp: false,
+      club_portal_url: null,
+      club_unavailable: true,
+    });
+  }
 
   const token = extractClubToken({
     headers: req.headers as Record<string, unknown>,
@@ -1157,19 +1174,23 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
   }
 
   const totalRounded = Math.round(totalPrice * 100) / 100;
+  const clubEnabled = tierSupportsClub(profileSubscriptionTier(site));
   const clubToken = extractClubToken({
     headers: req.headers as Record<string, unknown>,
     body: req.body as Record<string, unknown>,
   });
-  const clubPhoneVerified = await validateClubAccessSession({
-    profileId: String(site.id),
-    phone: clientPhone,
-    token: clubToken,
-    purposes: ['club_benefit', 'member_access', 'subscribe'],
-  });
-  const clubMember = clubPhoneVerified
-    ? await findActiveClubMemberByPhone(String(site.id), clientPhone)
-    : null;
+  const clubPhoneVerified =
+    clubEnabled &&
+    (await validateClubAccessSession({
+      profileId: String(site.id),
+      phone: clientPhone,
+      token: clubToken,
+      purposes: ['club_benefit', 'member_access', 'subscribe'],
+    }));
+  const clubMember =
+    clubEnabled && clubPhoneVerified
+      ? await findActiveClubMemberByPhone(String(site.id), clientPhone)
+      : null;
   const depositMandatory = siteRequiresDeposit(site) && !clubMember;
   const payInAdvance = Boolean(
     req.body?.pay_in_advance === true ||

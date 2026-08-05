@@ -3,7 +3,10 @@ import { supabase } from '../lib/supabase';
 import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 import { profileHasWagooAccess } from '../lib/profileAccess';
 import { profileSubscriptionTier } from '../lib/profileMultiBarber';
-import { tierSupportsPublicBooking } from '../lib/wagooSubscription';
+import {
+  tierSupportsClub,
+  tierSupportsPublicBooking,
+} from '../lib/wagooSubscription';
 import {
   clubClientPortalUrl,
   createClubCheckoutSession,
@@ -107,6 +110,15 @@ async function requireOwner(req: Request) {
     return { ok: false as const, status: 403, error: 'Assinatura activa necessária.' };
   }
 
+  const tier = profileSubscriptionTier(profile);
+  if (!tierSupportsClub(tier)) {
+    return {
+      ok: false as const,
+      status: 403,
+      error: 'Assinatura Wagoo necessária para usar o Clube.',
+    };
+  }
+
   return { ok: true as const, userId: auth.user.id, profile };
 }
 
@@ -120,7 +132,10 @@ async function loadPublishedSiteBySlug(slug: string) {
     .maybeSingle();
 
   if (!data || !data.booking_published) return null;
-  if (!tierSupportsPublicBooking(profileSubscriptionTier(data))) return null;
+  const tier = profileSubscriptionTier(data);
+  if (!tierSupportsPublicBooking(tier)) return null;
+  // Portal do clube: qualquer plano pago com Agenda Web publicada.
+  if (!tierSupportsClub(tier)) return null;
   return data;
 }
 

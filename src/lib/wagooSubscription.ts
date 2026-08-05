@@ -106,9 +106,27 @@ export function tierSupportsReminders(tier: WagooSubscriptionTier | null): boole
   return tier === 'agenda_web' || tier === 'pro' || tier === 'pro_plus';
 }
 
-/** Export CSV de agendamentos (analytics) — só Pro e Pro+. */
-export function tierSupportsCsvExport(tier: WagooSubscriptionTier | null): boolean {
+/**
+ * Analytics completo (caixa da loja, ganhos por profissional, planilha, lançamento rápido).
+ * Só Pro e Pro+.
+ */
+export function tierSupportsAnalytics(tier: WagooSubscriptionTier | null): boolean {
   return tier === 'pro' || tier === 'pro_plus';
+}
+
+/** Export CSV / planilha — alias de Analytics (Pro e Pro+). */
+export function tierSupportsCsvExport(tier: WagooSubscriptionTier | null): boolean {
+  return tierSupportsAnalytics(tier);
+}
+
+/** Clube de assinatura mensal — incluso em todos os planos pagos. */
+export function tierSupportsClub(tier: WagooSubscriptionTier | null): boolean {
+  return (
+    tier === 'agenda_web' ||
+    tier === 'basic' ||
+    tier === 'pro' ||
+    tier === 'pro_plus'
+  );
 }
 
 /** Site público de agendamento — Agenda Web standalone OU planos com IA (Basic/Pro/Pro+). */

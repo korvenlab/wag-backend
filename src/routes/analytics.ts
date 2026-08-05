@@ -4,7 +4,7 @@ import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 import { profileHasWagooAccess } from '../lib/profileAccess';
 import { profileSubscriptionTier } from '../lib/profileMultiBarber';
 import { listAllBarbeirosForUser } from '../lib/barbeiros';
-import { tierSupportsCsvExport } from '../lib/wagooSubscription';
+import { tierSupportsAnalytics } from '../lib/wagooSubscription';
 import { listCalendarEvents } from '../services/calendar';
 import {
   ANALYTICS_EXPORT_COLUMNS,
@@ -66,11 +66,11 @@ async function requireAnalyticsAccess(req: Request): Promise<AuthOk | AuthFail> 
     has_paid: row.has_paid,
     multi_barber_plan: row.multi_barber_plan as boolean | null | undefined,
   });
-  if (!tierSupportsCsvExport(tier)) {
+  if (!tierSupportsAnalytics(tier)) {
     return {
       ok: false,
       status: 403,
-      error: 'Analytics avançado está disponível nos planos Pro e Pro+.',
+      error: 'Analytics completo está disponível nos planos Pro e Pro+.',
     };
   }
 
