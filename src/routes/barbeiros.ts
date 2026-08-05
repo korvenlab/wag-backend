@@ -2,16 +2,50 @@ import express, { Request, Response } from 'express';
 import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 import { supabase } from '../lib/supabase';
 import { profileSubscriptionTier } from '../lib/profileMultiBarber';
-import { countBarbeirosForUser, listAllBarbeirosForUser } from '../lib/barbeiros';
+import { listAllBarbeirosForUser } from '../lib/barbeiros';
 import {
   canManageTeam,
   getMaxBarbeirosSlots,
   WAGOO_PLANS,
 } from '../lib/wagooSubscription';
+import {
+  buildPublicBarberCommission,
+  currentYearMonthBR,
+  generateCommissionShareToken,
+  monthRangeIsoBR,
+} from '../lib/barberCommissionShare';
+import type { ManualEarningsEntry } from '../lib/csvCommissionExport';
+import { loadPaidAppointmentsForExport } from './analytics';
+import { frontendBaseUrl } from '../lib/stripeClient';
 
 const router = express.Router();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+async function loadManualEntriesForMonth(
+  profileId: string,
+  year: number,
+  month: number,
+): Promise<ManualEarningsEntry[]> {
+  const { data, error } = await supabase
+    .from('barber_earnings_entries')
+    .select('barber_name, amount_brl, period_year, period_month')
+    .eq('profile_id', profileId)
+    .eq('period_year', year)
+    .eq('period_month', month);
+
+  if (error) {
+    console.error('[barbeiros] commission share entries:', error.message);
+    return [];
+  }
+
+  return (data ?? []).map((r) => ({
+    barber_name: String(r.barber_name),
+    amount_brl: Number(r.amount_brl) || 0,
+    period_year: Number(r.period_year),
+    period_month: Number(r.period_month),
+  }));
+}
 
 async function requireAuth(req: Request) {
   return getUserFromBearerHeader(supabase, req.headers.authorization);
@@ -124,7 +158,9 @@ router.post('/', async (req: Request, res: Response) => {
       ativo: true,
       commission_percent,
     })
-    .select('id, user_id, nome, google_calendar_email, ativo, commission_percent, created_at')
+    .select(
+      'id, user_id, nome, google_calendar_email, ativo, commission_percent, commission_share_token, created_at',
+    )
     .single();
 
   if (error) {
@@ -132,6 +168,151 @@ router.post('/', async (req: Request, res: Response) => {
   }
 
   res.status(201).json(data);
+});
+
+/** Gera ou renova o link privado de comissão do profissional. */
+router.post('/:id/commission-share', async (req: Request, res: Response) => {
+  const auth = await requireAuth(req);
+  if (!auth.ok) {
+    return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
+  }
+
+  const ctx = await loadTeamContext(auth.user.id);
+  if (!ctx.can_manage_team) {
+    return res.status(403).json({
+      error: 'upgrade_required',
+      message: 'Gerenciar equipe está disponível nos planos Pro e Pro+.',
+    });
+  }
+
+  const id = String(req.params.id);
+  const rotate = Boolean(req.body?.rotate ?? req.query?.rotate);
+
+  const { data: existing } = await supabase
+    .from('barbeiros')
+    .select('id, commission_share_token')
+    .eq('id', id)
+    .eq('user_id', auth.user.id)
+    .maybeSingle();
+
+  if (!existing) {
+    return res.status(404).json({ error: 'Profissional não encontrado.' });
+  }
+
+  const current = existing.commission_share_token
+    ? String(existing.commission_share_token)
+    : null;
+  const token =
+    !rotate && current ? current : generateCommissionShareToken();
+
+  if (token !== current) {
+    const { error } = await supabase
+      .from('barbeiros')
+      .update({ commission_share_token: token })
+      .eq('id', id)
+      .eq('user_id', auth.user.id);
+    if (error) return res.status(500).json({ error: error.message });
+  }
+
+  const base = frontendBaseUrl() || '';
+  const path = `/comissao/${token}`;
+  res.json({
+    commission_share_token: token,
+    share_path: path,
+    share_url: base ? `${base}${path}` : path,
+  });
+});
+
+/** Revoga o link privado (invalida o token atual). */
+router.delete('/:id/commission-share', async (req: Request, res: Response) => {
+  const auth = await requireAuth(req);
+  if (!auth.ok) {
+    return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
+  }
+
+  const ctx = await loadTeamContext(auth.user.id);
+  if (!ctx.can_manage_team) {
+    return res.status(403).json({
+      error: 'upgrade_required',
+      message: 'Gerenciar equipe está disponível nos planos Pro e Pro+.',
+    });
+  }
+
+  const id = String(req.params.id);
+  const { data, error } = await supabase
+    .from('barbeiros')
+    .update({ commission_share_token: null })
+    .eq('id', id)
+    .eq('user_id', auth.user.id)
+    .select('id')
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: 'Profissional não encontrado.' });
+
+  res.json({ ok: true });
+});
+
+/**
+ * Página pública do profissional: só os ganhos dele no mês.
+ * Sem autenticação — o token é o segredo.
+ */
+router.get('/public/commission/:token', async (req: Request, res: Response) => {
+  const token = String(req.params.token || '').trim();
+  if (!token || token.length < 16) {
+    return res.status(404).json({ error: 'Link inválido ou expirado.' });
+  }
+
+  const { data: barbeiro, error } = await supabase
+    .from('barbeiros')
+    .select(
+      'id, user_id, nome, google_calendar_email, ativo, commission_percent, commission_share_token, created_at',
+    )
+    .eq('commission_share_token', token)
+    .maybeSingle();
+
+  if (error) return res.status(500).json({ error: error.message });
+  if (!barbeiro) {
+    return res.status(404).json({ error: 'Link inválido ou expirado.' });
+  }
+
+  const now = currentYearMonthBR();
+  let year = Number(req.query.year);
+  let month = Number(req.query.month);
+  if (!Number.isFinite(year) || year < 2000 || year > 2100) year = now.year;
+  if (!Number.isFinite(month) || month < 1 || month > 12) month = now.month;
+
+  const { from, to } = monthRangeIsoBR(year, month);
+  const ownerId = String(barbeiro.user_id);
+
+  const [team, paidAppointments, manualEntries, profile] = await Promise.all([
+    listAllBarbeirosForUser(ownerId),
+    loadPaidAppointmentsForExport(ownerId, from, to),
+    loadManualEntriesForMonth(ownerId, year, month),
+    supabase
+      .from('profiles')
+      .select('store_name')
+      .eq('id', ownerId)
+      .maybeSingle()
+      .then((r) => r.data),
+  ]);
+
+  const row = team.find((b) => b.id === String(barbeiro.id));
+  if (!row) {
+    return res.status(404).json({ error: 'Link inválido ou expirado.' });
+  }
+
+  const payload = buildPublicBarberCommission({
+    barbeiro: row,
+    storeName: profile?.store_name ? String(profile.store_name) : null,
+    year,
+    month,
+    paidAppointments,
+    manualEntries,
+    teamBarbeiros: team,
+  });
+
+  res.json(payload);
 });
 
 router.patch('/:id', async (req: Request, res: Response) => {
@@ -184,7 +365,9 @@ router.patch('/:id', async (req: Request, res: Response) => {
     .update(patch)
     .eq('id', id)
     .eq('user_id', auth.user.id)
-    .select('id, user_id, nome, google_calendar_email, ativo, commission_percent, created_at')
+    .select(
+      'id, user_id, nome, google_calendar_email, ativo, commission_percent, commission_share_token, created_at',
+    )
     .maybeSingle();
 
   if (error) return res.status(500).json({ error: error.message });

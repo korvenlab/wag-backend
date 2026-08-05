@@ -122,6 +122,177 @@ router.get('/status', async (req: Request, res: Response) => {
   });
 });
 
+/** Saldo da conta Connect do salão (disponível + pendente). */
+router.get('/balance', async (req: Request, res: Response) => {
+  const auth = await requireUser(req);
+  if (!auth.ok) {
+    return res.status(401).json({
+      error:
+        auth.reason === 'missing_token'
+          ? 'Faça login e envie Authorization: Bearer.'
+          : 'Sessão inválida.',
+    });
+  }
+
+  const profile = await loadConnectProfile(auth.user.id);
+  if (!profile?.stripe_connect_account_id) {
+    return res.status(400).json({
+      error: 'Conecte a conta de recebimentos antes de ver o saldo.',
+    });
+  }
+
+  try {
+    const balance = await stripe.balance.retrieve({
+      stripeAccount: profile.stripe_connect_account_id,
+    });
+
+    const sumBrl = (
+      rows: Array<{ amount: number; currency: string }>,
+    ): number =>
+      rows
+        .filter((r) => String(r.currency).toLowerCase() === 'brl')
+        .reduce((acc, r) => acc + Number(r.amount || 0), 0) / 100;
+
+    const available_brl = sumBrl(balance.available || []);
+    const pending_brl = sumBrl(balance.pending || []);
+
+    res.json({
+      currency: 'brl',
+      available_brl,
+      pending_brl,
+      total_brl: Math.round((available_brl + pending_brl) * 100) / 100,
+      payouts_enabled: Boolean(profile.stripe_connect_payouts_enabled),
+      charges_enabled: Boolean(profile.stripe_connect_charges_enabled),
+    });
+  } catch (error: unknown) {
+    log.error('CONNECT', 'balance falhou', error, {
+      accountId: profile.stripe_connect_account_id,
+    });
+    res.status(500).json({
+      error: 'Não foi possível consultar o saldo agora. Tente de novo em instantes.',
+    });
+  }
+});
+
+/**
+ * Transfere o saldo disponível da conta Connect para a conta bancária cadastrada.
+ * Não abre o painel Stripe — o saque fica no Wagoo.
+ */
+router.post('/payout', express.json(), async (req: Request, res: Response) => {
+  const auth = await requireUser(req);
+  if (!auth.ok) {
+    return res.status(401).json({ error: 'Faça login.' });
+  }
+
+  let profile = await loadConnectProfile(auth.user.id);
+  if (!profile?.stripe_connect_account_id) {
+    return res.status(400).json({
+      error:
+        'Primeiro cadastre sua conta de recebimentos. Sem esse cadastro não dá para ver saldo nem transferir.',
+    });
+  }
+
+  const synced = await syncConnectAccountToProfile(
+    auth.user.id,
+    profile.stripe_connect_account_id,
+  );
+  if (synced) profile = synced;
+
+  if (!profile.stripe_connect_payouts_enabled) {
+    return res.status(400).json({
+      error:
+        'Termine o cadastro (documentos e conta bancária) para liberar transferências para o banco.',
+    });
+  }
+
+  try {
+    const balance = await stripe.balance.retrieve({
+      stripeAccount: profile.stripe_connect_account_id,
+    });
+    const availableCents = (balance.available || [])
+      .filter((r) => String(r.currency).toLowerCase() === 'brl')
+      .reduce((acc, r) => acc + Number(r.amount || 0), 0);
+
+    const requestedRaw = req.body?.amount_brl ?? req.body?.amountBrl;
+    let amountCents = availableCents;
+    if (requestedRaw !== undefined && requestedRaw !== null && requestedRaw !== '') {
+      const brl = Number(requestedRaw);
+      if (!Number.isFinite(brl) || brl <= 0) {
+        return res.status(400).json({ error: 'Informe um valor válido para transferir.' });
+      }
+      amountCents = Math.round(brl * 100);
+    }
+
+    if (amountCents < 100) {
+      return res.status(400).json({
+        error: 'Valor mínimo para transferir: R$ 1,00. Aguarde ter saldo disponível.',
+      });
+    }
+    if (amountCents > availableCents) {
+      return res.status(400).json({
+        error: 'O valor pedido é maior que o saldo disponível.',
+        available_brl: availableCents / 100,
+      });
+    }
+
+    const payout = await stripe.payouts.create(
+      {
+        amount: amountCents,
+        currency: 'brl',
+        metadata: {
+          platform: 'wagoo',
+          supabase_user_id: auth.user.id,
+        },
+      },
+      { stripeAccount: profile.stripe_connect_account_id },
+    );
+
+    const remaining = await stripe.balance.retrieve({
+      stripeAccount: profile.stripe_connect_account_id,
+    });
+    const sumBrl = (rows: Array<{ amount: number; currency: string }>) =>
+      rows
+        .filter((r) => String(r.currency).toLowerCase() === 'brl')
+        .reduce((acc, r) => acc + Number(r.amount || 0), 0) / 100;
+
+    res.json({
+      ok: true,
+      payout_id: payout.id,
+      amount_brl: amountCents / 100,
+      status: payout.status,
+      arrival_date: payout.arrival_date
+        ? new Date(payout.arrival_date * 1000).toISOString()
+        : null,
+      balance: {
+        available_brl: sumBrl(remaining.available || []),
+        pending_brl: sumBrl(remaining.pending || []),
+        total_brl:
+          Math.round(
+            (sumBrl(remaining.available || []) + sumBrl(remaining.pending || [])) * 100,
+          ) / 100,
+        payouts_enabled: true,
+        charges_enabled: Boolean(profile.stripe_connect_charges_enabled),
+      },
+      message: 'Transferência solicitada. O valor vai para a conta bancária cadastrada.',
+    });
+  } catch (error: unknown) {
+    log.error('CONNECT', 'payout falhou', error, {
+      accountId: profile.stripe_connect_account_id,
+    });
+    const stripeMsg =
+      error && typeof error === 'object' && 'message' in error
+        ? String((error as { message?: string }).message || '')
+        : '';
+    const friendly =
+      /external.?account|bank.?account|debit.?card/i.test(stripeMsg)
+        ? 'Cadastre uma conta bancária no fluxo de recebimentos antes de transferir.'
+        : /insufficient/i.test(stripeMsg)
+          ? 'Saldo disponível insuficiente para essa transferência.'
+          : 'Não foi possível transferir agora. Confira se o cadastro está completo e tente de novo.';
+    res.status(500).json({ error: friendly });
+  }
+});
+
 /**
  * Cria (se preciso) conta Express BR + Account Link de onboarding hospedado pela Stripe.
  * @see https://docs.stripe.com/connect/express-accounts
