@@ -200,10 +200,6 @@ export async function notifyWebBookingCreated(input: {
           phone,
         });
       }
-    } else {
-      log.info(TAG, 'confirmação Agenda Web pulada — WA offline', {
-        email: profile.email,
-      });
     }
   }
 
@@ -389,7 +385,6 @@ async function processDueReminders(): Promise<void> {
 
     const sock = sessions[profile.email as string];
     if (!sock?.user) {
-      log.info(TAG, 'WA offline — deixa para o próximo tick', { email: profile.email });
       continue;
     }
 

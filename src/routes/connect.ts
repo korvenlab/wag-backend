@@ -135,15 +135,16 @@ router.get('/balance', async (req: Request, res: Response) => {
   }
 
   const profile = await loadConnectProfile(auth.user.id);
-  if (!profile?.stripe_connect_account_id) {
+  const accountId = profile?.stripe_connect_account_id ?? null;
+  if (!accountId) {
     return res.status(400).json({
       error: 'Conecte a conta de recebimentos antes de ver o saldo.',
     });
   }
 
   try {
-    const balance = await stripe.balance.retrieve({
-      stripeAccount: profile.stripe_connect_account_id,
+    const balance = await stripe.balance.retrieve(undefined, {
+      stripeAccount: accountId,
     });
 
     const sumBrl = (
@@ -161,12 +162,12 @@ router.get('/balance', async (req: Request, res: Response) => {
       available_brl,
       pending_brl,
       total_brl: Math.round((available_brl + pending_brl) * 100) / 100,
-      payouts_enabled: Boolean(profile.stripe_connect_payouts_enabled),
-      charges_enabled: Boolean(profile.stripe_connect_charges_enabled),
+      payouts_enabled: Boolean(profile?.stripe_connect_payouts_enabled),
+      charges_enabled: Boolean(profile?.stripe_connect_charges_enabled),
     });
   } catch (error: unknown) {
     log.error('CONNECT', 'balance falhou', error, {
-      accountId: profile.stripe_connect_account_id,
+      accountId,
     });
     res.status(500).json({
       error: 'Não foi possível consultar o saldo agora. Tente de novo em instantes.',
@@ -185,20 +186,18 @@ router.post('/payout', express.json(), async (req: Request, res: Response) => {
   }
 
   let profile = await loadConnectProfile(auth.user.id);
-  if (!profile?.stripe_connect_account_id) {
+  const accountId = profile?.stripe_connect_account_id ?? null;
+  if (!accountId) {
     return res.status(400).json({
       error:
         'Primeiro cadastre sua conta de recebimentos. Sem esse cadastro não dá para ver saldo nem transferir.',
     });
   }
 
-  const synced = await syncConnectAccountToProfile(
-    auth.user.id,
-    profile.stripe_connect_account_id,
-  );
+  const synced = await syncConnectAccountToProfile(auth.user.id, accountId);
   if (synced) profile = synced;
 
-  if (!profile.stripe_connect_payouts_enabled) {
+  if (!profile?.stripe_connect_payouts_enabled) {
     return res.status(400).json({
       error:
         'Termine o cadastro (documentos e conta bancária) para liberar transferências para o banco.',
@@ -206,8 +205,8 @@ router.post('/payout', express.json(), async (req: Request, res: Response) => {
   }
 
   try {
-    const balance = await stripe.balance.retrieve({
-      stripeAccount: profile.stripe_connect_account_id,
+    const balance = await stripe.balance.retrieve(undefined, {
+      stripeAccount: accountId,
     });
     const availableCents = (balance.available || [])
       .filter((r) => String(r.currency).toLowerCase() === 'brl')
@@ -244,11 +243,11 @@ router.post('/payout', express.json(), async (req: Request, res: Response) => {
           supabase_user_id: auth.user.id,
         },
       },
-      { stripeAccount: profile.stripe_connect_account_id },
+      { stripeAccount: accountId },
     );
 
-    const remaining = await stripe.balance.retrieve({
-      stripeAccount: profile.stripe_connect_account_id,
+    const remaining = await stripe.balance.retrieve(undefined, {
+      stripeAccount: accountId,
     });
     const sumBrl = (rows: Array<{ amount: number; currency: string }>) =>
       rows
