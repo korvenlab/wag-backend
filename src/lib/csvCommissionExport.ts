@@ -205,6 +205,9 @@ export function buildBarberPeriodTotals(opts: {
       barbeiros.find((b) => foldName(b.nome) === key)?.nome ||
       key;
 
+    // Linha Loja/Caixa da planilha não é profissional
+    if (isStoreSpreadsheetRow(displayName)) continue;
+
     const autoCommission = auto?.auto ?? 0;
     const manualAmount = manual ? manual.amount : null;
     let source: BarberPeriodTotal['source'] = 'none';
@@ -720,6 +723,8 @@ export function parseEarningsUploadCsv(
 
 export function earningsTemplateCsv(): string {
   return (
+    '# Abra no Excel. Preencha o que rolou no salão e envie de volta no Analytics.\n' +
+    '# Use a linha Loja para o caixa da loja. As outras linhas são os profissionais.\n' +
     'profissional,valor\n' +
     'Loja,5000.00\n' +
     'João Silva,1200.00\n'

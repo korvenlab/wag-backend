@@ -300,13 +300,28 @@ async function buildAnalyticsSummaryPayload(
     barbers = applyUploadToBarbers(barbers, uploadedRows);
   }
 
+  // Caixa da planilha: upload ao vivo, ou linha Loja/Caixa já salva no banco
+  const persistedSheetRows = manualEntries.map((e) => ({
+    profissional: e.barber_name,
+    valor: e.amount_brl,
+  }));
+  const hasPersistedStoreRow = persistedSheetRows.some((r) =>
+    isStoreSpreadsheetRow(r.profissional),
+  );
+  const storeSheetRows =
+    uploadedRows && uploadedRows.length > 0
+      ? uploadedRows
+      : hasPersistedStoreRow
+        ? persistedSheetRows
+        : undefined;
+
   const store = buildStoreInvoicingSummary({
     barbeirosCount: barbeiros.length,
     paidAppointments,
     barbers,
     clubRevenueBrl: club.revenueBrl,
     clubPaymentsCount: club.count,
-    uploadedRows,
+    uploadedRows: storeSheetRows,
   });
 
   return {
@@ -536,9 +551,153 @@ router.get('/export/template', async (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader(
     'Content-Disposition',
-    'attachment; filename="wagoo-ganhos-template.csv"',
+    'attachment; filename="wagoo-planilha-salão.csv"',
   );
   res.send(`\uFEFF${earningsTemplateCsv()}`);
+});
+
+/**
+ * Recebe a planilha preenchida (CSV/Excel) e grava no banco:
+ * profissionais → ganhos manuais do mês; Loja/Caixa → caixa da loja.
+ */
+router.post('/earnings-upload', express.json({ limit: '2mb' }), async (req: Request, res: Response) => {
+  const gate = await requireAnalyticsAccess(req);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+  const csvText = String(req.body?.csv ?? '');
+  const year = Number(req.body?.period_year ?? req.body?.year);
+  const month = Number(req.body?.period_month ?? req.body?.month);
+  const from = String(req.body?.from ?? '').trim();
+
+  let periodYear = year;
+  let periodMonth = month;
+  if (!Number.isFinite(periodYear) || !Number.isFinite(periodMonth)) {
+    if (from) {
+      const d = new Date(from);
+      periodYear = d.getFullYear();
+      periodMonth = d.getMonth() + 1;
+    }
+  }
+
+  if (!Number.isFinite(periodYear) || periodYear < 2020 || periodYear > 2100) {
+    return res.status(400).json({ error: 'Informe o mês/ano do lançamento.' });
+  }
+  if (!Number.isFinite(periodMonth) || periodMonth < 1 || periodMonth > 12) {
+    return res.status(400).json({ error: 'Mês inválido.' });
+  }
+
+  const parsed = parseEarningsUploadCsv(csvText);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+
+  const barbeiros = await listAllBarbeirosForUser(gate.userId);
+  const note = 'planilha';
+
+  const { data: existingRows } = await supabase
+    .from('barber_earnings_entries')
+    .select('id, barber_name')
+    .eq('profile_id', gate.userId)
+    .eq('period_year', periodYear)
+    .eq('period_month', periodMonth);
+
+  const existingByName = new Map(
+    (existingRows ?? []).map((r) => [foldName(String(r.barber_name)), r.id as string]),
+  );
+
+  let saved = 0;
+  let storeSaved = false;
+  const savedNames: string[] = [];
+
+  for (const row of parsed.rows) {
+    const barberName = row.profissional.trim();
+    if (!barberName) continue;
+    const amountRounded = Math.round((Number(row.valor) || 0) * 100) / 100;
+    const isStore = isStoreSpreadsheetRow(barberName);
+    const teamMatch = !isStore
+      ? barbeiros.find((b) => foldName(b.nome) === foldName(barberName))
+      : null;
+    const key = foldName(barberName);
+    const existingId = existingByName.get(key);
+
+    if (existingId) {
+      const { error } = await supabase
+        .from('barber_earnings_entries')
+        .update({
+          amount_brl: amountRounded,
+          note,
+          barbeiro_id: teamMatch?.id ?? null,
+          barber_name: isStore ? barberName : teamMatch?.nome || barberName,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', existingId)
+        .eq('profile_id', gate.userId);
+      if (error) return res.status(500).json({ error: error.message });
+    } else {
+      const { data, error } = await supabase
+        .from('barber_earnings_entries')
+        .insert({
+          profile_id: gate.userId,
+          barbeiro_id: teamMatch?.id ?? null,
+          barber_name: isStore ? barberName : teamMatch?.nome || barberName,
+          period_year: periodYear,
+          period_month: periodMonth,
+          amount_brl: amountRounded,
+          note,
+        })
+        .select('id')
+        .single();
+      if (error) return res.status(500).json({ error: error.message });
+      if (data?.id) existingByName.set(key, String(data.id));
+    }
+
+    saved += 1;
+    savedNames.push(barberName);
+    if (isStore) storeSaved = true;
+  }
+
+  res.json({
+    ok: true,
+    saved,
+    store_saved: storeSaved,
+    period_year: periodYear,
+    period_month: periodMonth,
+    names: savedNames,
+  });
+});
+
+/**
+ * Remove a linha de caixa da planilha (Loja/Caixa) do mês — volta ao caixa Stripe.
+ */
+router.delete('/earnings-store-override', async (req: Request, res: Response) => {
+  const gate = await requireAnalyticsAccess(req);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+  const year = Number(req.query.year);
+  const month = Number(req.query.month);
+  if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) {
+    return res.status(400).json({ error: 'Informe year e month válidos.' });
+  }
+
+  const { data: rows } = await supabase
+    .from('barber_earnings_entries')
+    .select('id, barber_name')
+    .eq('profile_id', gate.userId)
+    .eq('period_year', year)
+    .eq('period_month', month);
+
+  const storeIds = (rows ?? [])
+    .filter((r) => isStoreSpreadsheetRow(String(r.barber_name)))
+    .map((r) => r.id);
+
+  if (storeIds.length) {
+    const { error } = await supabase
+      .from('barber_earnings_entries')
+      .delete()
+      .eq('profile_id', gate.userId)
+      .in('id', storeIds);
+    if (error) return res.status(500).json({ error: error.message });
+  }
+
+  res.json({ ok: true, deleted: storeIds.length });
 });
 
 async function buildExportCsv(opts: {
