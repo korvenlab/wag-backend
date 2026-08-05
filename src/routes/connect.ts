@@ -360,7 +360,8 @@ router.post('/onboard', express.json(), async (req: Request, res: Response) => {
   }
 });
 
-/** Login Link → Express Dashboard (saldo, saques, disputas, dados). */
+/** Login Link → Express Dashboard (saldo, saques, disputas, dados).
+ *  Se o onboarding não terminou, devolve o link de cadastro em vez de falhar. */
 router.post('/dashboard', express.json(), async (req: Request, res: Response) => {
   try {
     const auth = await requireUser(req);
@@ -369,16 +370,60 @@ router.post('/dashboard', express.json(), async (req: Request, res: Response) =>
     const profile = await loadConnectProfile(auth.user.id);
     if (!profile?.stripe_connect_account_id) {
       return res.status(400).json({
-        error: 'Conecte a Stripe primeiro (onboarding).',
+        error: 'Conecte a conta de recebimentos primeiro.',
       });
     }
 
-    const login = await stripe.accounts.createLoginLink(profile.stripe_connect_account_id);
-    res.json({ url: login.url });
+    const accountId = profile.stripe_connect_account_id;
+    const base = frontendBaseUrl();
+    if (!base) {
+      return res.status(500).json({ error: 'FRONTEND_URL não configurada.' });
+    }
+
+    const needsOnboarding = !profile.stripe_connect_details_submitted;
+
+    if (needsOnboarding) {
+      const accountLink = await stripe.accountLinks.create({
+        account: accountId,
+        refresh_url: `${base}/dashboard/agenda-web?connect=refresh`,
+        return_url: `${base}/dashboard/agenda-web?connect=return`,
+        type: 'account_onboarding',
+      });
+      return res.json({
+        url: accountLink.url,
+        onboarding: true,
+      });
+    }
+
+    try {
+      const login = await stripe.accounts.createLoginLink(accountId);
+      return res.json({ url: login.url, onboarding: false });
+    } catch (loginErr: unknown) {
+      const loginMsg = loginErr instanceof Error ? loginErr.message : String(loginErr);
+      // Conta criada mas onboarding incompleto no Stripe (flag local desatualizada)
+      if (/not completed onboarding/i.test(loginMsg)) {
+        const accountLink = await stripe.accountLinks.create({
+          account: accountId,
+          refresh_url: `${base}/dashboard/agenda-web?connect=refresh`,
+          return_url: `${base}/dashboard/agenda-web?connect=return`,
+          type: 'account_onboarding',
+        });
+        return res.json({
+          url: accountLink.url,
+          onboarding: true,
+        });
+      }
+      throw loginErr;
+    }
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     log.error('CONNECT', 'dashboard link falhou', error);
-    res.status(500).json({ error: message });
+    res.status(500).json({
+      error:
+        /not completed onboarding/i.test(message)
+          ? 'Termine o cadastro de recebimentos antes de abrir a conta bancária.'
+          : message,
+    });
   }
 });
 
