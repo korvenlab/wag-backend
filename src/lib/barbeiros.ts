@@ -6,13 +6,31 @@ export type BarbeiroRow = {
   nome: string;
   google_calendar_email: string;
   ativo: boolean;
+  /** Percentual de comissão sobre valor do serviço (0–100). */
+  commission_percent: number;
   created_at?: string;
 };
+
+const BARBEIRO_SELECT =
+  'id, user_id, nome, google_calendar_email, ativo, commission_percent, created_at';
+
+function normalizeBarbeiroRow(row: Record<string, unknown>): BarbeiroRow {
+  const pct = Number(row.commission_percent);
+  return {
+    id: String(row.id),
+    user_id: String(row.user_id),
+    nome: String(row.nome),
+    google_calendar_email: String(row.google_calendar_email),
+    ativo: Boolean(row.ativo),
+    commission_percent: Number.isFinite(pct) ? Math.min(100, Math.max(0, pct)) : 0,
+    created_at: row.created_at ? String(row.created_at) : undefined,
+  };
+}
 
 export async function listActiveBarbeirosForUser(userId: string): Promise<BarbeiroRow[]> {
   const { data, error } = await supabase
     .from('barbeiros')
-    .select('id, user_id, nome, google_calendar_email, ativo, created_at')
+    .select(BARBEIRO_SELECT)
     .eq('user_id', userId)
     .eq('ativo', true)
     .order('nome', { ascending: true });
@@ -21,13 +39,13 @@ export async function listActiveBarbeirosForUser(userId: string): Promise<Barbei
     console.error('[barbeiros] listActive:', error.message);
     return [];
   }
-  return (data ?? []) as BarbeiroRow[];
+  return (data ?? []).map((r) => normalizeBarbeiroRow(r as Record<string, unknown>));
 }
 
 export async function listAllBarbeirosForUser(userId: string): Promise<BarbeiroRow[]> {
   const { data, error } = await supabase
     .from('barbeiros')
-    .select('id, user_id, nome, google_calendar_email, ativo, created_at')
+    .select(BARBEIRO_SELECT)
     .eq('user_id', userId)
     .order('created_at', { ascending: true });
 
@@ -35,7 +53,7 @@ export async function listAllBarbeirosForUser(userId: string): Promise<BarbeiroR
     console.error('[barbeiros] listAll:', error.message);
     return [];
   }
-  return (data ?? []) as BarbeiroRow[];
+  return (data ?? []).map((r) => normalizeBarbeiroRow(r as Record<string, unknown>));
 }
 
 export async function countBarbeirosForUser(userId: string): Promise<number> {

@@ -98,6 +98,15 @@ router.post('/', async (req: Request, res: Response) => {
   const google_calendar_email = String(req.body?.google_calendar_email ?? '')
     .trim()
     .toLowerCase();
+  const commissionRaw = req.body?.commission_percent ?? req.body?.commissionPercent;
+  let commission_percent = 0;
+  if (commissionRaw !== undefined && commissionRaw !== null && commissionRaw !== '') {
+    const pct = Number(commissionRaw);
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
+      return res.status(400).json({ error: 'Comissão deve ser um percentual entre 0 e 100.' });
+    }
+    commission_percent = Math.round(pct * 100) / 100;
+  }
 
   if (!nome) {
     return res.status(400).json({ error: 'Informe o nome do barbeiro.' });
@@ -113,8 +122,9 @@ router.post('/', async (req: Request, res: Response) => {
       nome,
       google_calendar_email,
       ativo: true,
+      commission_percent,
     })
-    .select('id, user_id, nome, google_calendar_email, ativo, created_at')
+    .select('id, user_id, nome, google_calendar_email, ativo, commission_percent, created_at')
     .single();
 
   if (error) {
@@ -157,6 +167,13 @@ router.patch('/:id', async (req: Request, res: Response) => {
   if (req.body?.ativo !== undefined) {
     patch.ativo = Boolean(req.body.ativo);
   }
+  if (req.body?.commission_percent !== undefined || req.body?.commissionPercent !== undefined) {
+    const pct = Number(req.body?.commission_percent ?? req.body?.commissionPercent);
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100) {
+      return res.status(400).json({ error: 'Comissão deve ser um percentual entre 0 e 100.' });
+    }
+    patch.commission_percent = Math.round(pct * 100) / 100;
+  }
 
   if (Object.keys(patch).length === 0) {
     return res.status(400).json({ error: 'Nenhum campo para atualizar.' });
@@ -167,7 +184,7 @@ router.patch('/:id', async (req: Request, res: Response) => {
     .update(patch)
     .eq('id', id)
     .eq('user_id', auth.user.id)
-    .select('id, user_id, nome, google_calendar_email, ativo, created_at')
+    .select('id, user_id, nome, google_calendar_email, ativo, commission_percent, created_at')
     .maybeSingle();
 
   if (error) return res.status(500).json({ error: error.message });

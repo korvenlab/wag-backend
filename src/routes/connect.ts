@@ -23,6 +23,7 @@ type ConnectProfile = {
   stripe_connect_details_submitted: boolean;
   booking_deposit_enabled: boolean;
   booking_deposit_percent: number;
+  booking_advance_pay_enabled: boolean;
   email?: string | null;
   store_name?: string | null;
 };
@@ -35,7 +36,7 @@ async function loadConnectProfile(userId: string): Promise<ConnectProfile | null
   const { data } = await supabase
     .from('profiles')
     .select(
-      'stripe_connect_account_id, stripe_connect_charges_enabled, stripe_connect_payouts_enabled, stripe_connect_details_submitted, booking_deposit_enabled, booking_deposit_percent, store_name',
+      'stripe_connect_account_id, stripe_connect_charges_enabled, stripe_connect_payouts_enabled, stripe_connect_details_submitted, booking_deposit_enabled, booking_deposit_percent, booking_advance_pay_enabled, store_name',
     )
     .eq('id', userId)
     .maybeSingle();
@@ -98,6 +99,7 @@ router.get('/status', async (req: Request, res: Response) => {
     ready_to_charge: ready,
     deposit_enabled: profile.booking_deposit_enabled,
     deposit_percent: Number(profile.booking_deposit_percent) || 30,
+    advance_pay_enabled: Boolean(profile.booking_advance_pay_enabled),
     wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
     hold_minutes: BOOKING_PAYMENT_HOLD_MINUTES,
     fees: {
@@ -114,7 +116,9 @@ router.get('/status', async (req: Request, res: Response) => {
           ? 'Falta terminar o cadastro (documentos e conta bancária) para liberar os recebimentos.'
           : profile.booking_deposit_enabled
             ? 'Sinal ligado: o horário só confirma depois que o cliente pagar.'
-            : 'Tudo pronto. O sinal é opcional — você decide se quer cobrar na hora do agendamento.',
+            : profile.booking_advance_pay_enabled
+              ? 'Sinal desligado; pagamento adiantado opcional ligado (cliente pode pagar 100% se quiser).'
+              : 'Tudo pronto. Sinal e pagamento adiantado estão desligados — o cliente agenda sem pagar.',
   });
 });
 
@@ -217,6 +221,7 @@ router.patch('/deposit-settings', express.json(), async (req: Request, res: Resp
 
   const enabledRaw = req.body?.deposit_enabled ?? req.body?.depositEnabled;
   const percentRaw = req.body?.deposit_percent ?? req.body?.depositPercent;
+  const advanceRaw = req.body?.advance_pay_enabled ?? req.body?.advancePayEnabled;
 
   const patch: Record<string, unknown> = {};
 
@@ -239,6 +244,17 @@ router.patch('/deposit-settings', express.json(), async (req: Request, res: Resp
     patch.booking_deposit_percent = Math.round(pct * 100) / 100;
   }
 
+  if (advanceRaw !== undefined) {
+    const advance = Boolean(advanceRaw);
+    if (advance && !profile.stripe_connect_charges_enabled) {
+      return res.status(400).json({
+        error:
+          'Conclua a verificação Stripe (cobranças liberadas) antes de ativar o pagamento adiantado.',
+      });
+    }
+    patch.booking_advance_pay_enabled = advance;
+  }
+
   if (!Object.keys(patch).length) {
     return res.status(400).json({ error: 'Nada para atualizar.' });
   }
@@ -248,7 +264,7 @@ router.patch('/deposit-settings', express.json(), async (req: Request, res: Resp
     .update(patch)
     .eq('id', auth.user.id)
     .select(
-      'booking_deposit_enabled, booking_deposit_percent, stripe_connect_charges_enabled',
+      'booking_deposit_enabled, booking_deposit_percent, booking_advance_pay_enabled, stripe_connect_charges_enabled',
     )
     .single();
 
@@ -257,6 +273,7 @@ router.patch('/deposit-settings', express.json(), async (req: Request, res: Resp
   res.json({
     deposit_enabled: data.booking_deposit_enabled,
     deposit_percent: Number(data.booking_deposit_percent),
+    advance_pay_enabled: Boolean(data.booking_advance_pay_enabled),
     wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
     ready_to_charge: Boolean(data.stripe_connect_charges_enabled),
   });

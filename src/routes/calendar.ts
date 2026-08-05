@@ -6,6 +6,10 @@ import { profileSubscriptionTier } from '../lib/profileMultiBarber';
 import { listAllBarbeirosForUser } from '../lib/barbeiros';
 import { syncCalendarShareSlug } from '../lib/storeSlug';
 import { tierSupportsCsvExport } from '../lib/wagooSubscription';
+import {
+  eventsToCsvWithCommission,
+  type PaidAppointmentForExport,
+} from '../lib/csvCommissionExport';
 import { listCalendarEvents, type CalendarEventDto } from '../services/calendar';
 
 const router = Router();
@@ -16,40 +20,6 @@ function frontendBaseUrl(): string {
 
 function publicShareUrl(slug: string): string {
   return `${frontendBaseUrl()}/calendario/publico/${encodeURIComponent(slug)}`;
-}
-
-function csvEscape(value: string): string {
-  if (/[",\n\r]/.test(value)) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-  return value;
-}
-
-function eventsToCsv(events: CalendarEventDto[]): string {
-  const header = [
-    'data_inicio',
-    'data_fim',
-    'cliente',
-    'telefone',
-    'profissional',
-    'titulo',
-    'origem',
-  ];
-  const lines = [header.join(',')];
-  for (const ev of events) {
-    lines.push(
-      [
-        csvEscape(ev.start),
-        csvEscape(ev.end),
-        csvEscape(ev.clientName ?? ''),
-        csvEscape(ev.clientPhone ?? ''),
-        csvEscape(ev.barberName ?? ''),
-        csvEscape(ev.summary),
-        csvEscape(ev.source),
-      ].join(','),
-    );
-  }
-  return lines.join('\n');
 }
 
 function filterEventsByBarber(
@@ -67,6 +37,53 @@ function filterEventsByBarber(
       return ev.barberName.trim().toLowerCase() === target.toLowerCase();
     }
     return false;
+  });
+}
+
+async function loadPaidAppointmentsForExport(
+  profileId: string,
+  from: string,
+  to: string,
+): Promise<PaidAppointmentForExport[]> {
+  const { data, error } = await supabase
+    .from('booking_appointments')
+    .select(
+      'id, google_event_id, client_name, client_phone, starts_at, ends_at, price_brl, deposit_amount_brl, application_fee_brl, payment_status, notes, booking_providers(name)',
+    )
+    .eq('profile_id', profileId)
+    .eq('payment_status', 'paid')
+    .gte('starts_at', from)
+    .lte('starts_at', to)
+    .order('starts_at', { ascending: true });
+
+  if (error) {
+    console.error('[calendar/export] paid appointments:', error.message);
+    return [];
+  }
+
+  return (data ?? []).map((row) => {
+    const r = row as Record<string, unknown>;
+    const provider = r.booking_providers as { name?: string } | null | undefined;
+    return {
+      id: String(r.id),
+      google_event_id: r.google_event_id ? String(r.google_event_id) : null,
+      client_name: String(r.client_name ?? ''),
+      client_phone: String(r.client_phone ?? ''),
+      starts_at: String(r.starts_at),
+      ends_at: String(r.ends_at),
+      price_brl: Number(r.price_brl) || 0,
+      deposit_amount_brl:
+        (r as { deposit_amount_brl?: unknown }).deposit_amount_brl != null
+          ? Number((r as { deposit_amount_brl: unknown }).deposit_amount_brl)
+          : null,
+      application_fee_brl:
+        (r as { application_fee_brl?: unknown }).application_fee_brl != null
+          ? Number((r as { application_fee_brl: unknown }).application_fee_brl)
+          : null,
+      payment_status: String(r.payment_status ?? 'paid'),
+      notes: r.notes != null ? String(r.notes) : null,
+      provider_name: provider?.name ? String(provider.name) : null,
+    };
   });
 }
 
@@ -195,8 +212,16 @@ router.get('/events/export', async (req: Request, res: Response) => {
     }
 
     const email = String(profile.email).toLowerCase().trim();
-    const events = await listCalendarEvents(email, from, to);
-    const csv = eventsToCsv(events);
+    const [events, barbeiros, paidAppointments] = await Promise.all([
+      listCalendarEvents(email, from, to),
+      listAllBarbeirosForUser(auth.user.id),
+      loadPaidAppointmentsForExport(auth.user.id, from, to),
+    ]);
+    const csv = eventsToCsvWithCommission({
+      events,
+      paidAppointments,
+      barbeiros,
+    });
     const stamp = new Date().toISOString().slice(0, 10);
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');

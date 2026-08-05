@@ -19,6 +19,10 @@ import {
   fulfillBookingDepositPayment,
   markBookingPaymentFailed,
 } from '../services/bookingPayments';
+import {
+  handleClubCheckoutSession,
+  handleClubSubscriptionEvent,
+} from '../services/clubMembership';
 import { log } from '../lib/logger';
 
 dotenv.config();
@@ -295,6 +299,13 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
           break;
         }
 
+        if (session.metadata?.wagoo_payment === 'club_membership') {
+          const connectAccountId =
+            typeof event.account === 'string' ? event.account : null;
+          await handleClubCheckoutSession(session, connectAccountId);
+          break;
+        }
+
         // Assinatura SaaS Wagoo (plataforma)
         let userId = session.client_reference_id ?? null;
         let tier: WagooSubscriptionTier | null = null;
@@ -367,12 +378,20 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
 
       case 'customer.subscription.updated': {
         const sub = event.data.object as Stripe.Subscription;
+        if (sub.metadata?.wagoo_payment === 'club_membership') {
+          await handleClubSubscriptionEvent(sub);
+          break;
+        }
         await applySubscriptionFromStripe(sub);
         break;
       }
 
       case 'customer.subscription.deleted': {
         const sub = event.data.object as Stripe.Subscription;
+        if (sub.metadata?.wagoo_payment === 'club_membership') {
+          await handleClubSubscriptionEvent(sub);
+          break;
+        }
         const userId = sub.metadata?.supabase_user_id;
         if (!userId) break;
         const r = await setProfileSubscriptionTierByUserId(supabase, userId, null);
@@ -388,7 +407,16 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
           typeof inv.subscription === 'string' ? inv.subscription : inv.subscription?.id ?? null;
         if (!subId) break;
         try {
-          const sub = await stripe.subscriptions.retrieve(subId);
+          const connectAccountId =
+            typeof event.account === 'string' ? event.account : undefined;
+          const sub = await stripe.subscriptions.retrieve(
+            subId,
+            connectAccountId ? { stripeAccount: connectAccountId } : undefined,
+          );
+          if (sub.metadata?.wagoo_payment === 'club_membership') {
+            await handleClubSubscriptionEvent(sub);
+            break;
+          }
           if (sub.status === 'active' || sub.status === 'trialing') {
             await applySubscriptionFromStripe(sub);
           }

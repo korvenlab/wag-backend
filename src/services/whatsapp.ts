@@ -77,6 +77,7 @@ import {
   createBookingDepositCheckout,
   profileRequiresDeposit,
 } from './bookingDepositCheckout';
+import { findActiveClubMemberByPhone } from './clubMembership';
 import { BOOKING_PAYMENT_HOLD_MINUTES } from '../lib/connectFees';
 import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
@@ -1345,8 +1346,13 @@ export async function startWhatsApp(email: string, res: Response | null) {
             {
                 const clientName = msg.pushName || "Cliente WhatsApp";
                 const clientPhone = remoteJid.split('@')[0].replace(/\D/g, '');
+                const clubMember = await findActiveClubMemberByPhone(
+                  String(p.id),
+                  clientPhone,
+                );
+                const chargeDeposit = requiresDeposit && matchedSvc && !clubMember;
 
-                if (requiresDeposit && matchedSvc) {
+                if (chargeDeposit && matchedSvc) {
                   const endsAtIso = dayjs(bookingIso)
                     .add(durationMin, 'minute')
                     .toISOString();
@@ -1456,10 +1462,13 @@ export async function startWhatsApp(email: string, res: Response | null) {
                         ? ` com ${finalBarberName}`
                         : '';
                     const svcLine = matchedSvc ? ` (${matchedSvc.name})` : '';
+                    const clubLine = clubMember
+                      ? ' Clube ativo — sem sinal nesta reserva.'
+                      : '';
                     const confirmText = emphasizeWa(
                       resolveAfterBookingReply(
                         templates,
-                        `Anotei: ${confirmDate}${profLine}${svcLine}. Te esperamos!`,
+                        `Anotei: ${confirmDate}${profLine}${svcLine}.${clubLine} Te esperamos!`,
                       ),
                       typeof finalBarberName === 'string' ? finalBarberName : null,
                       clientName,

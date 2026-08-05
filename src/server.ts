@@ -10,6 +10,8 @@ import promoRoutes from './routes/promo';
 import barbeirosRoutes from './routes/barbeiros';
 import calendarRoutes from './routes/calendar';
 import bookingRoutes from './routes/booking';
+import analyticsRoutes from './routes/analytics';
+import clubRoutes from './routes/club';
 import { profileHasWagooAccess } from './lib/profileAccess';
 import { profileHasMultiBarberPlan, profileSubscriptionTier } from './lib/profileMultiBarber';
 import { getMaxBarbeirosSlots, WAGOO_PLANS, tierSupportsReminders, tierSupportsAi, tierSupportsPublicBooking } from './lib/wagooSubscription';
@@ -85,6 +87,8 @@ app.use('/api/promo', promoRoutes);
 app.use('/api/barbeiros', barbeirosRoutes);
 app.use('/api/calendar', calendarRoutes);
 app.use('/api/booking', bookingRoutes);
+app.use('/api/analytics', analyticsRoutes);
+app.use('/api/club', clubRoutes);
 
 // --- 1. ROTA DE PERFIL (somente dono da sessão — Bearer Supabase) ---
 app.get('/api/user/profile', async (req: Request, res: Response) => {

@@ -28,6 +28,11 @@ import {
 } from '../lib/connectFees';
 import { expireStalePendingPayments } from '../services/bookingPayments';
 import { createBookingDepositCheckout } from '../services/bookingDepositCheckout';
+import { findActiveClubMemberByPhone } from '../services/clubMembership';
+import {
+  extractClubToken,
+  validateClubAccessSession,
+} from '../services/clubOtp';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -115,10 +120,11 @@ function frontendBase(): string {
 }
 
 function publicUrls(slug: string | null | undefined) {
-  if (!slug) return { publicUrl: null, agendaUrl: null };
+  if (!slug) return { publicUrl: null, agendaUrl: null, clientUrl: null };
   return {
     publicUrl: `${frontendBase()}/a/${slug}`,
     agendaUrl: `${frontendBase()}/a/${slug}/agenda`,
+    clientUrl: `${frontendBase()}/a/${slug}/cliente`,
   };
 }
 
@@ -190,7 +196,7 @@ async function loadPublishedSite(slug: string) {
   const { data, error } = await supabase
     .from('profiles')
     .select(
-      'id, store_name, booking_slug, booking_logo_url, booking_cover_url, booking_tagline, booking_phone, booking_address, booking_published, working_hours, subscription_tier, stripe_connect_account_id, stripe_connect_charges_enabled, booking_deposit_enabled, booking_deposit_percent',
+      'id, store_name, booking_slug, booking_logo_url, booking_cover_url, booking_tagline, booking_phone, booking_address, booking_published, working_hours, subscription_tier, stripe_connect_account_id, stripe_connect_charges_enabled, booking_deposit_enabled, booking_deposit_percent, booking_advance_pay_enabled',
     )
     .eq('booking_slug', slug)
     .maybeSingle();
@@ -210,6 +216,28 @@ function siteRequiresDeposit(site: {
     site.booking_deposit_enabled &&
       site.stripe_connect_charges_enabled &&
       site.stripe_connect_account_id,
+  );
+}
+
+/** Conta Connect pronta para cobrar (sinal obrigatório ou pagamento antecipado opcional). */
+function siteCanChargeOnline(site: {
+  stripe_connect_charges_enabled?: boolean | null;
+  stripe_connect_account_id?: string | null;
+}): boolean {
+  return Boolean(site.stripe_connect_charges_enabled && site.stripe_connect_account_id);
+}
+
+/** Dono liberou pagamento adiantado opcional (100%) com sinal desligado. */
+function siteAllowsOptionalAdvance(site: {
+  booking_advance_pay_enabled?: boolean | null;
+  booking_deposit_enabled?: boolean | null;
+  stripe_connect_charges_enabled?: boolean | null;
+  stripe_connect_account_id?: string | null;
+}): boolean {
+  return Boolean(
+    site.booking_advance_pay_enabled &&
+      !siteRequiresDeposit(site) &&
+      siteCanChargeOnline(site),
   );
 }
 
@@ -265,6 +293,7 @@ router.get('/me', async (req: Request, res: Response) => {
     appointments: appointments ?? [],
     publicUrl: urls.publicUrl,
     agendaUrl: urls.agendaUrl,
+    clientUrl: urls.clientUrl,
     publishReady: publishCheck.missing.length === 0,
     missing: publishCheck.missing,
     missingMessages: publishCheck.messages,
@@ -415,6 +444,7 @@ router.patch('/me', async (req: Request, res: Response) => {
     profile: data,
     publicUrl: urls.publicUrl,
     agendaUrl: urls.agendaUrl,
+    clientUrl: urls.clientUrl,
     publishReady: publishCheck.missing.length === 0,
     missing: publishCheck.missing,
     missingMessages: publishCheck.messages,
@@ -752,15 +782,73 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
     working_hours: site.working_hours ?? null,
     services: services ?? [],
     providers: providers ?? [],
+    club_portal_url: site.booking_slug
+      ? `${frontendBase()}/a/${site.booking_slug}/cliente`
+      : null,
     deposit: {
       required: depositRequired,
+      /** Sinal desligado + dono liberou pagamento adiantado opcional. */
+      optional: siteAllowsOptionalAdvance(site),
       percent: depositPercent,
+      /** Percentual cobrado no pagamento antecipado opcional (serviço completo). */
+      advance_percent: 100,
       wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
       hold_minutes: BOOKING_PAYMENT_HOLD_MINUTES,
-      // Taxas são do salão (não acrescidas ao cliente). Expostas para transparência no app do dono;
-      // no link público usamos só o valor do sinal.
       fees_summary: FEE_COPY.summary,
     },
+  });
+});
+
+/** Consulta se o telefone é membro ativo do clube (exige OTP no WhatsApp). */
+router.get('/public/:slug/club-status', async (req: Request, res: Response) => {
+  const slug = String(req.params.slug || '').trim().toLowerCase();
+  const site = await loadPublishedSite(slug);
+  if (!site) return res.status(404).json({ error: 'Agenda não encontrada.' });
+
+  const phone = String(req.query.phone || '').replace(/\D/g, '');
+  if (phone.length < 10) {
+    return res.status(400).json({ error: 'Informe o telefone com DDD.' });
+  }
+
+  const clubPortal = site.booking_slug
+    ? `${frontendBase()}/a/${site.booking_slug}/cliente`
+    : null;
+
+  const token = extractClubToken({
+    headers: req.headers as Record<string, unknown>,
+    query: req.query as Record<string, unknown>,
+  });
+  const verified = await validateClubAccessSession({
+    profileId: String(site.id),
+    phone,
+    token,
+    purposes: ['club_benefit', 'member_access', 'subscribe'],
+  });
+
+  if (!verified) {
+    return res.json({
+      is_club_member: false,
+      member: null,
+      skips_deposit: false,
+      needs_otp: true,
+      club_portal_url: clubPortal,
+    });
+  }
+
+  const member = await findActiveClubMemberByPhone(String(site.id), phone);
+  res.json({
+    is_club_member: Boolean(member),
+    member: member
+      ? {
+          name: member.client_name,
+          phone: member.client_phone,
+          days_left: member.days_left,
+          current_period_end: member.current_period_end,
+        }
+      : null,
+    skips_deposit: Boolean(member),
+    needs_otp: false,
+    club_portal_url: clubPortal,
   });
 });
 
@@ -1069,17 +1157,55 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
   }
 
   const totalRounded = Math.round(totalPrice * 100) / 100;
-  const requiresDeposit = siteRequiresDeposit(site);
-  const depositPercent = Number(site.booking_deposit_percent) || 30;
+  const clubToken = extractClubToken({
+    headers: req.headers as Record<string, unknown>,
+    body: req.body as Record<string, unknown>,
+  });
+  const clubPhoneVerified = await validateClubAccessSession({
+    profileId: String(site.id),
+    phone: clientPhone,
+    token: clubToken,
+    purposes: ['club_benefit', 'member_access', 'subscribe'],
+  });
+  const clubMember = clubPhoneVerified
+    ? await findActiveClubMemberByPhone(String(site.id), clientPhone)
+    : null;
+  const depositMandatory = siteRequiresDeposit(site) && !clubMember;
+  const payInAdvance = Boolean(
+    req.body?.pay_in_advance === true ||
+      req.body?.payInAdvance === true ||
+      req.body?.pay_advance === true,
+  );
+  const canOptionalAdvance =
+    siteAllowsOptionalAdvance(site) &&
+    !clubMember &&
+    payInAdvance &&
+    totalRounded > 0;
+  const chargeNow = depositMandatory || canOptionalAdvance;
+  const depositPercent = depositMandatory
+    ? Number(site.booking_deposit_percent) || 30
+    : 100;
 
-  if (requiresDeposit && totalRounded <= 0) {
+  if (depositMandatory && totalRounded <= 0) {
     return res.status(400).json({
       error: 'Este horário exige sinal. Cadastre o preço nos serviços.',
     });
   }
 
-  // Fluxo com sinal: Checkout compartilhado (Agenda Web + IA)
-  if (requiresDeposit) {
+  if (payInAdvance && !siteAllowsOptionalAdvance(site) && !depositMandatory) {
+    return res.status(400).json({
+      error: 'Este salão não está aceitando pagamento adiantado no momento.',
+    });
+  }
+
+  if (payInAdvance && !siteCanChargeOnline(site)) {
+    return res.status(400).json({
+      error: 'Este salão ainda não aceita pagamento online.',
+    });
+  }
+
+  // Sinal obrigatório OU pagamento antecipado opcional (serviço completo)
+  if (chargeNow) {
     const pay = await createBookingDepositCheckout({
       profileId: String(site.id),
       stripeConnectAccountId: String(site.stripe_connect_account_id),
@@ -1094,7 +1220,12 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
       totalPriceBrl: totalRounded,
       depositPercent,
       serviceLabel: serviceNames,
-      notes: services.length > 1 ? `Serviços: ${serviceNames}` : '',
+      notes: [
+        services.length > 1 ? `Serviços: ${serviceNames}` : '',
+        canOptionalAdvance ? 'pay_in_advance=optional' : '',
+      ]
+        .filter(Boolean)
+        .join(' | '),
       source: 'agenda_web',
     });
 
@@ -1117,6 +1248,7 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
       payment: {
         total_brl: totalRounded,
         deposit_percent: depositPercent,
+        optional_advance: canOptionalAdvance,
         ...pay.feeSchedule,
         hold_minutes: BOOKING_PAYMENT_HOLD_MINUTES,
       },
@@ -1146,7 +1278,12 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
       application_fee_brl: null,
       payment_status: 'not_required',
       payment_expires_at: null,
-      notes: services.length > 1 ? `Serviços: ${serviceNames}` : '',
+      notes: [
+        services.length > 1 ? `Serviços: ${serviceNames}` : '',
+        clubMember ? `club_member=${clubMember.id}` : '',
+      ]
+        .filter(Boolean)
+        .join(' | '),
     })
     .select(
       'id, starts_at, ends_at, client_name, status, provider_id, payment_status, deposit_amount_brl, price_brl',
@@ -1212,6 +1349,7 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
 
   res.status(201).json({
     requires_payment: false,
+    club_member: Boolean(clubMember),
     appointment: { ...data, google_event_id: googleEventId },
     service: {
       name: serviceNames,
