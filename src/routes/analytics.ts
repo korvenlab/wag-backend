@@ -278,7 +278,8 @@ function applyUploadToBarbers(
   );
 }
 
-async function buildAnalyticsSummaryPayload(
+/** Totais por barbeiro + faturamento da loja — mesma fonte do painel Analytics. */
+export async function buildAnalyticsSummaryPayload(
   userId: string,
   from: string,
   to: string,

@@ -4,10 +4,8 @@ import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
 import { BR_TZ } from './dateTimeBR';
 import {
-  buildBarberPeriodTotals,
   foldName,
-  type ManualEarningsEntry,
-  type PaidAppointmentForExport,
+  type BarberPeriodTotal,
 } from './csvCommissionExport';
 import type { BarbeiroRow } from './barbeiros';
 import { supabase } from './supabase';
@@ -137,38 +135,68 @@ export async function loadBarberMonthAppointments(opts: {
   return out;
 }
 
+/**
+ * Linha do Analytics para este profissional (mesmo cálculo do painel).
+ * Se houver mais de uma linha com o mesmo nome normalizado, soma os finais.
+ */
+export function pickBarberTotalFromAnalytics(
+  barbers: BarberPeriodTotal[],
+  barberName: string,
+): BarberPeriodTotal | null {
+  const key = foldName(barberName);
+  if (!key) return null;
+  const matches = barbers.filter((b) => foldName(b.profissional) === key);
+  if (!matches.length) return null;
+  if (matches.length === 1) return matches[0];
+
+  const summed = matches.reduce(
+    (acc, b) => ({
+      profissional: barberName,
+      paid_appointments_count: acc.paid_appointments_count + b.paid_appointments_count,
+      faturamento_brl: acc.faturamento_brl + b.faturamento_brl,
+      auto_commission_brl: acc.auto_commission_brl + b.auto_commission_brl,
+      manual_amount_brl:
+        b.manual_amount_brl != null || acc.manual_amount_brl != null
+          ? (acc.manual_amount_brl ?? 0) + (b.manual_amount_brl ?? 0)
+          : null,
+      final_amount_brl: acc.final_amount_brl + b.final_amount_brl,
+      source: b.source === 'manual' || acc.source === 'manual' ? ('manual' as const) : b.source,
+    }),
+    {
+      profissional: barberName,
+      paid_appointments_count: 0,
+      faturamento_brl: 0,
+      auto_commission_brl: 0,
+      manual_amount_brl: null as number | null,
+      final_amount_brl: 0,
+      source: 'none' as BarberPeriodTotal['source'],
+    },
+  );
+
+  return {
+    ...summed,
+    faturamento_brl: Math.round(summed.faturamento_brl * 100) / 100,
+    auto_commission_brl: Math.round(summed.auto_commission_brl * 100) / 100,
+    manual_amount_brl:
+      summed.manual_amount_brl != null
+        ? Math.round(summed.manual_amount_brl * 100) / 100
+        : null,
+    final_amount_brl: Math.round(summed.final_amount_brl * 100) / 100,
+  };
+}
+
 export function buildPublicBarberCommission(opts: {
   barbeiro: BarbeiroRow;
   storeName: string | null;
   year: number;
   month: number;
-  paidAppointments: PaidAppointmentForExport[];
-  /** Só entradas deste barbeiro (já filtradas) ou todas — filtra por nome. */
-  manualEntries: ManualEarningsEntry[];
-  /** Lista completa da equipe só para % de comissão por nome. */
-  teamBarbeiros: BarbeiroRow[];
+  /** Linha já calculada pelo Analytics (fonte da verdade). */
+  analyticsRow: BarberPeriodTotal | null;
   appointments?: PublicScheduleAppointment[];
 }): PublicBarberCommissionPayload {
-  const {
-    barbeiro,
-    storeName,
-    year,
-    month,
-    paidAppointments,
-    manualEntries,
-    teamBarbeiros,
-    appointments = [],
-  } = opts;
-  const key = foldName(barbeiro.nome);
-
-  const rows = buildBarberPeriodTotals({
-    paidAppointments,
-    barbeiros: teamBarbeiros,
-    manualEntries,
-  });
-
-  const mine = rows.find((r) => foldName(r.profissional) === key);
+  const { barbeiro, storeName, year, month, analyticsRow, appointments = [] } = opts;
   const busy_days = [...new Set(appointments.map((a) => a.day))].sort();
+  const mine = analyticsRow;
 
   return {
     profissional: barbeiro.nome,

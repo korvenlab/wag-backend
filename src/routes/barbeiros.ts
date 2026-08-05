@@ -14,12 +14,12 @@ import {
   generateCommissionShareToken,
   loadBarberMonthAppointments,
   monthRangeIsoBR,
+  pickBarberTotalFromAnalytics,
 } from '../lib/barberCommissionShare';
-import type { ManualEarningsEntry } from '../lib/csvCommissionExport';
-import { loadPaidAppointmentsForExport } from './analytics';
+import { foldName } from '../lib/csvCommissionExport';
+import { buildAnalyticsSummaryPayload } from './analytics';
 import { frontendBaseUrl } from '../lib/stripeClient';
 import { listCalendarEvents } from '../services/calendar';
-import { foldName } from '../lib/csvCommissionExport';
 import type { PublicScheduleAppointment } from '../lib/barberCommissionShare';
 import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
@@ -32,31 +32,6 @@ dayjs.extend(timezone);
 const router = express.Router();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-async function loadManualEntriesForMonth(
-  profileId: string,
-  year: number,
-  month: number,
-): Promise<ManualEarningsEntry[]> {
-  const { data, error } = await supabase
-    .from('barber_earnings_entries')
-    .select('barber_name, amount_brl, period_year, period_month')
-    .eq('profile_id', profileId)
-    .eq('period_year', year)
-    .eq('period_month', month);
-
-  if (error) {
-    console.error('[barbeiros] commission share entries:', error.message);
-    return [];
-  }
-
-  return (data ?? []).map((r) => ({
-    barber_name: String(r.barber_name),
-    amount_brl: Number(r.amount_brl) || 0,
-    period_year: Number(r.period_year),
-    period_month: Number(r.period_month),
-  }));
-}
 
 async function requireAuth(req: Request) {
   return getUserFromBearerHeader(supabase, req.headers.authorization);
@@ -296,29 +271,30 @@ router.get('/public/commission/:token', async (req: Request, res: Response) => {
   const { from, to } = monthRangeIsoBR(year, month);
   const ownerId = String(barbeiro.user_id);
 
-  const [team, paidAppointments, manualEntries, profile, agendaAppointments] =
-    await Promise.all([
-      listAllBarbeirosForUser(ownerId),
-      loadPaidAppointmentsForExport(ownerId, from, to),
-      loadManualEntriesForMonth(ownerId, year, month),
-      supabase
-        .from('profiles')
-        .select('store_name, email, googleAuth')
-        .eq('id', ownerId)
-        .maybeSingle()
-        .then((r) => r.data),
-      loadBarberMonthAppointments({
-        profileId: ownerId,
-        barberName: String(barbeiro.nome),
-        from,
-        to,
-      }),
-    ]);
+  const [team, analytics, profile, agendaAppointments] = await Promise.all([
+    listAllBarbeirosForUser(ownerId),
+    buildAnalyticsSummaryPayload(ownerId, from, to),
+    supabase
+      .from('profiles')
+      .select('store_name, email, googleAuth')
+      .eq('id', ownerId)
+      .maybeSingle()
+      .then((r) => r.data),
+    loadBarberMonthAppointments({
+      profileId: ownerId,
+      barberName: String(barbeiro.nome),
+      from,
+      to,
+    }),
+  ]);
 
   const row = team.find((b) => b.id === String(barbeiro.id));
   if (!row) {
     return res.status(404).json({ error: 'Link inválido ou expirado.' });
   }
+
+  // Mesmo total do card no Analytics (pagos no app + planilha)
+  const analyticsRow = pickBarberTotalFromAnalytics(analytics.barbers, row.nome);
 
   // Complementa com Google Agenda do salão, só eventos desse profissional
   let appointments = agendaAppointments;
@@ -334,7 +310,6 @@ router.get('/public/commission/:token', async (req: Request, res: Response) => {
       for (const ev of events) {
         const tagged = ev.barberName ? foldName(ev.barberName) : '';
         if (tagged && tagged !== barberKey) continue;
-        // Sem tag de barbeiro: só inclui se for o único da equipe ou se o título/desc casar
         if (!tagged && team.length > 1) continue;
 
         const startBr = dayjs(ev.start).tz(BR_TZ);
@@ -353,7 +328,6 @@ router.get('/public/commission/:token', async (req: Request, res: Response) => {
         });
       }
 
-      // Evita duplicar o mesmo horário já vindo da Agenda Web
       const seen = new Set(
         appointments.map(
           (a) => `${a.day}|${a.time_label}|${foldName(a.client_name)}`,
@@ -376,9 +350,7 @@ router.get('/public/commission/:token', async (req: Request, res: Response) => {
     storeName: profile?.store_name ? String(profile.store_name) : null,
     year,
     month,
-    paidAppointments,
-    manualEntries,
-    teamBarbeiros: team,
+    analyticsRow,
     appointments,
   });
 
