@@ -12,11 +12,22 @@ import {
   buildPublicBarberCommission,
   currentYearMonthBR,
   generateCommissionShareToken,
+  loadBarberMonthAppointments,
   monthRangeIsoBR,
 } from '../lib/barberCommissionShare';
 import type { ManualEarningsEntry } from '../lib/csvCommissionExport';
 import { loadPaidAppointmentsForExport } from './analytics';
 import { frontendBaseUrl } from '../lib/stripeClient';
+import { listCalendarEvents } from '../services/calendar';
+import { foldName } from '../lib/csvCommissionExport';
+import type { PublicScheduleAppointment } from '../lib/barberCommissionShare';
+import dayjs from 'dayjs';
+import timezone from 'dayjs/plugin/timezone';
+import utc from 'dayjs/plugin/utc';
+import { BR_TZ } from '../lib/dateTimeBR';
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
 const router = express.Router();
 
@@ -285,21 +296,79 @@ router.get('/public/commission/:token', async (req: Request, res: Response) => {
   const { from, to } = monthRangeIsoBR(year, month);
   const ownerId = String(barbeiro.user_id);
 
-  const [team, paidAppointments, manualEntries, profile] = await Promise.all([
-    listAllBarbeirosForUser(ownerId),
-    loadPaidAppointmentsForExport(ownerId, from, to),
-    loadManualEntriesForMonth(ownerId, year, month),
-    supabase
-      .from('profiles')
-      .select('store_name')
-      .eq('id', ownerId)
-      .maybeSingle()
-      .then((r) => r.data),
-  ]);
+  const [team, paidAppointments, manualEntries, profile, agendaAppointments] =
+    await Promise.all([
+      listAllBarbeirosForUser(ownerId),
+      loadPaidAppointmentsForExport(ownerId, from, to),
+      loadManualEntriesForMonth(ownerId, year, month),
+      supabase
+        .from('profiles')
+        .select('store_name, email, googleAuth')
+        .eq('id', ownerId)
+        .maybeSingle()
+        .then((r) => r.data),
+      loadBarberMonthAppointments({
+        profileId: ownerId,
+        barberName: String(barbeiro.nome),
+        from,
+        to,
+      }),
+    ]);
 
   const row = team.find((b) => b.id === String(barbeiro.id));
   if (!row) {
     return res.status(404).json({ error: 'Link inválido ou expirado.' });
+  }
+
+  // Complementa com Google Agenda do salão, só eventos desse profissional
+  let appointments = agendaAppointments;
+  const googleAuth = profile?.googleAuth as Record<string, unknown> | null | undefined;
+  const ownerEmail = String(profile?.email || '')
+    .toLowerCase()
+    .trim();
+  if (googleAuth?.refreshToken && ownerEmail) {
+    try {
+      const events = await listCalendarEvents(ownerEmail, from, to);
+      const barberKey = foldName(row.nome);
+      const fromGoogle: PublicScheduleAppointment[] = [];
+      for (const ev of events) {
+        const tagged = ev.barberName ? foldName(ev.barberName) : '';
+        if (tagged && tagged !== barberKey) continue;
+        // Sem tag de barbeiro: só inclui se for o único da equipe ou se o título/desc casar
+        if (!tagged && team.length > 1) continue;
+
+        const startBr = dayjs(ev.start).tz(BR_TZ);
+        const endBr = dayjs(ev.end).tz(BR_TZ);
+        fromGoogle.push({
+          id: `gcal-${ev.id}`,
+          starts_at: ev.start,
+          ends_at: ev.end,
+          day: startBr.format('YYYY-MM-DD'),
+          time_label: `${startBr.format('HH:mm')} – ${endBr.format('HH:mm')}`,
+          client_name: ev.clientName?.trim() || ev.summary?.trim() || 'Cliente',
+          service_name: null,
+          price_brl: 0,
+          payment_status: null,
+          status: 'confirmed',
+        });
+      }
+
+      // Evita duplicar o mesmo horário já vindo da Agenda Web
+      const seen = new Set(
+        appointments.map(
+          (a) => `${a.day}|${a.time_label}|${foldName(a.client_name)}`,
+        ),
+      );
+      for (const g of fromGoogle) {
+        const k = `${g.day}|${g.time_label}|${foldName(g.client_name)}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        appointments.push(g);
+      }
+      appointments.sort((a, b) => a.starts_at.localeCompare(b.starts_at));
+    } catch (err) {
+      console.error('[commission-share] google calendar:', err);
+    }
   }
 
   const payload = buildPublicBarberCommission({
@@ -310,6 +379,7 @@ router.get('/public/commission/:token', async (req: Request, res: Response) => {
     paidAppointments,
     manualEntries,
     teamBarbeiros: team,
+    appointments,
   });
 
   res.json(payload);
