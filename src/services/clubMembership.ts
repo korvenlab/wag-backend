@@ -555,7 +555,7 @@ export async function handleAsaasClubPaymentEvent(
   });
 }
 
-/** Resolve payment id do webhook e processa (clube + sinal). */
+/** Resolve payment id do webhook e processa. */
 export async function handleAsaasClubWebhookPayload(payload: {
   event?: string;
   payment?: AsaasPayment;
@@ -564,29 +564,9 @@ export async function handleAsaasClubWebhookPayload(payload: {
   let payment = payload.payment;
   if (!payment?.id) return;
 
+  // Garante dados frescos
   const fresh = await asaasGetPayment(payment.id);
   if (fresh.ok) payment = fresh.data;
-
-  const ref = String(payment.externalReference || '');
-  const depositMatch = ref.match(/^booking_deposit:([0-9a-f-]{36})$/i);
-  if (depositMatch) {
-    const appointmentId = depositMatch[1];
-    const status = String(payment.status || '').toUpperCase();
-    const paidOk =
-      status === 'RECEIVED' ||
-      status === 'CONFIRMED' ||
-      status === 'RECEIVED_IN_CASH' ||
-      /PAYMENT_(RECEIVED|CONFIRMED)/i.test(event);
-    if (!paidOk) return;
-
-    const { fulfillBookingDepositPayment } = await import('./bookingPayments');
-    await fulfillBookingDepositPayment({
-      appointmentId,
-      asaasPaymentId: payment.id,
-      depositAmountBrl: Number(payment.value) || null,
-    });
-    return;
-  }
 
   await handleAsaasClubPaymentEvent(payment, event);
 }

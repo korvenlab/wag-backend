@@ -178,25 +178,6 @@ export async function asaasGetPayment(
   return { ok: true, data: res.data };
 }
 
-export async function asaasCreatePayment(input: {
-  customerId: string;
-  value: number;
-  dueDate: string;
-  description: string;
-  externalReference: string;
-}): Promise<{ ok: true; data: AsaasPayment } | { ok: false; error: string }> {
-  const res = await asaasRequest<AsaasPayment>('POST', '/payments', {
-    customer: input.customerId,
-    billingType: 'UNDEFINED',
-    value: Math.round(Number(input.value) * 100) / 100,
-    dueDate: input.dueDate,
-    description: input.description.slice(0, 500),
-    externalReference: input.externalReference.slice(0, 100),
-  });
-  if (!res.ok) return { ok: false, error: res.error };
-  return { ok: true, data: res.data };
-}
-
 export async function asaasCancelSubscription(
   subscriptionId: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {

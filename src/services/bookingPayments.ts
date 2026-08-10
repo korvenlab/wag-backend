@@ -19,13 +19,11 @@ export async function fulfillBookingDepositPayment(opts: {
   appointmentId: string;
   paymentIntentId?: string | null;
   checkoutSessionId?: string | null;
-  asaasPaymentId?: string | null;
-  depositAmountBrl?: number | null;
 }): Promise<{ ok: boolean; already?: boolean; error?: string }> {
   const { data: appt, error } = await supabase
     .from('booking_appointments')
     .select(
-      'id, profile_id, status, payment_status, client_name, client_phone, starts_at, ends_at, notes, provider_id, google_event_id, price_brl, service_id, deposit_amount_brl',
+      'id, profile_id, status, payment_status, client_name, client_phone, starts_at, ends_at, notes, provider_id, google_event_id, price_brl, service_id',
     )
     .eq('id', opts.appointmentId)
     .maybeSingle();
@@ -49,7 +47,6 @@ export async function fulfillBookingDepositPayment(opts: {
   };
   if (opts.paymentIntentId) patch.stripe_payment_intent_id = opts.paymentIntentId;
   if (opts.checkoutSessionId) patch.stripe_checkout_session_id = opts.checkoutSessionId;
-  if (opts.asaasPaymentId) patch.asaas_payment_id = opts.asaasPaymentId;
 
   const { error: upErr } = await supabase
     .from('booking_appointments')
@@ -57,28 +54,6 @@ export async function fulfillBookingDepositPayment(opts: {
     .eq('id', appt.id);
 
   if (upErr) return { ok: false, error: upErr.message };
-
-  // Credita ledger do salão (mesmo wallet do clube)
-  const gross =
-    Number(opts.depositAmountBrl) ||
-    Number(appt.deposit_amount_brl) ||
-    0;
-  if (opts.asaasPaymentId && gross > 0 && appt.profile_id) {
-    try {
-      const { creditClubLedgerFromPayment } = await import('../lib/clubLedger');
-      await creditClubLedgerFromPayment({
-        profileId: String(appt.profile_id),
-        clubMemberId: null,
-        grossBrl: gross,
-        asaasPaymentId: opts.asaasPaymentId,
-        description: 'Sinal de agendamento (Asaas)',
-      });
-    } catch (err) {
-      log.error('BOOKING_PAY', 'ledger crédito falhou', err, {
-        appointmentId: appt.id,
-      });
-    }
-  }
 
   const [{ data: owner }, { data: provider }, { data: service }] = await Promise.all([
     supabase
