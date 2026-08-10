@@ -12,7 +12,6 @@ import calendarRoutes from './routes/calendar';
 import bookingRoutes from './routes/booking';
 import analyticsRoutes from './routes/analytics';
 import clubRoutes from './routes/club';
-import asaasRoutes from './routes/asaas';
 import { profileHasWagooAccess } from './lib/profileAccess';
 import { profileHasMultiBarberPlan, profileSubscriptionTier } from './lib/profileMultiBarber';
 import { getMaxBarbeirosSlots, WAGOO_PLANS, tierSupportsReminders, tierSupportsAi, tierSupportsPublicBooking } from './lib/wagooSubscription';
@@ -73,7 +72,6 @@ app.use(cors({
     'Content-Type',
     'Authorization',
     'stripe-signature',
-    'asaas-access-token',
     'x-admin-secret',
     'x-api-key',
     'X-API-Key',
@@ -82,7 +80,6 @@ app.use(cors({
 }));
 
 app.use('/api/stripe', stripeRoutes);
-app.use('/api/asaas', asaasRoutes);
 app.use(express.json({ limit: '4mb' }));
 app.use('/feedback', feedbackRoutes);
 app.use('/api/admin', adminDashboardRoutes);
