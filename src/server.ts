@@ -13,6 +13,7 @@ import bookingRoutes from './routes/booking';
 import analyticsRoutes from './routes/analytics';
 import clubRoutes from './routes/club';
 import asaasRoutes from './routes/asaas';
+import paymentsRoutes from './routes/payments';
 import { profileHasWagooAccess } from './lib/profileAccess';
 import { profileHasMultiBarberPlan, profileSubscriptionTier } from './lib/profileMultiBarber';
 import { getMaxBarbeirosSlots, WAGOO_PLANS, tierSupportsReminders, tierSupportsAi, tierSupportsPublicBooking } from './lib/wagooSubscription';
@@ -83,6 +84,7 @@ app.use(cors({
 
 app.use('/api/stripe', stripeRoutes);
 app.use('/api/asaas', asaasRoutes);
+app.use('/api/payments', paymentsRoutes);
 app.use(express.json({ limit: '4mb' }));
 app.use('/feedback', feedbackRoutes);
 app.use('/api/admin', adminDashboardRoutes);

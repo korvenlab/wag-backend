@@ -1365,7 +1365,6 @@ export async function startWhatsApp(email: string, res: Response | null) {
                   const depositPercent = Number(p.booking_deposit_percent) || 30;
                   const pay = await createBookingDepositCheckout({
                     profileId: String(p.id),
-                    stripeConnectAccountId: String(p.stripe_connect_account_id),
                     storeName: String(p.store_name || 'Agendamento'),
                     bookingSlug: p.booking_slug ? String(p.booking_slug) : null,
                     serviceId: matchedSvc.id,

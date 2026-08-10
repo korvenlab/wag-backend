@@ -31,6 +31,7 @@ import {
 } from '../lib/connectFees';
 import { expireStalePendingPayments } from '../services/bookingPayments';
 import { createBookingDepositCheckout } from '../services/bookingDepositCheckout';
+import { asaasConfigured } from '../lib/asaasClient';
 import { findActiveClubMemberByPhone } from '../services/clubMembership';
 import {
   extractClubToken,
@@ -212,35 +213,24 @@ async function loadPublishedSite(slug: string) {
 
 function siteRequiresDeposit(site: {
   booking_deposit_enabled?: boolean | null;
-  stripe_connect_charges_enabled?: boolean | null;
-  stripe_connect_account_id?: string | null;
 }): boolean {
-  return Boolean(
-    site.booking_deposit_enabled &&
-      site.stripe_connect_charges_enabled &&
-      site.stripe_connect_account_id,
-  );
+  return Boolean(site.booking_deposit_enabled && asaasConfigured());
 }
 
-/** Conta Connect pronta para cobrar (sinal obrigatório ou pagamento antecipado opcional). */
-function siteCanChargeOnline(site: {
-  stripe_connect_charges_enabled?: boolean | null;
-  stripe_connect_account_id?: string | null;
-}): boolean {
-  return Boolean(site.stripe_connect_charges_enabled && site.stripe_connect_account_id);
+/** Pagamentos online via Asaas (conta Wagoo). */
+function siteCanChargeOnline(_site?: unknown): boolean {
+  return asaasConfigured();
 }
 
 /** Dono liberou pagamento adiantado opcional (100%) com sinal desligado. */
 function siteAllowsOptionalAdvance(site: {
   booking_advance_pay_enabled?: boolean | null;
   booking_deposit_enabled?: boolean | null;
-  stripe_connect_charges_enabled?: boolean | null;
-  stripe_connect_account_id?: string | null;
 }): boolean {
   return Boolean(
     site.booking_advance_pay_enabled &&
       !siteRequiresDeposit(site) &&
-      siteCanChargeOnline(site),
+      siteCanChargeOnline(),
   );
 }
 
@@ -1219,7 +1209,7 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
     });
   }
 
-  if (payInAdvance && !siteCanChargeOnline(site)) {
+  if (payInAdvance && !siteCanChargeOnline()) {
     return res.status(400).json({
       error: 'Este salão ainda não aceita pagamento online.',
     });
@@ -1229,7 +1219,6 @@ router.post('/public/:slug/appointments', async (req: Request, res: Response) =>
   if (chargeNow) {
     const pay = await createBookingDepositCheckout({
       profileId: String(site.id),
-      stripeConnectAccountId: String(site.stripe_connect_account_id),
       storeName: String(site.store_name || 'Agendamento'),
       bookingSlug: site.booking_slug ? String(site.booking_slug) : null,
       serviceId: String(primary.id),
