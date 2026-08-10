@@ -24,11 +24,8 @@ import {
 } from '../services/clubOtp';
 import { WAGOO_APPLICATION_FEE_PERCENT } from '../lib/connectFees';
 import {
-  finalizeClubLedgerPayout,
+  debitClubLedgerForPayout,
   getClubLedgerBalance,
-  newPayoutHoldId,
-  releaseClubLedgerPayout,
-  reserveClubLedgerPayout,
 } from '../lib/clubLedger';
 import { asaasTransferPix } from '../lib/asaasClient';
 import { log } from '../lib/logger';
@@ -369,20 +366,6 @@ router.post('/me/payout', express.json(), async (req: Request, res: Response) =>
     });
   }
 
-  const holdId = newPayoutHoldId();
-  const reserved = await reserveClubLedgerPayout({
-    profileId: gate.userId,
-    amountBrl: amount,
-    holdId,
-    description: 'Saque PIX clube',
-  });
-  if (!reserved.ok) {
-    return res.status(400).json({
-      error: reserved.error,
-      ledger_balance_brl: reserved.balance ?? balance,
-    });
-  }
-
   const transfer = await asaasTransferPix({
     value: amount,
     pixAddressKey: pixKey,
@@ -391,20 +374,24 @@ router.post('/me/payout', express.json(), async (req: Request, res: Response) =>
   });
 
   if (!transfer.ok) {
-    await releaseClubLedgerPayout({ profileId: gate.userId, holdId });
     return res.status(502).json({ error: transfer.error });
   }
 
-  const finalized = await finalizeClubLedgerPayout({
+  const debited = await debitClubLedgerForPayout({
     profileId: gate.userId,
-    holdId,
+    amountBrl: amount,
     asaasTransferId: transfer.data.id,
+    description: 'Saque PIX clube',
   });
-  if (!finalized.ok) {
-    log.error('CLUB', 'PIX ok mas finalize ledger falhou', null, {
+
+  if (!debited.ok) {
+    log.error('CLUB', 'transfer ok mas ledger debit falhou', null, {
       transferId: transfer.data.id,
-      holdId,
       profileId: gate.userId,
+    });
+    return res.status(500).json({
+      error: 'Transferência enviada, mas falhou o registro interno. Contate o suporte.',
+      transfer_id: transfer.data.id,
     });
   }
 

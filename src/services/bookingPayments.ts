@@ -25,7 +25,7 @@ export async function fulfillBookingDepositPayment(opts: {
   const { data: appt, error } = await supabase
     .from('booking_appointments')
     .select(
-      'id, profile_id, status, payment_status, client_name, client_phone, starts_at, ends_at, notes, provider_id, google_event_id, price_brl, service_id, deposit_amount_brl, asaas_payment_id',
+      'id, profile_id, status, payment_status, client_name, client_phone, starts_at, ends_at, notes, provider_id, google_event_id, price_brl, service_id, deposit_amount_brl',
     )
     .eq('id', opts.appointmentId)
     .maybeSingle();
@@ -35,37 +35,11 @@ export async function fulfillBookingDepositPayment(opts: {
   }
 
   if (appt.status === 'confirmed' && appt.payment_status === 'paid') {
-    // Ainda tenta crédito idempotente se o webhook anterior falhou no ledger.
-    if (opts.asaasPaymentId && appt.profile_id) {
-      const gross =
-        Number(opts.depositAmountBrl) ||
-        Number(appt.deposit_amount_brl) ||
-        0;
-      if (gross > 0) {
-        const { creditClubLedgerFromPayment } = await import('../lib/clubLedger');
-        await creditClubLedgerFromPayment({
-          profileId: String(appt.profile_id),
-          clubMemberId: null,
-          grossBrl: gross,
-          asaasPaymentId: opts.asaasPaymentId,
-          description: 'Sinal de agendamento (Asaas)',
-        });
-      }
-    }
     return { ok: true, already: true };
   }
 
   if (appt.status === 'cancelled') {
     return { ok: false, error: 'Agendamento cancelado.' };
-  }
-
-  // Não aceita payment id diferente do já vinculado
-  if (
-    appt.asaas_payment_id &&
-    opts.asaasPaymentId &&
-    String(appt.asaas_payment_id) !== String(opts.asaasPaymentId)
-  ) {
-    return { ok: false, error: 'Pagamento não corresponde a este agendamento.' };
   }
 
   const patch: Record<string, unknown> = {
