@@ -9,9 +9,9 @@ import {
 } from '../lib/wagooSubscription';
 import {
   clubClientPortalUrl,
-  createClubCheckoutSession,
+  clubPaymentsReady,
+  createClubAsaasCheckout,
   digitsPhone,
-  ensureClubStripeAssets,
   findActiveClubMemberByPhone,
   type ClubPlanRow,
 } from '../services/clubMembership';
@@ -23,6 +23,40 @@ import {
   type ClubOtpPurpose,
 } from '../services/clubOtp';
 import { WAGOO_APPLICATION_FEE_PERCENT } from '../lib/connectFees';
+import {
+  debitClubLedgerForPayout,
+  getClubLedgerBalance,
+} from '../lib/clubLedger';
+import { asaasTransferPix } from '../lib/asaasClient';
+import { log } from '../lib/logger';
+
+type PixKeyType = 'CPF' | 'CNPJ' | 'EMAIL' | 'PHONE' | 'EVP';
+
+function detectPixKeyType(raw: string): PixKeyType | null {
+  const key = String(raw || '').trim();
+  if (!key) return null;
+  if (key.includes('@')) return 'EMAIL';
+  const digits = key.replace(/\D/g, '');
+  if (digits.length === 11 && /^\d+$/.test(digits)) return 'CPF';
+  if (digits.length === 14 && /^\d+$/.test(digits)) return 'CNPJ';
+  if (digits.length === 10 || digits.length === 11) {
+    // telefone sem @ — se só dígitos e 10/11, PHONE (CPF também 11: preferir CPF se validar)
+    // Heurística: 11 dígitos começando com DDD celular → ainda pode ser CPF. Usuário escolhe no painel.
+  }
+  // Chave aleatória EVP (UUID-like)
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(key)) {
+    return 'EVP';
+  }
+  if (digits.length >= 10 && digits.length <= 13) return 'PHONE';
+  return 'EVP';
+}
+
+function normalizePixKey(key: string, type: PixKeyType): string {
+  const raw = key.trim();
+  if (type === 'EMAIL') return raw.toLowerCase();
+  if (type === 'CPF' || type === 'CNPJ' || type === 'PHONE') return raw.replace(/\D/g, '');
+  return raw;
+}
 
 const OTP_PURPOSES = new Set<ClubOtpPurpose>([
   'subscribe',
@@ -94,7 +128,7 @@ async function requireOwner(req: Request) {
   const { data: profile } = await supabase
     .from('profiles')
     .select(
-      'id, store_name, booking_slug, booking_published, has_paid, complimentary_access_until, subscription_tier, multi_barber_plan, stripe_connect_account_id, stripe_connect_charges_enabled',
+      'id, store_name, booking_slug, booking_published, has_paid, complimentary_access_until, subscription_tier, multi_barber_plan, club_payout_pix_key, club_payout_pix_key_type',
     )
     .eq('id', auth.user.id)
     .maybeSingle();
@@ -126,7 +160,7 @@ async function loadPublishedSiteBySlug(slug: string) {
   const { data } = await supabase
     .from('profiles')
     .select(
-      'id, store_name, booking_slug, booking_logo_url, booking_cover_url, booking_tagline, booking_phone, booking_address, booking_published, working_hours, subscription_tier, multi_barber_plan, has_paid, stripe_connect_account_id, stripe_connect_charges_enabled',
+      'id, store_name, booking_slug, booking_logo_url, booking_cover_url, booking_tagline, booking_phone, booking_address, booking_published, working_hours, subscription_tier, multi_barber_plan, has_paid',
     )
     .eq('booking_slug', slug)
     .maybeSingle();
@@ -157,30 +191,32 @@ router.get('/me', async (req: Request, res: Response) => {
   ]);
 
   const slug = gate.profile.booking_slug as string | null;
-  const ready =
-    Boolean(gate.profile.stripe_connect_account_id) &&
-    Boolean(gate.profile.stripe_connect_charges_enabled);
+  const ready = clubPaymentsReady();
+  const balance = await getClubLedgerBalance(gate.userId);
 
   res.json({
     plan: plan ?? null,
     members: members ?? [],
     client_portal_url: slug ? clubClientPortalUrl(slug) : null,
-    payment_link_url: plan?.payment_link_url ?? null,
-    connect_ready: ready,
+    payment_link_url: slug ? clubClientPortalUrl(slug) : plan?.payment_link_url ?? null,
+    connect_ready: ready, // legado UI: agora = Asaas configurado
+    payments_ready: ready,
+    provider: 'asaas',
     wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
+    ledger_balance_brl: balance,
+    payout_pix_key: gate.profile.club_payout_pix_key ?? null,
+    payout_pix_key_type: gate.profile.club_payout_pix_key_type ?? null,
   });
 });
 
-/** Cria/atualiza plano e (re)gera Payment Link Stripe. */
+/** Cria/atualiza plano do clube (cobrança Asaas — sem Stripe Connect). */
 router.put('/me', express.json(), async (req: Request, res: Response) => {
   const gate = await requireOwner(req);
   if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
 
-  const connectId = gate.profile.stripe_connect_account_id as string | null;
-  const chargesOk = Boolean(gate.profile.stripe_connect_charges_enabled);
-  if (!connectId || !chargesOk) {
-    return res.status(400).json({
-      error: 'Conecte a conta em Pagamentos e termine o cadastro Stripe antes de ativar o clube.',
+  if (!clubPaymentsReady()) {
+    return res.status(503).json({
+      error: 'Pagamentos do clube em configuração. Tente novamente em breve.',
     });
   }
 
@@ -203,6 +239,7 @@ router.put('/me', express.json(), async (req: Request, res: Response) => {
   }
 
   const priceRounded = Math.round(price * 100) / 100;
+  const portal = clubClientPortalUrl(slug);
 
   const { data: existing } = await supabase
     .from('club_plans')
@@ -219,6 +256,7 @@ router.put('/me', express.json(), async (req: Request, res: Response) => {
         description,
         price_brl: priceRounded,
         active,
+        payment_link_url: portal,
         updated_at: new Date().toISOString(),
       })
       .eq('id', existing.id)
@@ -235,6 +273,7 @@ router.put('/me', express.json(), async (req: Request, res: Response) => {
         description,
         price_brl: priceRounded,
         active,
+        payment_link_url: portal,
       })
       .select('*')
       .single();
@@ -242,22 +281,128 @@ router.put('/me', express.json(), async (req: Request, res: Response) => {
     plan = data as ClubPlanRow;
   }
 
-  const ensured = await ensureClubStripeAssets({
+  res.json({
     plan,
-    connectAccountId: connectId,
-    storeName: String(gate.profile.store_name || ''),
-    slug,
+    client_portal_url: portal,
+    payment_link_url: portal,
+    payments_ready: true,
+    provider: 'asaas',
+    wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
   });
+});
 
-  if (!ensured.ok) {
-    return res.status(500).json({ error: ensured.error });
+/** Salva chave PIX para saque automático do saldo do clube. */
+router.put('/me/payout-pix', express.json(), async (req: Request, res: Response) => {
+  const gate = await requireOwner(req);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+  const rawKey = String(req.body?.pix_key ?? req.body?.club_payout_pix_key ?? '').trim();
+  const typeRaw = String(req.body?.pix_key_type ?? req.body?.club_payout_pix_key_type ?? '')
+    .trim()
+    .toUpperCase();
+
+  if (!rawKey) {
+    await supabase
+      .from('profiles')
+      .update({
+        club_payout_pix_key: null,
+        club_payout_pix_key_type: null,
+      })
+      .eq('id', gate.userId);
+    return res.json({ ok: true, payout_pix_key: null, payout_pix_key_type: null });
   }
 
+  const allowed: PixKeyType[] = ['CPF', 'CNPJ', 'EMAIL', 'PHONE', 'EVP'];
+  let type = (allowed.includes(typeRaw as PixKeyType) ? typeRaw : detectPixKeyType(rawKey)) as
+    | PixKeyType
+    | null;
+  if (!type) {
+    return res.status(400).json({ error: 'Tipo de chave PIX inválido.' });
+  }
+
+  const normalized = normalizePixKey(rawKey, type);
+  await supabase
+    .from('profiles')
+    .update({
+      club_payout_pix_key: normalized,
+      club_payout_pix_key_type: type,
+    })
+    .eq('id', gate.userId);
+
+  res.json({ ok: true, payout_pix_key: normalized, payout_pix_key_type: type });
+});
+
+/** Saque automático do saldo do clube via PIX (Asaas). */
+router.post('/me/payout', express.json(), async (req: Request, res: Response) => {
+  const gate = await requireOwner(req);
+  if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+  if (!clubPaymentsReady()) {
+    return res.status(503).json({ error: 'Saques temporariamente indisponíveis.' });
+  }
+
+  const pixKey = String(gate.profile.club_payout_pix_key || '').trim();
+  const pixType = String(gate.profile.club_payout_pix_key_type || '').trim().toUpperCase() as PixKeyType;
+  if (!pixKey || !pixType) {
+    return res.status(400).json({
+      error: 'Cadastre sua chave PIX em Clube antes de sacar.',
+    });
+  }
+
+  const balance = await getClubLedgerBalance(gate.userId);
+  const requested = Number(req.body?.amount_brl);
+  const amount =
+    Number.isFinite(requested) && requested > 0
+      ? Math.round(requested * 100) / 100
+      : balance;
+
+  if (amount < 1) {
+    return res.status(400).json({ error: 'Saldo insuficiente para saque (mín. R$ 1,00).' });
+  }
+  if (amount > balance + 0.001) {
+    return res.status(400).json({
+      error: `Saldo disponível: R$ ${balance.toFixed(2).replace('.', ',')}.`,
+      ledger_balance_brl: balance,
+    });
+  }
+
+  const transfer = await asaasTransferPix({
+    value: amount,
+    pixAddressKey: pixKey,
+    pixAddressKeyType: pixType,
+    description: `Repasse clube Wagoo`,
+  });
+
+  if (!transfer.ok) {
+    return res.status(502).json({ error: transfer.error });
+  }
+
+  const debited = await debitClubLedgerForPayout({
+    profileId: gate.userId,
+    amountBrl: amount,
+    asaasTransferId: transfer.data.id,
+    description: 'Saque PIX clube',
+  });
+
+  if (!debited.ok) {
+    log.error('CLUB', 'transfer ok mas ledger debit falhou', null, {
+      transferId: transfer.data.id,
+      profileId: gate.userId,
+    });
+    return res.status(500).json({
+      error: 'Transferência enviada, mas falhou o registro interno. Contate o suporte.',
+      transfer_id: transfer.data.id,
+    });
+  }
+
+  const newBalance = await getClubLedgerBalance(gate.userId);
   res.json({
-    plan: ensured.plan,
-    client_portal_url: clubClientPortalUrl(slug),
-    payment_link_url: ensured.plan.payment_link_url,
-    wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
+    ok: true,
+    amount_brl: amount,
+    transfer_id: transfer.data.id,
+    transfer_status: transfer.data.status ?? null,
+    ledger_balance_brl: newBalance,
+    message: `Saque de R$ ${amount.toFixed(2).replace('.', ',')} enviado para sua chave PIX.`,
   });
 });
 
@@ -276,8 +421,7 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
     .eq('active', true)
     .maybeSingle();
 
-  const connectReady =
-    Boolean(site.stripe_connect_account_id) && Boolean(site.stripe_connect_charges_enabled);
+  const paymentsReady = clubPaymentsReady();
 
   res.json({
     store: {
@@ -296,8 +440,8 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
           name: plan.name,
           description: plan.description,
           price_brl: Number(plan.price_brl),
-          payment_link_url: plan.payment_link_url,
-          available: connectReady,
+          payment_link_url: plan.payment_link_url || clubClientPortalUrl(slug),
+          available: paymentsReady,
         }
       : null,
     booking_url: `${(process.env.FRONTEND_URL || 'https://wagoobot.com').replace(/\/$/, '')}/a/${slug}`,
@@ -454,7 +598,7 @@ router.get('/public/:slug/member', async (req: Request, res: Response) => {
   });
 });
 
-/** Cadastro + Checkout mensal (cartão) — exige OTP no WhatsApp. */
+/** Cadastro + Checkout mensal Asaas — exige OTP no WhatsApp. */
 router.post('/public/:slug/subscribe', express.json(), async (req: Request, res: Response) => {
   const slug = String(req.params.slug || '').trim();
   const clientName = String(req.body?.name ?? req.body?.client_name ?? '').trim();
@@ -491,8 +635,7 @@ router.post('/public/:slug/subscribe', express.json(), async (req: Request, res:
     });
   }
 
-  const connectId = site.stripe_connect_account_id as string | null;
-  if (!connectId || !site.stripe_connect_charges_enabled) {
+  if (!clubPaymentsReady()) {
     return res.status(400).json({ error: 'Este salão ainda não aceita pagamento do clube.' });
   }
 
@@ -503,7 +646,7 @@ router.post('/public/:slug/subscribe', express.json(), async (req: Request, res:
     .eq('active', true)
     .maybeSingle();
 
-  if (!plan?.stripe_price_id) {
+  if (!plan || Number(plan.price_brl) < 1) {
     return res.status(400).json({ error: 'Clube não está disponível nesta loja.' });
   }
 
@@ -560,10 +703,10 @@ router.post('/public/:slug/subscribe', express.json(), async (req: Request, res:
     memberId = created.id;
   }
 
-  const checkout = await createClubCheckoutSession({
+  const checkout = await createClubAsaasCheckout({
     plan: plan as ClubPlanRow,
-    connectAccountId: connectId,
     slug,
+    storeName: String(site.store_name || ''),
     clientName,
     clientPhone,
     clientEmail,
@@ -571,7 +714,7 @@ router.post('/public/:slug/subscribe', express.json(), async (req: Request, res:
   });
 
   if (!checkout.ok) return res.status(500).json({ error: checkout.error });
-  res.json({ checkout_url: checkout.url, member_id: memberId });
+  res.json({ checkout_url: checkout.url, member_id: memberId, provider: 'asaas' });
 });
 
 export default router;

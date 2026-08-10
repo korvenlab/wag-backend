@@ -3,6 +3,17 @@ import { supabase } from '../lib/supabase';
 import { stripe, frontendBaseUrl } from '../lib/stripeClient';
 import { WAGOO_APPLICATION_FEE_PERCENT, brlToCents } from '../lib/connectFees';
 import { log } from '../lib/logger';
+import {
+  asaasCancelSubscription,
+  asaasConfigured,
+  asaasCreateCustomer,
+  asaasCreateSubscription,
+  asaasGetPayment,
+  asaasListSubscriptionPayments,
+  todayIsoDateSaoPaulo,
+  type AsaasPayment,
+} from '../lib/asaasClient';
+import { creditClubLedgerFromPayment } from '../lib/clubLedger';
 
 export type ClubPlanRow = {
   id: string;
@@ -15,6 +26,7 @@ export type ClubPlanRow = {
   stripe_price_id: string | null;
   stripe_payment_link_id: string | null;
   payment_link_url: string | null;
+  asaas_external_ref?: string | null;
 };
 
 function digitsPhone(raw: string): string {
@@ -28,7 +40,11 @@ export function clubClientPortalUrl(slug: string): string {
   return `${base}/a/${encodeURIComponent(slug)}/cliente`;
 }
 
-/** Garante Product + Price recorrente + Payment Link na conta Connect. */
+export function clubPaymentsReady(): boolean {
+  return asaasConfigured();
+}
+
+/** @deprecated Stripe Connect — mantido só para membros legados. */
 export async function ensureClubStripeAssets(opts: {
   plan: ClubPlanRow;
   connectAccountId: string;
@@ -73,7 +89,6 @@ export async function ensureClubStripeAssets(opts: {
       );
     }
 
-    // Novo Price se valor mudou ou ainda não existe
     let priceId = plan.stripe_price_id;
     let needNewPrice = !priceId;
     if (priceId) {
@@ -105,7 +120,6 @@ export async function ensureClubStripeAssets(opts: {
       priceId = price.id;
     }
 
-    // Payment Link (cartão, recorrente) — link compartilhável
     let linkId = plan.stripe_payment_link_id;
     let linkUrl = plan.payment_link_url;
 
@@ -178,6 +192,92 @@ export async function ensureClubStripeAssets(opts: {
   }
 }
 
+/** Checkout Asaas: assinatura mensal na conta Wagoo + URL da 1ª fatura. */
+export async function createClubAsaasCheckout(opts: {
+  plan: ClubPlanRow;
+  slug: string;
+  storeName: string;
+  clientName: string;
+  clientPhone: string;
+  clientEmail?: string | null;
+  memberId: string;
+}): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+  if (!asaasConfigured()) {
+    return { ok: false, error: 'Pagamentos do clube temporariamente indisponíveis.' };
+  }
+
+  const price = Math.round(Number(opts.plan.price_brl) * 100) / 100;
+  if (price < 1) return { ok: false, error: 'Valor do clube inválido.' };
+
+  const phone = digitsPhone(opts.clientPhone);
+  const externalRef = `club_member:${opts.memberId}`.slice(0, 100);
+
+  const customer = await asaasCreateCustomer({
+    name: opts.clientName,
+    email: opts.clientEmail,
+    mobilePhone: phone,
+    externalReference: externalRef,
+  });
+  if (!customer.ok) return { ok: false, error: customer.error };
+
+  // Cancela assinatura Asaas anterior pendente deste membro (evita duplicar)
+  const { data: memberRow } = await supabase
+    .from('club_members')
+    .select('asaas_subscription_id')
+    .eq('id', opts.memberId)
+    .maybeSingle();
+  if (memberRow?.asaas_subscription_id) {
+    await asaasCancelSubscription(String(memberRow.asaas_subscription_id));
+  }
+
+  const description = `${opts.plan.name} — ${opts.storeName || 'Salão'}`.slice(0, 400);
+  const sub = await asaasCreateSubscription({
+    customerId: customer.data.id,
+    value: price,
+    nextDueDate: todayIsoDateSaoPaulo(),
+    description,
+    externalReference: externalRef,
+    cycle: 'MONTHLY',
+  });
+  if (!sub.ok) return { ok: false, error: sub.error };
+
+  await supabase
+    .from('club_members')
+    .update({
+      asaas_customer_id: customer.data.id,
+      asaas_subscription_id: sub.data.id,
+      status: 'pending',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', opts.memberId);
+
+  let checkoutUrl =
+    (sub.data.paymentLink && String(sub.data.paymentLink)) ||
+    '';
+
+  if (!checkoutUrl) {
+    // Aguarda fatura da 1ª cobrança
+    for (let i = 0; i < 5 && !checkoutUrl; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, 400));
+      const payments = await asaasListSubscriptionPayments(sub.data.id);
+      if (!payments.ok) continue;
+      const first = payments.data.find((p) => p.invoiceUrl) || payments.data[0];
+      if (first?.invoiceUrl) checkoutUrl = first.invoiceUrl;
+    }
+  }
+
+  if (!checkoutUrl) {
+    const portal = clubClientPortalUrl(opts.slug);
+    return {
+      ok: false,
+      error: `Assinatura criada, mas a fatura ainda não está pronta. Tente de novo em instantes ou abra ${portal}.`,
+    };
+  }
+
+  return { ok: true, url: checkoutUrl };
+}
+
+/** @deprecated Stripe Connect checkout */
 export async function createClubCheckoutSession(opts: {
   plan: ClubPlanRow;
   connectAccountId: string;
@@ -225,7 +325,7 @@ export async function createClubCheckoutSession(opts: {
     if (!session.url) return { ok: false, error: 'Não foi possível abrir o pagamento.' };
     return { ok: true, url: session.url };
   } catch (err) {
-    log.error('CLUB', 'checkout falhou', err, { memberId: opts.memberId });
+    log.error('CLUB', 'checkout Stripe falhou', err, { memberId: opts.memberId });
     const message = err instanceof Error ? err.message : 'Falha no Checkout.';
     return { ok: false, error: message };
   }
@@ -362,12 +462,117 @@ export async function handleClubSubscriptionEvent(
   });
 }
 
+function parseClubMemberExternalRef(ref: string | null | undefined): string | null {
+  const raw = String(ref || '');
+  const m = raw.match(/^club_member:([0-9a-f-]{36})$/i);
+  return m?.[1] || null;
+}
+
+function periodFromPayment(payment: AsaasPayment): {
+  start: string;
+  end: string;
+} {
+  const paidRaw =
+    payment.paymentDate || payment.clientPaymentDate || payment.dueDate || null;
+  const start = paidRaw ? new Date(`${paidRaw}T12:00:00-03:00`) : new Date();
+  if (Number.isNaN(start.getTime())) {
+    const now = new Date();
+    const end = new Date(now);
+    end.setMonth(end.getMonth() + 1);
+    return { start: now.toISOString(), end: end.toISOString() };
+  }
+  const end = new Date(start);
+  end.setMonth(end.getMonth() + 1);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+/** Webhook Asaas: pagamento confirmado da assinatura do clube. */
+export async function handleAsaasClubPaymentEvent(
+  payment: AsaasPayment,
+  eventType: string,
+): Promise<void> {
+  const status = String(payment.status || '').toUpperCase();
+  const paidOk =
+    status === 'RECEIVED' ||
+    status === 'CONFIRMED' ||
+    status === 'RECEIVED_IN_CASH';
+
+  if (!paidOk && !/PAYMENT_(RECEIVED|CONFIRMED)/i.test(eventType)) {
+    return;
+  }
+
+  const memberIdFromRef = parseClubMemberExternalRef(payment.externalReference);
+  let memberQuery = supabase
+    .from('club_members')
+    .select('id, profile_id, club_plan_id, asaas_subscription_id, status');
+
+  if (memberIdFromRef) {
+    memberQuery = memberQuery.eq('id', memberIdFromRef);
+  } else if (payment.subscription) {
+    memberQuery = memberQuery.eq('asaas_subscription_id', payment.subscription);
+  } else {
+    return;
+  }
+
+  const { data: member } = await memberQuery.maybeSingle();
+  if (!member?.id || !member.profile_id) {
+    log.warn('CLUB', 'pagamento Asaas sem membro', {
+      paymentId: payment.id,
+      ref: payment.externalReference,
+    });
+    return;
+  }
+
+  const { start, end } = periodFromPayment(payment);
+
+  await supabase
+    .from('club_members')
+    .update({
+      status: 'active',
+      asaas_last_payment_id: payment.id,
+      asaas_subscription_id: payment.subscription || member.asaas_subscription_id,
+      current_period_start: start,
+      current_period_end: end,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', member.id);
+
+  const gross = Number(payment.value) || 0;
+  if (gross > 0) {
+    await creditClubLedgerFromPayment({
+      profileId: String(member.profile_id),
+      clubMemberId: String(member.id),
+      grossBrl: gross,
+      asaasPaymentId: payment.id,
+      description: 'Mensalidade clube (Asaas)',
+    });
+  }
+
+  log.info('CLUB', 'membro ativado via Asaas', {
+    memberId: member.id,
+    paymentId: payment.id,
+    eventType,
+  });
+}
+
+/** Resolve payment id do webhook e processa. */
+export async function handleAsaasClubWebhookPayload(payload: {
+  event?: string;
+  payment?: AsaasPayment;
+}): Promise<void> {
+  const event = String(payload.event || '');
+  let payment = payload.payment;
+  if (!payment?.id) return;
+
+  // Garante dados frescos
+  const fresh = await asaasGetPayment(payment.id);
+  if (fresh.ok) payment = fresh.data;
+
+  await handleAsaasClubPaymentEvent(payment, event);
+}
+
 export { digitsPhone };
 
-/**
- * Membro com assinatura ativa (e período ainda válido).
- * Usado para liberar agendamento sem sinal no WhatsApp e na Agenda Web.
- */
 function phoneLookupVariants(raw: string): string[] {
   const d = digitsPhone(raw);
   if (!d) return [];
@@ -402,7 +607,6 @@ export async function findActiveClubMemberByPhone(
 
   const end = data.current_period_end ? new Date(data.current_period_end) : null;
   if (end && !Number.isNaN(end.getTime()) && end.getTime() < Date.now()) {
-    // Período vencido — marca past_due leve (não cancela assinatura Stripe aqui)
     await supabase
       .from('club_members')
       .update({ status: 'past_due', updated_at: new Date().toISOString() })
@@ -428,4 +632,3 @@ export async function findActiveClubMemberByPhone(
     days_left,
   };
 }
-
