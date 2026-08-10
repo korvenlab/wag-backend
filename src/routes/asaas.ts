@@ -8,19 +8,21 @@ const router = Router();
  * Webhook Asaas (conta plataforma).
  * Configure no painel Asaas: URL https://<api>/api/asaas/webhook
  * Eventos: PAYMENT_RECEIVED, PAYMENT_CONFIRMED
- * Header opcional: asaas-access-token = ASAAS_WEBHOOK_TOKEN
+ * Header obrigatório: asaas-access-token = ASAAS_WEBHOOK_TOKEN
  */
 router.post('/webhook', express.json({ limit: '2mb' }), async (req: Request, res: Response) => {
   const expected = String(process.env.ASAAS_WEBHOOK_TOKEN || '').trim();
-  if (expected) {
-    const got =
-      String(req.headers['asaas-access-token'] || '') ||
-      String(req.headers['asaas-access-token'.toLowerCase()] || '') ||
-      String(req.query.token || '');
-    if (got !== expected) {
-      log.warn('ASAAS', 'webhook token inválido');
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+  if (!expected) {
+    log.error('ASAAS', 'ASAAS_WEBHOOK_TOKEN não configurado — webhook recusado');
+    return res.status(503).json({ error: 'Webhook não configurado.' });
+  }
+
+  const got =
+    String(req.headers['asaas-access-token'] || '') ||
+    String(req.query.token || '');
+  if (got !== expected) {
+    log.warn('ASAAS', 'webhook token inválido');
+    return res.status(401).json({ error: 'Unauthorized' });
   }
 
   try {

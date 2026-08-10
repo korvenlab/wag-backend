@@ -564,8 +564,16 @@ export async function handleAsaasClubWebhookPayload(payload: {
   let payment = payload.payment;
   if (!payment?.id) return;
 
+  // Sempre revalida no Asaas — nunca confiar só no body do webhook.
   const fresh = await asaasGetPayment(payment.id);
-  if (fresh.ok) payment = fresh.data;
+  if (!fresh.ok) {
+    log.warn('CLUB', 'webhook: pagamento não encontrado no Asaas', {
+      paymentId: payment.id,
+      error: fresh.error,
+    });
+    return;
+  }
+  payment = fresh.data;
 
   const ref = String(payment.externalReference || '');
   const depositMatch = ref.match(/^booking_deposit:([0-9a-f-]{36})$/i);

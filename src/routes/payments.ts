@@ -4,9 +4,12 @@ import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 import { profileHasWagooAccess } from '../lib/profileAccess';
 import { asaasConfigured, asaasTransferPix } from '../lib/asaasClient';
 import {
-  debitClubLedgerForPayout,
+  finalizeClubLedgerPayout,
   getClubLedgerBalance,
   clubNetFromGross,
+  newPayoutHoldId,
+  releaseClubLedgerPayout,
+  reserveClubLedgerPayout,
 } from '../lib/clubLedger';
 import {
   WAGOO_APPLICATION_FEE_PERCENT,
@@ -223,6 +226,21 @@ router.post('/me/payout', express.json(), async (req: Request, res: Response) =>
     });
   }
 
+  // Débito-primeiro (atômico): impede dois saques concorrentes com o mesmo saldo.
+  const holdId = newPayoutHoldId();
+  const reserved = await reserveClubLedgerPayout({
+    profileId: gate.userId,
+    amountBrl: amount,
+    holdId,
+    description: 'Saque PIX',
+  });
+  if (!reserved.ok) {
+    return res.status(400).json({
+      error: reserved.error,
+      ledger_balance_brl: reserved.balance ?? balance,
+    });
+  }
+
   const transfer = await asaasTransferPix({
     value: amount,
     pixAddressKey: pixKey,
@@ -230,22 +248,20 @@ router.post('/me/payout', express.json(), async (req: Request, res: Response) =>
     description: 'Repasse Wagoo',
   });
 
-  if (!transfer.ok) return res.status(502).json({ error: transfer.error });
+  if (!transfer.ok) {
+    await releaseClubLedgerPayout({ profileId: gate.userId, holdId });
+    return res.status(502).json({ error: transfer.error });
+  }
 
-  const debited = await debitClubLedgerForPayout({
+  const finalized = await finalizeClubLedgerPayout({
     profileId: gate.userId,
-    amountBrl: amount,
+    holdId,
     asaasTransferId: transfer.data.id,
-    description: 'Saque PIX',
   });
-
-  if (!debited.ok) {
-    log.error('PAY', 'transfer ok mas ledger debit falhou', null, {
+  if (!finalized.ok) {
+    log.error('PAY', 'PIX ok mas finalize ledger falhou', null, {
       transferId: transfer.data.id,
-    });
-    return res.status(500).json({
-      error: 'Transferência enviada, mas falhou o registro interno. Contate o suporte.',
-      transfer_id: transfer.data.id,
+      holdId,
     });
   }
 
