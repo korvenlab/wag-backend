@@ -756,7 +756,7 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
   const site = await loadPublishedSite(slug);
   if (!site) return res.status(404).json({ error: 'Agenda não encontrada ou não publicada.' });
 
-  const [{ data: services }, { data: providers }] = await Promise.all([
+  const [{ data: services }, { data: providers }, { data: clubPlan }] = await Promise.all([
     supabase
       .from('booking_services')
       .select('id, name, description, price_brl, duration_minutes, image_url')
@@ -769,11 +769,25 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
       .eq('profile_id', site.id)
       .eq('active', true)
       .order('sort_order', { ascending: true }),
+    supabase
+      .from('club_plans')
+      .select('id, name, description, price_brl, active')
+      .eq('profile_id', site.id)
+      .eq('active', true)
+      .maybeSingle(),
   ]);
 
   res.setHeader('Cache-Control', 'no-store');
   const depositRequired = siteRequiresDeposit(site);
   const depositPercent = Number(site.booking_deposit_percent) || 30;
+  const clubTierOk = tierSupportsClub(profileSubscriptionTier(site));
+  const connectReady =
+    Boolean(site.stripe_connect_account_id) && Boolean(site.stripe_connect_charges_enabled);
+  const clubPortal =
+    clubTierOk && site.booking_slug
+      ? `${frontendBase()}/a/${site.booking_slug}/cliente`
+      : null;
+
   res.json({
     store_name: site.store_name || 'Negócio',
     slug: site.booking_slug,
@@ -785,9 +799,16 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
     working_hours: site.working_hours ?? null,
     services: services ?? [],
     providers: providers ?? [],
-    club_portal_url:
-      tierSupportsClub(profileSubscriptionTier(site)) && site.booking_slug
-        ? `${frontendBase()}/a/${site.booking_slug}/cliente`
+    club_portal_url: clubPortal,
+    club:
+      clubTierOk && clubPlan
+        ? {
+            name: clubPlan.name,
+            description: clubPlan.description || '',
+            price_brl: Number(clubPlan.price_brl),
+            available: connectReady,
+            subscribe_url: clubPortal,
+          }
         : null,
     deposit: {
       required: depositRequired,
