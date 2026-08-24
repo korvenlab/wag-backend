@@ -16,6 +16,15 @@ import {
   monthRangeIsoBR,
   pickBarberTotalFromAnalytics,
 } from '../lib/barberCommissionShare';
+import {
+  buildCommissionWhatsAppMessage,
+  clearCommissionPayout,
+  loadBarberCommissionSnapshots,
+  loadPayoutForBarberMonth,
+  markCommissionPayout,
+  periodLabel,
+  toPublicPayout,
+} from '../lib/barberCommissionPayout';
 import { foldName } from '../lib/csvCommissionExport';
 import { buildAnalyticsSummaryPayload } from './analytics';
 import { frontendBaseUrl } from '../lib/stripeClient';
@@ -32,6 +41,15 @@ dayjs.extend(timezone);
 const router = express.Router();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function parseYearMonthQuery(req: Request): { year: number; month: number } {
+  const now = currentYearMonthBR();
+  let year = Number(req.query.year);
+  let month = Number(req.query.month);
+  if (!Number.isFinite(year) || year < 2000 || year > 2100) year = now.year;
+  if (!Number.isFinite(month) || month < 1 || month > 12) month = now.month;
+  return { year, month };
+}
 
 async function requireAuth(req: Request) {
   return getUserFromBearerHeader(supabase, req.headers.authorization);
@@ -67,6 +85,23 @@ router.get('/', async (req: Request, res: Response) => {
   }
 
   const ctx = await loadTeamContext(auth.user.id);
+  const { year, month } = parseYearMonthQuery(req);
+  const includeCommission = req.query.commission === '1' || req.query.commission === 'true';
+
+  let commission_period: { year: number; month: number; label: string } | undefined;
+  let commission_by_barber:
+    | Record<string, { final_amount_brl: number; payout: ReturnType<typeof toPublicPayout> }>
+    | undefined;
+
+  if (includeCommission && ctx.can_manage_team && ctx.barbeiros.length > 0) {
+    commission_period = { year, month, label: periodLabel(year, month) };
+    commission_by_barber = await loadBarberCommissionSnapshots({
+      profileId: auth.user.id,
+      barbeiros: ctx.barbeiros,
+      year,
+      month,
+    });
+  }
 
   res.json({
     subscription_tier: ctx.tier,
@@ -77,6 +112,8 @@ router.get('/', async (req: Request, res: Response) => {
     can_manage_team: ctx.can_manage_team,
     can_add_team_member: ctx.can_add_team_member,
     plan_label: ctx.plan_label,
+    commission_period,
+    commission_by_barber,
   });
 });
 
@@ -239,6 +276,158 @@ router.delete('/:id/commission-share', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+/** Resumo do mês para copiar mensagem WhatsApp (dono autenticado). */
+router.get('/:id/commission-summary', async (req: Request, res: Response) => {
+  const auth = await requireAuth(req);
+  if (!auth.ok) {
+    return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
+  }
+
+  const ctx = await loadTeamContext(auth.user.id);
+  if (!ctx.can_manage_team) {
+    return res.status(403).json({
+      error: 'upgrade_required',
+      message: 'Gerenciar equipe está disponível nos planos Pro e Pro+.',
+    });
+  }
+
+  const id = String(req.params.id);
+  const barbeiro = ctx.barbeiros.find((b) => b.id === id);
+  if (!barbeiro) {
+    return res.status(404).json({ error: 'Profissional não encontrado.' });
+  }
+
+  const { year, month } = parseYearMonthQuery(req);
+  const token = barbeiro.commission_share_token;
+  if (!token) {
+    return res.status(400).json({
+      error: 'no_share_link',
+      message: 'Gere o link de comissão antes de copiar a mensagem.',
+    });
+  }
+
+  const { from, to } = monthRangeIsoBR(year, month);
+  const analytics = await buildAnalyticsSummaryPayload(auth.user.id, from, to);
+  const row = pickBarberTotalFromAnalytics(analytics.barbers, barbeiro.nome);
+  const payoutRow = await loadPayoutForBarberMonth({ barbeiroId: id, year, month });
+
+  const base = frontendBaseUrl() || '';
+  const sharePath = `/comissao/${token}`;
+  const shareUrl = base ? `${base}${sharePath}` : sharePath;
+  const label = periodLabel(year, month);
+  const finalAmount = row?.final_amount_brl ?? 0;
+
+  res.json({
+    profissional: barbeiro.nome,
+    period: { year, month, label },
+    final_amount_brl: finalAmount,
+    share_url: shareUrl,
+    payout: toPublicPayout(payoutRow),
+    whatsapp_message: buildCommissionWhatsAppMessage({
+      profissional: barbeiro.nome,
+      periodLabel: label,
+      finalAmountBrl: finalAmount,
+      shareUrl,
+    }),
+  });
+});
+
+/** Marca repasse manual como pago para o mês. */
+router.post('/:id/commission-payout', async (req: Request, res: Response) => {
+  const auth = await requireAuth(req);
+  if (!auth.ok) {
+    return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
+  }
+
+  const ctx = await loadTeamContext(auth.user.id);
+  if (!ctx.can_manage_team) {
+    return res.status(403).json({
+      error: 'upgrade_required',
+      message: 'Gerenciar equipe está disponível nos planos Pro e Pro+.',
+    });
+  }
+
+  const id = String(req.params.id);
+  const barbeiro = ctx.barbeiros.find((b) => b.id === id);
+  if (!barbeiro) {
+    return res.status(404).json({ error: 'Profissional não encontrado.' });
+  }
+
+  const year = Number(req.body?.year ?? req.query?.year);
+  const month = Number(req.body?.month ?? req.query?.month);
+  const now = currentYearMonthBR();
+  const y = Number.isFinite(year) && year >= 2000 && year <= 2100 ? year : now.year;
+  const m = Number.isFinite(month) && month >= 1 && month <= 12 ? month : now.month;
+
+  let amountBrl: number | null = null;
+  if (req.body?.amount_brl != null || req.body?.amountBrl != null) {
+    const raw = Number(req.body?.amount_brl ?? req.body?.amountBrl);
+    if (!Number.isFinite(raw) || raw < 0) {
+      return res.status(400).json({ error: 'Valor do repasse inválido.' });
+    }
+    amountBrl = Math.round(raw * 100) / 100;
+  } else {
+    const { from, to } = monthRangeIsoBR(y, m);
+    const analytics = await buildAnalyticsSummaryPayload(auth.user.id, from, to);
+    const row = pickBarberTotalFromAnalytics(analytics.barbers, barbeiro.nome);
+    amountBrl = row?.final_amount_brl ?? 0;
+  }
+
+  const payout = await markCommissionPayout({
+    profileId: auth.user.id,
+    barbeiroId: id,
+    year: y,
+    month: m,
+    amountBrl,
+    note: req.body?.note != null ? String(req.body.note) : '',
+  });
+
+  if (!payout) {
+    return res.status(500).json({ error: 'Não foi possível registrar o repasse.' });
+  }
+
+  res.json({
+    ok: true,
+    period: { year: y, month: m, label: periodLabel(y, m) },
+    payout: toPublicPayout(payout),
+  });
+});
+
+/** Remove marcação de repasse pago. */
+router.delete('/:id/commission-payout', async (req: Request, res: Response) => {
+  const auth = await requireAuth(req);
+  if (!auth.ok) {
+    return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
+  }
+
+  const ctx = await loadTeamContext(auth.user.id);
+  if (!ctx.can_manage_team) {
+    return res.status(403).json({
+      error: 'upgrade_required',
+      message: 'Gerenciar equipe está disponível nos planos Pro e Pro+.',
+    });
+  }
+
+  const id = String(req.params.id);
+  if (!ctx.barbeiros.some((b) => b.id === id)) {
+    return res.status(404).json({ error: 'Profissional não encontrado.' });
+  }
+
+  const { year, month } = parseYearMonthQuery(req);
+  const ok = await clearCommissionPayout({
+    profileId: auth.user.id,
+    barbeiroId: id,
+    year,
+    month,
+  });
+
+  if (!ok) {
+    return res.status(500).json({ error: 'Não foi possível desfazer o repasse.' });
+  }
+
+  res.json({ ok: true });
+});
+
 /**
  * Página pública do profissional: só os ganhos dele no mês.
  * Sem autenticação — o token é o segredo.
@@ -271,7 +460,7 @@ router.get('/public/commission/:token', async (req: Request, res: Response) => {
   const { from, to } = monthRangeIsoBR(year, month);
   const ownerId = String(barbeiro.user_id);
 
-  const [team, analytics, profile, agendaAppointments] = await Promise.all([
+  const [team, analytics, profile, agendaAppointments, payoutRow] = await Promise.all([
     listAllBarbeirosForUser(ownerId),
     buildAnalyticsSummaryPayload(ownerId, from, to),
     supabase
@@ -285,6 +474,11 @@ router.get('/public/commission/:token', async (req: Request, res: Response) => {
       barberName: String(barbeiro.nome),
       from,
       to,
+    }),
+    loadPayoutForBarberMonth({
+      barbeiroId: String(barbeiro.id),
+      year,
+      month,
     }),
   ]);
 
@@ -352,6 +546,7 @@ router.get('/public/commission/:token', async (req: Request, res: Response) => {
     month,
     analyticsRow,
     appointments,
+    payout: toPublicPayout(payoutRow),
   });
 
   res.json(payload);

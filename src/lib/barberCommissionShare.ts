@@ -8,6 +8,7 @@ import {
   type BarberPeriodTotal,
 } from './csvCommissionExport';
 import type { BarbeiroRow } from './barbeiros';
+import type { CommissionPayoutPublic } from './barberCommissionPayout';
 import { supabase } from './supabase';
 
 dayjs.extend(utc);
@@ -59,6 +60,8 @@ export type PublicBarberCommissionPayload = {
   appointments: PublicScheduleAppointment[];
   /** Dias do mês (YYYY-MM-DD) que têm pelo menos 1 horário. */
   busy_days: string[];
+  /** Repasse manual marcado pelo dono. */
+  payout: CommissionPayoutPublic;
 };
 
 const MONTH_LABELS = [
@@ -193,8 +196,9 @@ export function buildPublicBarberCommission(opts: {
   /** Linha já calculada pelo Analytics (fonte da verdade). */
   analyticsRow: BarberPeriodTotal | null;
   appointments?: PublicScheduleAppointment[];
+  payout?: CommissionPayoutPublic;
 }): PublicBarberCommissionPayload {
-  const { barbeiro, storeName, year, month, analyticsRow, appointments = [] } = opts;
+  const { barbeiro, storeName, year, month, analyticsRow, appointments = [], payout } = opts;
   const busy_days = [...new Set(appointments.map((a) => a.day))].sort();
   const mine = analyticsRow;
 
@@ -215,5 +219,6 @@ export function buildPublicBarberCommission(opts: {
     source: mine?.source ?? 'none',
     appointments,
     busy_days,
+    payout: payout ?? { paid: false, paid_at: null, amount_brl: null, note: null },
   };
 }
