@@ -1112,19 +1112,13 @@ router.get('/dashboard', async (req: Request, res: Response) => {
   }
 });
 
-/** Korven / ferramentas: lista valores distintos de `profiles.role` (evita 404 em GET /api/admin/roles). */
+/** Korven / ferramentas: roles (sem coluna profiles.role em produção — fallback fixo). */
 router.get('/roles', async (_req: Request, res: Response) => {
   try {
-    const { data, error } = await supabase.from('profiles').select('role');
-    if (error) throw error;
-    const seen = new Set<string>();
-    for (const row of (data ?? []) as { role?: string | null }[]) {
-      const v = typeof row.role === 'string' ? row.role.trim() : '';
-      if (v) seen.add(v);
-    }
-    const items = [...seen]
-      .sort((a, b) => a.localeCompare(b))
-      .map((value) => ({ value, label: value }));
+    const items = [
+      { value: 'user', label: 'user' },
+      { value: 'admin', label: 'admin' },
+    ];
     res.status(200).type(JSON_UTF8).json({ ok: true, data: { items } });
   } catch (e: unknown) {
     sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
