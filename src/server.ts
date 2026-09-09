@@ -29,6 +29,10 @@ import { normalizeServicePrices } from './lib/servicePrices';
 import { requireBearerUser, sanitizeProfileForClient } from './lib/requireAuth';
 import { createGoogleOAuthState, verifyGoogleOAuthState } from './lib/googleOAuthState';
 import { log } from './lib/logger';
+import {
+  publishControlPlaneEvent,
+  startControlPlanePublisher,
+} from './services/controlPlanePublisher';
 
 const app = express();
 const port: number = process.env.PORT ? Number(process.env.PORT) : 3000;
@@ -75,6 +79,8 @@ app.use(cors({
     'x-admin-secret',
     'x-api-key',
     'X-API-Key',
+    'Idempotency-Key',
+    'x-admin-actor',
   ],
   credentials: true,
 }));
@@ -445,6 +451,30 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
 
     if (error) throw error;
     log.info('AUTH', 'sync OK', { email: userEmail, userId: id, hasGoogleToken: !!accessToken });
+
+    // Este é o ponto autenticado real chamado pelo frontend após signup/login.
+    // Eventos únicos usam dedupe persistente no outbox; session.started representa cada sync.
+    void publishControlPlaneEvent({
+      eventType: 'user.created',
+      occurredAt: authed.user.created_at,
+      externalUserId: id,
+      email: userEmail,
+      dedupeKey: `user.created:${id}`,
+      payload: { source: 'auth.sync' },
+    });
+    void publishControlPlaneEvent({
+      eventType: 'user.first_login',
+      externalUserId: id,
+      email: userEmail,
+      dedupeKey: `user.first_login:${id}`,
+      payload: { source: 'auth.sync' },
+    });
+    void publishControlPlaneEvent({
+      eventType: 'session.started',
+      externalUserId: id,
+      email: userEmail,
+      payload: { source: 'auth.sync' },
+    });
     res.json({ ok: true });
   } catch (err: any) {
     log.error('AUTH', 'erro na sincronização', err, { email: userEmail, userId: id });
@@ -484,6 +514,7 @@ app.get('/health', (_req, res) =>
 
 app.listen(port, '0.0.0.0', () => {
   log.info('CORE', `API online na porta ${port}`);
+  startControlPlanePublisher();
   pushAdminEvent('core', `API Wagoo inicializada na porta ${port}`, 'online');
   autoReconnectAll().catch((err) => log.error('WA', 'Erro na reconexão automática', err));
   startReminderWorker();

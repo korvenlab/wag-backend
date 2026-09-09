@@ -24,11 +24,77 @@ import {
   handleClubSubscriptionEvent,
 } from '../services/clubMembership';
 import { log } from '../lib/logger';
+import { publishControlPlaneEvent } from '../services/controlPlanePublisher';
 
 dotenv.config();
 const router = express.Router();
 
 router.use('/connect', connectRoutes);
+
+type StripeMetadata = Record<string, string>;
+
+function standardizedMetadata(input: {
+  externalUserId: string;
+  organizationId?: unknown;
+  plan?: unknown;
+  extra?: StripeMetadata;
+}): StripeMetadata {
+  const metadata: StripeMetadata = {
+    product: 'wagoo',
+    external_user_id: input.externalUserId,
+    ...input.extra,
+  };
+  if (typeof input.organizationId === 'string' && input.organizationId.trim()) {
+    metadata.organization_id = input.organizationId.trim();
+  }
+  if (typeof input.plan === 'string' && input.plan.trim()) {
+    metadata.plan = input.plan.trim();
+  }
+  return metadata;
+}
+
+function publishStripeControlPlaneEvent(input: {
+  stripeEvent: Stripe.Event;
+  eventType: 'payment.succeeded' | 'payment.failed' | 'subscription.changed';
+  metadata?: Stripe.Metadata | null;
+  email?: string | null;
+  payload: Record<string, unknown>;
+}): void {
+  const metadata = input.metadata || {};
+  const externalUserId =
+    metadata.external_user_id ||
+    metadata.supabase_user_id ||
+    metadata.profile_id;
+  if (!externalUserId) {
+    log.warn('CONTROL_PLANE', 'evento Stripe sem external_user_id', {
+      stripeEventId: input.stripeEvent.id,
+      eventType: input.eventType,
+    });
+    return;
+  }
+  const organizationId = metadata.organization_id || undefined;
+  const plan = metadata.plan || metadata.plan_tier || null;
+  void publishControlPlaneEvent({
+    eventId: `${input.stripeEvent.id}:${input.eventType}`,
+    eventType: input.eventType,
+    occurredAt: new Date(input.stripeEvent.created * 1000).toISOString(),
+    externalUserId,
+    organizationId,
+    email: input.email,
+    dedupeKey: `stripe:${input.stripeEvent.id}:${input.eventType}`,
+    payload: {
+      stripe_event_id: input.stripeEvent.id,
+      livemode: input.stripeEvent.livemode,
+      metadata: {
+        product: 'wagoo',
+        external_user_id: externalUserId,
+        organization_id: organizationId || null,
+        plan,
+      },
+      ...input.payload,
+    },
+  });
+}
 
 async function applySubscriptionFromStripe(sub: Stripe.Subscription): Promise<void> {
   const userId = sub.metadata?.supabase_user_id;
@@ -115,7 +181,7 @@ async function createCheckoutForTier(req: Request, res: Response, defaultTier: W
       });
     }
 
-    const { email, userId, planTier, plan_tier } = req.body;
+    const { email, userId, planTier, plan_tier, organizationId, organization_id } = req.body;
     const tierRaw = planTier ?? plan_tier ?? defaultTier;
     const tier = normalizeSubscriptionTier(tierRaw);
 
@@ -141,6 +207,15 @@ async function createCheckoutForTier(req: Request, res: Response, defaultTier: W
     }
 
     const frontendUrl = frontendBaseUrl();
+    const metadata = standardizedMetadata({
+      externalUserId: userId,
+      organizationId: organizationId ?? organization_id,
+      plan: tier,
+      extra: {
+        supabase_user_id: userId,
+        plan_tier: tier,
+      },
+    });
     const successPath =
       tier === 'agenda_web'
         ? '/dashboard/agenda-web?checkout=success'
@@ -154,13 +229,11 @@ async function createCheckoutForTier(req: Request, res: Response, defaultTier: W
       mode: 'subscription',
       customer_email: emailNorm,
       client_reference_id: userId,
+      metadata,
       success_url: `${frontendUrl}${successPath}&plan=${tier}`,
       cancel_url: `${frontendUrl}/?checkout=canceled#precos`,
       subscription_data: {
-        metadata: {
-          supabase_user_id: userId,
-          plan_tier: tier,
-        },
+        metadata,
       },
     });
     res.json({ url: session.url, planTier: tier });
@@ -293,6 +366,38 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
       case 'checkout.session.completed':
       case 'checkout.session.async_payment_succeeded': {
         const session = event.data.object as Stripe.Checkout.Session;
+        const checkoutMetadata = {
+          ...(session.metadata || {}),
+          ...(session.client_reference_id
+            ? { external_user_id: session.client_reference_id }
+            : {}),
+        };
+
+        if (
+          event.type === 'checkout.session.async_payment_succeeded' ||
+          session.payment_status === 'paid' ||
+          session.payment_status === 'no_payment_required'
+        ) {
+          publishStripeControlPlaneEvent({
+            stripeEvent: event,
+            eventType: 'payment.succeeded',
+            metadata: checkoutMetadata,
+            email: session.customer_details?.email || session.customer_email,
+            payload: {
+              checkout_session_id: session.id,
+              payment_intent_id:
+                typeof session.payment_intent === 'string'
+                  ? session.payment_intent
+                  : session.payment_intent?.id ?? null,
+              subscription_id:
+                typeof session.subscription === 'string'
+                  ? session.subscription
+                  : session.subscription?.id ?? null,
+              amount_total: session.amount_total,
+              currency: session.currency,
+            },
+          });
+        }
 
         if (session.metadata?.wagoo_payment === 'booking_deposit') {
           await handleBookingDepositCheckout(session);
@@ -338,6 +443,26 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
 
       case 'checkout.session.async_payment_failed': {
         const session = event.data.object as Stripe.Checkout.Session;
+        publishStripeControlPlaneEvent({
+          stripeEvent: event,
+          eventType: 'payment.failed',
+          metadata: {
+            ...(session.metadata || {}),
+            ...(session.client_reference_id
+              ? { external_user_id: session.client_reference_id }
+              : {}),
+          },
+          email: session.customer_details?.email || session.customer_email,
+          payload: {
+            checkout_session_id: session.id,
+            payment_intent_id:
+              typeof session.payment_intent === 'string'
+                ? session.payment_intent
+                : session.payment_intent?.id ?? null,
+            amount_total: session.amount_total,
+            currency: session.currency,
+          },
+        });
         if (session.metadata?.wagoo_payment === 'booking_deposit' && session.metadata.appointment_id) {
           await markBookingPaymentFailed(session.metadata.appointment_id);
         }
@@ -376,8 +501,22 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
         break;
       }
 
+      case 'customer.subscription.created':
       case 'customer.subscription.updated': {
         const sub = event.data.object as Stripe.Subscription;
+        publishStripeControlPlaneEvent({
+          stripeEvent: event,
+          eventType: 'subscription.changed',
+          metadata: sub.metadata,
+          payload: {
+            subscription_id: sub.id,
+            customer_id:
+              typeof sub.customer === 'string' ? sub.customer : sub.customer?.id ?? null,
+            status: sub.status,
+            cancel_at_period_end: sub.cancel_at_period_end,
+            current_period_end: sub.current_period_end,
+          },
+        });
         if (sub.metadata?.wagoo_payment === 'club_membership') {
           await handleClubSubscriptionEvent(sub);
           break;
@@ -388,6 +527,18 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
 
       case 'customer.subscription.deleted': {
         const sub = event.data.object as Stripe.Subscription;
+        publishStripeControlPlaneEvent({
+          stripeEvent: event,
+          eventType: 'subscription.changed',
+          metadata: sub.metadata,
+          payload: {
+            subscription_id: sub.id,
+            customer_id:
+              typeof sub.customer === 'string' ? sub.customer : sub.customer?.id ?? null,
+            status: sub.status,
+            deleted: true,
+          },
+        });
         if (sub.metadata?.wagoo_payment === 'club_membership') {
           await handleClubSubscriptionEvent(sub);
           break;
@@ -413,6 +564,24 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
             subId,
             connectAccountId ? { stripeAccount: connectAccountId } : undefined,
           );
+          publishStripeControlPlaneEvent({
+            stripeEvent: event,
+            eventType: 'payment.succeeded',
+            metadata: sub.metadata,
+            email: inv.customer_email,
+            payload: {
+              invoice_id: inv.id,
+              subscription_id: sub.id,
+              customer_id:
+                typeof inv.customer === 'string' ? inv.customer : inv.customer?.id ?? null,
+              payment_intent_id:
+                typeof inv.payment_intent === 'string'
+                  ? inv.payment_intent
+                  : inv.payment_intent?.id ?? null,
+              amount_paid: inv.amount_paid,
+              currency: inv.currency,
+            },
+          });
           if (sub.metadata?.wagoo_payment === 'club_membership') {
             await handleClubSubscriptionEvent(sub);
             break;
@@ -422,6 +591,44 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req: R
           }
         } catch (e) {
           console.error('[stripe webhook] invoice.payment_succeeded:', e);
+        }
+        break;
+      }
+
+      case 'invoice.payment_failed': {
+        const inv = event.data.object as Stripe.Invoice;
+        const subId =
+          typeof inv.subscription === 'string' ? inv.subscription : inv.subscription?.id ?? null;
+        if (!subId) break;
+        try {
+          const connectAccountId =
+            typeof event.account === 'string' ? event.account : undefined;
+          const sub = await stripe.subscriptions.retrieve(
+            subId,
+            connectAccountId ? { stripeAccount: connectAccountId } : undefined,
+          );
+          publishStripeControlPlaneEvent({
+            stripeEvent: event,
+            eventType: 'payment.failed',
+            metadata: sub.metadata,
+            email: inv.customer_email,
+            payload: {
+              invoice_id: inv.id,
+              subscription_id: sub.id,
+              customer_id:
+                typeof inv.customer === 'string' ? inv.customer : inv.customer?.id ?? null,
+              payment_intent_id:
+                typeof inv.payment_intent === 'string'
+                  ? inv.payment_intent
+                  : inv.payment_intent?.id ?? null,
+              amount_due: inv.amount_due,
+              amount_paid: inv.amount_paid,
+              attempt_count: inv.attempt_count,
+              currency: inv.currency,
+            },
+          });
+        } catch (e) {
+          log.error('STRIPE', 'invoice.payment_failed lookup', e, { invoiceId: inv.id });
         }
         break;
       }

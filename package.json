@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node dist/server.js",
     "build": "tsc",
-    "dev": "ts-node src/server.ts"
+    "dev": "ts-node src/server.ts",
+    "test": "npm run build && node --test dist/lib/controlPlaneSignature.test.js"
   },
   "dependencies": {
     "@google/generative-ai": "latest",

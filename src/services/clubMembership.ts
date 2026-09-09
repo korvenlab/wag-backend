@@ -53,6 +53,10 @@ export async function ensureClubStripeAssets(opts: {
           name: `${plan.name} — ${storeName || 'Salão'}`,
           description: plan.description || undefined,
           metadata: {
+            product: 'wagoo',
+            external_user_id: plan.profile_id,
+            organization_id: plan.profile_id,
+            plan: 'club_membership',
             wagoo_payment: 'club_membership',
             profile_id: plan.profile_id,
             club_plan_id: plan.id,
@@ -95,6 +99,10 @@ export async function ensureClubStripeAssets(opts: {
           unit_amount: priceCents,
           recurring: { interval: 'month' },
           metadata: {
+            product: 'wagoo',
+            external_user_id: plan.profile_id,
+            organization_id: plan.profile_id,
+            plan: 'club_membership',
             wagoo_payment: 'club_membership',
             profile_id: plan.profile_id,
             club_plan_id: plan.id,
@@ -126,12 +134,20 @@ export async function ensureClubStripeAssets(opts: {
           },
           application_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
           metadata: {
+            product: 'wagoo',
+            external_user_id: plan.profile_id,
+            organization_id: plan.profile_id,
+            plan: 'club_membership',
             wagoo_payment: 'club_membership',
             profile_id: plan.profile_id,
             club_plan_id: plan.id,
           },
           subscription_data: {
             metadata: {
+              product: 'wagoo',
+              external_user_id: plan.profile_id,
+              organization_id: plan.profile_id,
+              plan: 'club_membership',
               wagoo_payment: 'club_membership',
               profile_id: plan.profile_id,
               club_plan_id: plan.id,
@@ -194,6 +210,10 @@ export async function createClubCheckoutSession(opts: {
   const portal = clubClientPortalUrl(opts.slug);
   const phone = digitsPhone(opts.clientPhone);
   const meta = {
+    product: 'wagoo',
+    external_user_id: opts.plan.profile_id,
+    organization_id: opts.plan.profile_id,
+    plan: 'club_membership',
     wagoo_payment: 'club_membership',
     profile_id: opts.plan.profile_id,
     club_plan_id: opts.plan.id,

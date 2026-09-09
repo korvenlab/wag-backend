@@ -109,6 +109,10 @@ export async function createBookingDepositCheckout(
     input.cancelPath || `/a/${slugEnc}?pagamento=cancelado&appointment=${appt.id}`;
 
   const meta = {
+    product: 'wagoo',
+    external_user_id: String(input.profileId),
+    organization_id: String(input.profileId),
+    plan: 'booking_deposit',
     wagoo_payment: 'booking_deposit',
     appointment_id: String(appt.id),
     profile_id: String(input.profileId),

@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { publishControlPlaneEvent } from './controlPlanePublisher';
 
 export type AdminApp = 'wagoo' | '2avendas' | 'core';
 export type AdminEventStatus = 'online' | 'degraded' | 'offline';
@@ -20,14 +21,23 @@ export function pushAdminEvent(
   status: AdminEventStatus = 'online'
 ): void {
   const timestamp = new Date().toISOString();
+  const id = randomUUID();
   events.unshift({
-    id: randomUUID(),
+    id,
     timestamp,
     app,
     message,
     status,
   });
   if (events.length > MAX_EVENTS) events.length = MAX_EVENTS;
+
+  void publishControlPlaneEvent({
+    eventId: id,
+    eventType: 'admin.event',
+    occurredAt: timestamp,
+    externalUserId: 'system',
+    payload: { app, message, status },
+  });
 }
 
 export function getAdminEvents(limit = 100): AdminEventRow[] {

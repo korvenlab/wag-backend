@@ -1181,6 +1181,286 @@ router.get('/users', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * Contrato de reconciliação para o control plane. Diferente de /users, pagina direto
+ * no Supabase Auth e devolve cursor explícito sem carregar toda a base em memória.
+ */
+router.get('/sync/users', async (req: Request, res: Response) => {
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const perPage = Math.min(200, Math.max(1, Number(req.query.per_page ?? req.query.limit) || 100));
+  try {
+    const { data, error } = await supabase.auth.admin.listUsers({ page, perPage });
+    if (error) throw error;
+    const authUsers = data?.users ?? [];
+    const profileMap = await getUserProfileMapForAuthUsers(
+      authUsers.map((u) => ({ id: u.id, email: u.email ?? undefined })),
+    );
+    const promoUserIds = await getUserIdsWithPromoRedemption(authUsers.map((u) => u.id));
+    const barbeirosCountMap = await getBarbeirosCountByUserIds(authUsers.map((u) => u.id));
+    const items = authUsers.map((u) =>
+      buildWagooAdminUserRow(
+        u as unknown as {
+          id: string;
+          email?: string;
+          created_at?: string;
+          last_sign_in_at?: string;
+          user_metadata?: Record<string, unknown>;
+          app_metadata?: Record<string, unknown>;
+          banned_until?: string | null;
+        },
+        profileMap,
+        promoUserIds,
+        barbeirosCountMap,
+      ),
+    );
+    res.status(200).type(JSON_UTF8).json({
+      ok: true,
+      data: {
+        items,
+        page,
+        per_page: perPage,
+        next_page: authUsers.length === perPage ? page + 1 : null,
+      },
+    });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
+const CONTROL_PLANE_COMMANDS = [
+  'role.set',
+  'status.set',
+  'plan.set',
+  'access.grant',
+  'user.delete',
+] as const;
+type ControlPlaneCommand = (typeof CONTROL_PLANE_COMMANDS)[number];
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const row = value as Record<string, unknown>;
+    return `{${Object.keys(row)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(row[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+function commandTargetId(body: Record<string, unknown>): string {
+  return normalizeAuthUserId(
+    String(body.external_user_id ?? body.user_id ?? body.id ?? ''),
+  );
+}
+
+async function claimAdminCommand(
+  idempotencyKey: string,
+  command: ControlPlaneCommand,
+  body: Record<string, unknown>,
+): Promise<
+  | { kind: 'claimed'; requestHash: string }
+  | { kind: 'replay'; response: Record<string, unknown> }
+  | { kind: 'conflict'; message: string }
+> {
+  const requestHash = crypto
+    .createHash('sha256')
+    .update(stableJson({ command, body }))
+    .digest('hex');
+  const { error } = await supabase.from('wagoo_admin_command_receipts').insert({
+    idempotency_key: idempotencyKey,
+    command,
+    request_hash: requestHash,
+  });
+  if (!error) return { kind: 'claimed', requestHash };
+  if (error.code !== '23505') throw error;
+
+  const { data, error: readError } = await supabase
+    .from('wagoo_admin_command_receipts')
+    .select('command, request_hash, status, response')
+    .eq('idempotency_key', idempotencyKey)
+    .maybeSingle();
+  if (readError) throw readError;
+  if (!data || data.command !== command || data.request_hash !== requestHash) {
+    return { kind: 'conflict', message: 'Idempotency-Key já usado com outro comando ou body.' };
+  }
+  if (data.status === 'succeeded' && data.response) {
+    return { kind: 'replay', response: data.response as Record<string, unknown> };
+  }
+  return { kind: 'conflict', message: 'Comando com esta Idempotency-Key ainda está em processamento.' };
+}
+
+async function completeAdminCommand(
+  idempotencyKey: string,
+  response: Record<string, unknown>,
+): Promise<void> {
+  const { error } = await supabase
+    .from('wagoo_admin_command_receipts')
+    .update({
+      status: 'succeeded',
+      response,
+      completed_at: new Date().toISOString(),
+    })
+    .eq('idempotency_key', idempotencyKey);
+  if (error) throw error;
+}
+
+async function executeControlPlaneCommand(
+  command: ControlPlaneCommand,
+  body: Record<string, unknown>,
+  req: Request,
+): Promise<Record<string, unknown>> {
+  const id = commandTargetId(body);
+  if (!id) throw new Error('external_user_id é obrigatório.');
+
+  const { data: authData, error: authLookupError } = await supabase.auth.admin.getUserById(id);
+  if (authLookupError || !authData?.user) {
+    throw new Error(`Usuário não encontrado: ${authLookupError?.message || id}`);
+  }
+
+  const actor = getAdminActor(req);
+  const nowIso = new Date().toISOString();
+
+  if (command === 'role.set') {
+    const role = typeof body.role === 'string' ? body.role.trim() : '';
+    if (!role) throw new Error('role é obrigatório.');
+    const { error } = await supabase.auth.admin.updateUserById(id, { app_metadata: { role } });
+    if (error) throw error;
+    const { error: profileError } = await supabase.from('profiles').update({ role }).eq('id', id);
+    if (profileError) throw profileError;
+    pushAdminAudit({ actor, action: command, target: id, timestamp: nowIso, meta: { role } });
+    pushAdminEvent('core', `Control plane atualizou role de ${id}`, 'online');
+    return { ok: true, data: { external_user_id: id, role } };
+  }
+
+  if (command === 'status.set') {
+    const active = body.active ?? (body.status === 'active' ? true : body.status === 'inactive' ? false : undefined);
+    if (typeof active !== 'boolean') throw new Error('active(boolean) ou status(active|inactive) é obrigatório.');
+    const { error } = await supabase.auth.admin.updateUserById(id, {
+      user_metadata: { active },
+    });
+    if (error) throw error;
+    const patch: Record<string, unknown> = { is_active: active };
+    if (active) patch.deleted_at = null;
+    const { error: profileError } = await supabase.from('profiles').update(patch).eq('id', id);
+    if (profileError) throw profileError;
+    pushAdminAudit({ actor, action: command, target: id, timestamp: nowIso, meta: { active } });
+    pushAdminEvent('core', `Control plane atualizou status de ${id}`, active ? 'online' : 'degraded');
+    return { ok: true, data: { external_user_id: id, active } };
+  }
+
+  if (command === 'plan.set') {
+    const rawPlan = body.plan ?? body.subscription_tier ?? body.subscriptionTier;
+    const tier =
+      rawPlan === null || rawPlan === '' || rawPlan === 'none'
+        ? null
+        : normalizeSubscriptionTier(rawPlan);
+    if (rawPlan !== null && rawPlan !== '' && rawPlan !== 'none' && !tier) {
+      throw new Error('plan inválido. Use agenda_web, basic, pro, pro_plus ou none.');
+    }
+    const result = await setProfileSubscriptionTierByUserId(supabase, id, tier);
+    if (!result.ok) throw new Error(result.error);
+    pushAdminAudit({ actor, action: command, target: id, timestamp: nowIso, meta: { plan: tier } });
+    pushAdminEvent('wagoo', `Control plane definiu plano de ${id}`, tier ? 'online' : 'degraded');
+    return { ok: true, data: { external_user_id: id, plan: tier } };
+  }
+
+  if (command === 'access.grant') {
+    const rawDays = body.days ?? body.complimentary_days;
+    const days = Number(rawDays);
+    if (!Number.isInteger(days) || days < 1 || days > 730) {
+      throw new Error('days deve ser inteiro entre 1 e 730; access.grant concede cortesia/promo, não trial.');
+    }
+    const { data: current, error: currentError } = await supabase
+      .from('profiles')
+      .select('complimentary_access_until')
+      .eq('id', id)
+      .maybeSingle();
+    if (currentError) throw currentError;
+    const currentMs = complimentaryUntilToMillis(current?.complimentary_access_until);
+    const baseMs = currentMs && currentMs > Date.now() ? currentMs : Date.now();
+    const complimentaryUntil = new Date(baseMs + days * 86_400_000).toISOString();
+    const row: Record<string, unknown> = {
+      id,
+      complimentary_access_until: complimentaryUntil,
+      is_ai_enabled: true,
+      is_active: true,
+    };
+    if (authData.user.email) row.email = authData.user.email.trim().toLowerCase();
+    const { error: upsertError } = await supabase.from('profiles').upsert(row, { onConflict: 'id' });
+    if (upsertError) throw upsertError;
+    pushAdminAudit({ actor, action: command, target: id, timestamp: nowIso, meta: { days } });
+    pushAdminEvent('wagoo', `Control plane concedeu cortesia a ${id}`, 'online');
+    return {
+      ok: true,
+      data: {
+        external_user_id: id,
+        access_type: 'complimentary',
+        complimentary_access_until: complimentaryUntil,
+      },
+    };
+  }
+
+  const { error } = await supabase.auth.admin.deleteUser(id);
+  if (error) throw error;
+  pushAdminAudit({ actor, action: command, target: id, timestamp: nowIso });
+  pushAdminEvent('core', `Control plane removeu conta ${id}`, 'degraded');
+  return { ok: true, data: { external_user_id: id, deleted: true } };
+}
+
+router.post('/commands/:command', async (req: Request, res: Response) => {
+  const command = String(req.params.command || '') as ControlPlaneCommand;
+  if (!(CONTROL_PLANE_COMMANDS as readonly string[]).includes(command)) {
+    sendApiError(res, 404, 'NOT_FOUND', 'Comando não suportado.');
+    return;
+  }
+  const keyRaw = req.headers['idempotency-key'];
+  const idempotencyKey = (Array.isArray(keyRaw) ? keyRaw[0] : keyRaw)?.trim();
+  if (!idempotencyKey || idempotencyKey.length > 200) {
+    sendApiError(res, 400, 'VALIDATION_ERROR', 'Idempotency-Key é obrigatório (máximo 200 caracteres).');
+    return;
+  }
+  const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+  try {
+    const claim = await claimAdminCommand(idempotencyKey, command, body);
+    if (claim.kind === 'replay') {
+      res.setHeader('Idempotency-Replayed', 'true');
+      res.status(200).type(JSON_UTF8).json(claim.response);
+      return;
+    }
+    if (claim.kind === 'conflict') {
+      sendApiError(res, 409, 'VALIDATION_ERROR', claim.message);
+      return;
+    }
+    let response: Record<string, unknown> | null = null;
+    try {
+      response = await executeControlPlaneCommand(command, body, req);
+      await completeAdminCommand(idempotencyKey, response);
+      res.status(200).type(JSON_UTF8).json(response);
+    } catch (commandError) {
+      // Só libera a chave se a mutação ainda não ocorreu; evita repetir access.grant/delete.
+      if (!response) {
+        await supabase
+          .from('wagoo_admin_command_receipts')
+          .delete()
+          .eq('idempotency_key', idempotencyKey)
+          .eq('status', 'processing');
+      }
+      throw commandError;
+    }
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : String(e);
+    const validation = /obrigat|inválid|deve ser|não trial/i.test(message);
+    const notFound = /não encontrado/i.test(message);
+    sendApiError(
+      res,
+      validation ? 400 : notFound ? 404 : 500,
+      validation ? 'VALIDATION_ERROR' : notFound ? 'NOT_FOUND' : 'INTERNAL_ERROR',
+      message,
+    );
+  }
+});
+
 router.get('/users/:id', async (req: Request, res: Response) => {
   const id = String(req.params.id || '').trim();
   if (!id) {
