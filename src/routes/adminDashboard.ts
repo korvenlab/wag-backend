@@ -771,7 +771,7 @@ function buildWagooAdminUserRow(
 }
 
 const PROFILE_ADMIN_SELECT =
-  'id, email, store_name, is_active, deleted_at, has_paid, complimentary_access_until, multi_barber_plan, subscription_tier, is_ai_enabled, whatsapp_session, googleAuth';
+  'id, email, store_name, has_paid, complimentary_access_until, multi_barber_plan, subscription_tier, is_ai_enabled, whatsapp_session, googleAuth';
 
 type AuthUserLite = { id: string; email?: string };
 
