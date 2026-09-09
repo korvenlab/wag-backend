@@ -1911,6 +1911,262 @@ router.get('/users/:id/assets', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * Korven Admin: dossiê completo do usuário (acesso, cortesia, mensagens, agenda, WhatsApp).
+ * GET /api/admin/users/:id/dossier
+ */
+router.get('/users/:id/dossier', async (req: Request, res: Response) => {
+  const id = String(req.params.id || '').trim();
+  if (!id) {
+    sendApiError(res, 400, 'VALIDATION_ERROR', 'id é obrigatório.');
+    return;
+  }
+  try {
+    const { data, error } = await supabase.auth.admin.getUserById(id);
+    if (error || !data?.user) {
+      sendApiError(res, 404, 'NOT_FOUND', 'Usuário não encontrado.');
+      return;
+    }
+    const authRow = data.user as unknown as {
+      id: string;
+      email?: string;
+      created_at?: string;
+      last_sign_in_at?: string;
+      user_metadata?: Record<string, unknown>;
+      app_metadata?: Record<string, unknown>;
+      banned_until?: string | null;
+    };
+    const profileMap = await getUserProfileMapForAuthUsers([
+      { id: authUser.id, email: authUser.email },
+    ]);
+    const promoUserIds = await getUserIdsWithPromoRedemption([id]);
+    const barbeirosCountMap = await getBarbeirosCountByUserIds([id]);
+    const user = buildWagooAdminUserRow(
+      authUser,
+      profileMap,
+      promoUserIds,
+      barbeirosCountMap,
+    );
+
+    const profile = profileRowForUser(profileMap, id) as Record<string, unknown> | undefined;
+    const email = (user.email || authUser.email || '').trim().toLowerCase();
+
+    const [
+      redemptionsRes,
+      feedbackRes,
+      barbeirosRes,
+      appointmentsRes,
+      assetsRes,
+      profileExtraRes,
+    ] = await Promise.all([
+      supabase
+        .from('wagoo_promo_redemptions')
+        .select('id, promo_link_id, redeemed_at, wagoo_promo_links ( code, label, complimentary_days )')
+        .eq('user_id', id)
+        .order('redeemed_at', { ascending: false })
+        .limit(50),
+      email
+        ? supabase
+            .from('feedback_messages')
+            .select('id, created_at, body, user_email, user_full_name')
+            .or(`user_id.eq.${id},user_email.eq.${email}`)
+            .order('created_at', { ascending: false })
+            .limit(50)
+        : supabase
+            .from('feedback_messages')
+            .select('id, created_at, body, user_email, user_full_name')
+            .eq('user_id', id)
+            .order('created_at', { ascending: false })
+            .limit(50),
+      supabase
+        .from('barbeiros')
+        .select('id, nome, created_at')
+        .eq('user_id', id)
+        .order('created_at', { ascending: false })
+        .limit(50),
+      supabase
+        .from('booking_appointments')
+        .select('id, status, starts_at, created_at, client_name', { count: 'exact' })
+        .eq('profile_id', id)
+        .order('created_at', { ascending: false })
+        .limit(20),
+      supabase
+        .from('user_assets')
+        .select('id, url, created_at')
+        .eq('user_id', id)
+        .order('created_at', { ascending: false })
+        .limit(50),
+      supabase
+        .from('profiles')
+        .select(
+          'is_ai_enabled, whatsapp_session, store_name, googleAuth, complimentary_access_until, has_paid, subscription_tier, multi_barber_plan, role, is_active, deleted_at, created_at, updated_at',
+        )
+        .eq('id', id)
+        .maybeSingle(),
+    ]);
+
+    const promoRedemptions = (redemptionsRes.data ?? []).map((row: Record<string, unknown>) => {
+      const link = (row.wagoo_promo_links && typeof row.wagoo_promo_links === 'object'
+        ? (row.wagoo_promo_links as Record<string, unknown>)
+        : {}) as Record<string, unknown>;
+      return {
+        id: String(row.id || ''),
+        promoLinkId: String(row.promo_link_id || ''),
+        redeemedAt: row.redeemed_at ? String(row.redeemed_at) : null,
+        code: typeof link.code === 'string' ? link.code : null,
+        label: typeof link.label === 'string' ? link.label : null,
+        complimentaryDays:
+          typeof link.complimentary_days === 'number' ? link.complimentary_days : null,
+      };
+    });
+
+    const feedbackMessages = (feedbackRes.error ? [] : feedbackRes.data ?? []).map(
+      (row: Record<string, unknown>) => ({
+        id: String(row.id || ''),
+        createdAt: row.created_at ? String(row.created_at) : null,
+        body: typeof row.body === 'string' ? row.body : '',
+        userEmail: typeof row.user_email === 'string' ? row.user_email : null,
+        userFullName: typeof row.user_full_name === 'string' ? row.user_full_name : null,
+      }),
+    );
+
+    const barbeiros = (barbeirosRes.error ? [] : barbeirosRes.data ?? []).map(
+      (row: Record<string, unknown>) => ({
+        id: String(row.id || ''),
+        name: typeof row.nome === 'string' ? row.nome : '—',
+        createdAt: row.created_at ? String(row.created_at) : null,
+      }),
+    );
+
+    const appointments = (appointmentsRes.error ? [] : appointmentsRes.data ?? []).map(
+      (row: Record<string, unknown>) => ({
+        id: String(row.id || ''),
+        status: typeof row.status === 'string' ? row.status : null,
+        startsAt: row.starts_at ? String(row.starts_at) : null,
+        createdAt: row.created_at ? String(row.created_at) : null,
+        clientName: typeof row.client_name === 'string' ? row.client_name : null,
+      }),
+    );
+
+    const assets = (assetsRes.error ? [] : assetsRes.data ?? []).map(
+      (row: Record<string, unknown>) => ({
+        id: String(row.id || ''),
+        url: typeof row.url === 'string' ? row.url : '',
+        createdAt: row.created_at ? String(row.created_at) : null,
+      }),
+    );
+
+    const extra = (profileExtraRes.data || profile || {}) as Record<string, unknown>;
+    const whatsappSession = extra.whatsapp_session;
+    const whatsappConfigured =
+      whatsappSession != null &&
+      whatsappSession !== '' &&
+      !(typeof whatsappSession === 'object' && whatsappSession !== null && Object.keys(whatsappSession as object).length === 0);
+
+    const timeline: Array<{
+      at: string;
+      kind: string;
+      title: string;
+      detail: string | null;
+    }> = [];
+
+    if (user.createdAt) {
+      timeline.push({
+        at: user.createdAt,
+        kind: 'account',
+        title: 'Conta criada no Wagoo',
+        detail: email || null,
+      });
+    }
+    if (user.lastSignInAt) {
+      timeline.push({
+        at: user.lastSignInAt,
+        kind: 'login',
+        title: 'Último login',
+        detail: null,
+      });
+    }
+    for (const r of promoRedemptions) {
+      if (!r.redeemedAt) continue;
+      timeline.push({
+        at: r.redeemedAt,
+        kind: 'promo',
+        title: 'Resgatou link de cortesia',
+        detail: [r.code, r.label, r.complimentaryDays != null ? `${r.complimentaryDays} dias` : null]
+          .filter(Boolean)
+          .join(' · '),
+      });
+    }
+    for (const m of feedbackMessages) {
+      if (!m.createdAt) continue;
+      timeline.push({
+        at: m.createdAt,
+        kind: 'feedback',
+        title: 'Mensagem de suporte/feedback',
+        detail: m.body.slice(0, 160),
+      });
+    }
+    for (const a of appointments) {
+      if (!a.createdAt) continue;
+      timeline.push({
+        at: a.createdAt,
+        kind: 'booking',
+        title: `Agendamento ${a.status ?? ''}`.trim(),
+        detail: [a.clientName, a.startsAt].filter(Boolean).join(' · ') || null,
+      });
+    }
+    timeline.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+
+    res.status(200).type(JSON_UTF8).json({
+      ok: true,
+      data: {
+        product: 'wagoo',
+        user,
+        access: {
+          hasPaid: user.hasPaid,
+          hasAccess: user.hasAccess,
+          complimentaryAccessUntil: user.complimentary_access_until ?? null,
+          complimentaryViaLink: Boolean(user.complimentaryViaLink),
+          accessOriginSummary: user.accessOriginSummary,
+          accessOriginDetail: user.accessOriginDetail,
+          subscriptionTier: user.subscriptionTier,
+          multiBarberPlan: user.multiBarberPlan,
+          isAiEnabled: Boolean(extra.is_ai_enabled),
+          whatsappConfigured,
+          storeName:
+            typeof extra.store_name === 'string'
+              ? extra.store_name
+              : user.name,
+          googleConnected: Boolean(extra.googleAuth),
+        },
+        counts: {
+          barbeiros: barbeiros.length || user.barbeirosCount || 0,
+          promoRedemptions: promoRedemptions.length,
+          feedbackMessages: feedbackMessages.length,
+          appointments: appointmentsRes.count ?? appointments.length,
+          assets: assets.length,
+        },
+        promoRedemptions,
+        feedbackMessages,
+        barbeiros,
+        appointments,
+        assets,
+        timeline: timeline.slice(0, 80),
+        warnings: [
+          redemptionsRes.error ? `promo: ${redemptionsRes.error.message}` : null,
+          feedbackRes.error ? `feedback: ${feedbackRes.error.message}` : null,
+          barbeirosRes.error ? `barbeiros: ${barbeirosRes.error.message}` : null,
+          appointmentsRes.error ? `appointments: ${appointmentsRes.error.message}` : null,
+          assetsRes.error ? `assets: ${assetsRes.error.message}` : null,
+          profileExtraRes.error ? `profile: ${profileExtraRes.error.message}` : null,
+        ].filter(Boolean),
+      },
+    });
+  } catch (e: unknown) {
+    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
 function generateWagooPromoCode(): string {
   const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
   const buf = crypto.randomBytes(16);
