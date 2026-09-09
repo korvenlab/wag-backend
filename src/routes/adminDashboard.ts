@@ -1927,7 +1927,7 @@ router.get('/users/:id/dossier', async (req: Request, res: Response) => {
       sendApiError(res, 404, 'NOT_FOUND', 'Usuário não encontrado.');
       return;
     }
-    const authRow = data.user as unknown as {
+    const authUser = data.user as unknown as {
       id: string;
       email?: string;
       created_at?: string;
