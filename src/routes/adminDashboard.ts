@@ -771,7 +771,7 @@ function buildWagooAdminUserRow(
 }
 
 const PROFILE_ADMIN_SELECT =
-  'id, email, store_name, role, is_active, deleted_at, has_paid, complimentary_access_until, multi_barber_plan, subscription_tier';
+  'id, email, store_name, is_active, deleted_at, has_paid, complimentary_access_until, multi_barber_plan, subscription_tier, is_ai_enabled, whatsapp_session, googleAuth';
 
 type AuthUserLite = { id: string; email?: string };
 
@@ -1887,28 +1887,8 @@ router.get('/users/:id/assets', async (req: Request, res: Response) => {
     sendApiError(res, 400, 'VALIDATION_ERROR', 'id é obrigatório.');
     return;
   }
-  try {
-    // Tenta fonte dedicada; se não existir tabela, faz fallback para vazio.
-    let items: Array<{ id: string; url: string; createdAt: string | null }> = [];
-    const { data, error } = await supabase
-      .from('user_assets')
-      .select('id, url, created_at')
-      .eq('user_id', id)
-      .order('created_at', { ascending: false })
-      .limit(200);
-
-    if (!error && data) {
-      items = data.map((x: Record<string, unknown>) => ({
-        id: String(x.id || ''),
-        url: String(x.url || ''),
-        createdAt: x.created_at ? String(x.created_at) : null,
-      }));
-    }
-
-    res.status(200).type(JSON_UTF8).json({ ok: true, data: { items } });
-  } catch (e: unknown) {
-    sendApiError(res, 500, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
-  }
+  // Wagoo não tem `user_assets` em produção — devolve lista vazia estável para o Korven.
+  res.status(200).type(JSON_UTF8).json({ ok: true, data: { items: [] as Array<{ id: string; url: string; createdAt: string | null }> } });
 });
 
 /**
@@ -1956,7 +1936,6 @@ router.get('/users/:id/dossier', async (req: Request, res: Response) => {
       feedbackRes,
       barbeirosRes,
       appointmentsRes,
-      assetsRes,
       profileExtraRes,
     ] = await Promise.all([
       supabase
@@ -1991,15 +1970,9 @@ router.get('/users/:id/dossier', async (req: Request, res: Response) => {
         .order('created_at', { ascending: false })
         .limit(20),
       supabase
-        .from('user_assets')
-        .select('id, url, created_at')
-        .eq('user_id', id)
-        .order('created_at', { ascending: false })
-        .limit(50),
-      supabase
         .from('profiles')
         .select(
-          'is_ai_enabled, whatsapp_session, store_name, googleAuth, complimentary_access_until, has_paid, subscription_tier, multi_barber_plan, role, is_active, deleted_at, created_at, updated_at',
+          'is_ai_enabled, whatsapp_session, store_name, googleAuth, complimentary_access_until, has_paid, subscription_tier, multi_barber_plan, is_active, deleted_at',
         )
         .eq('id', id)
         .maybeSingle(),
@@ -2048,13 +2021,7 @@ router.get('/users/:id/dossier', async (req: Request, res: Response) => {
       }),
     );
 
-    const assets = (assetsRes.error ? [] : assetsRes.data ?? []).map(
-      (row: Record<string, unknown>) => ({
-        id: String(row.id || ''),
-        url: typeof row.url === 'string' ? row.url : '',
-        createdAt: row.created_at ? String(row.created_at) : null,
-      }),
-    );
+    const assets: Array<{ id: string; url: string; createdAt: string | null }> = [];
 
     const extra = (profileExtraRes.data || profile || {}) as Record<string, unknown>;
     const whatsappSession = extra.whatsapp_session;
@@ -2157,7 +2124,6 @@ router.get('/users/:id/dossier', async (req: Request, res: Response) => {
           feedbackRes.error ? `feedback: ${feedbackRes.error.message}` : null,
           barbeirosRes.error ? `barbeiros: ${barbeirosRes.error.message}` : null,
           appointmentsRes.error ? `appointments: ${appointmentsRes.error.message}` : null,
-          assetsRes.error ? `assets: ${assetsRes.error.message}` : null,
           profileExtraRes.error ? `profile: ${profileExtraRes.error.message}` : null,
         ].filter(Boolean),
       },
