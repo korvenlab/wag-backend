@@ -325,7 +325,7 @@ export async function tryHandlePresenceConfirmation(input: {
     );
   } else {
     await input.sendReply(
-      `${hello}registramos que você não poderá vir em ${when}. Se quiser remarcar, é só pedir um novo horário.`,
+      `${hello}registramos que você não poderá vir em ${when}. Se quiser remarcar, diga *remarcar* que eu já te mando 3 horários livres.`,
     );
   }
 

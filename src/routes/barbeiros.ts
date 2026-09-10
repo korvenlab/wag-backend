@@ -25,15 +25,20 @@ import {
   periodLabel,
   toPublicPayout,
 } from '../lib/barberCommissionPayout';
+import { sendBarberWeeklyCommissionDigest } from '../lib/barberCommissionDigest';
 import { foldName } from '../lib/csvCommissionExport';
 import { buildAnalyticsSummaryPayload } from './analytics';
 import { frontendBaseUrl } from '../lib/stripeClient';
 import { listCalendarEvents } from '../services/calendar';
 import type { PublicScheduleAppointment } from '../lib/barberCommissionShare';
+import { digitsPhone } from '../services/clubMembership';
 import dayjs from 'dayjs';
 import timezone from 'dayjs/plugin/timezone';
 import utc from 'dayjs/plugin/utc';
 import { BR_TZ } from '../lib/dateTimeBR';
+
+const BARBEIRO_ROW_SELECT =
+  'id, user_id, nome, google_calendar_email, ativo, commission_percent, commission_share_token, whatsapp_phone, commission_digest_enabled, commission_digest_last_sent_at, created_at';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -172,6 +177,14 @@ router.post('/', async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Informe um e-mail válido do Google Agenda.' });
   }
 
+  const phoneRaw = req.body?.whatsapp_phone ?? req.body?.whatsappPhone;
+  const whatsapp_phone = phoneRaw != null && String(phoneRaw).trim() !== ''
+    ? digitsPhone(String(phoneRaw))
+    : null;
+  if (phoneRaw != null && String(phoneRaw).trim() !== '' && (!whatsapp_phone || whatsapp_phone.length < 10)) {
+    return res.status(400).json({ error: 'WhatsApp do profissional inválido.' });
+  }
+
   const { data, error } = await supabase
     .from('barbeiros')
     .insert({
@@ -180,10 +193,10 @@ router.post('/', async (req: Request, res: Response) => {
       google_calendar_email,
       ativo: true,
       commission_percent,
+      whatsapp_phone,
+      commission_digest_enabled: Boolean(req.body?.commission_digest_enabled),
     })
-    .select(
-      'id, user_id, nome, google_calendar_email, ativo, commission_percent, commission_share_token, created_at',
-    )
+    .select(BARBEIRO_ROW_SELECT)
     .single();
 
   if (error) {
@@ -429,6 +442,54 @@ router.delete('/:id/commission-payout', async (req: Request, res: Response) => {
 });
 
 /**
+ * Envia agora o resumo semanal de comissão no WhatsApp do profissional (modo barbeiro).
+ * Body opcional: { force: true } para ignorar janela de segunda / já enviado hoje.
+ */
+router.post('/:id/commission-digest-send', async (req: Request, res: Response) => {
+  const auth = await requireAuth(req);
+  if (!auth.ok) {
+    return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
+  }
+
+  const ctx = await loadTeamContext(auth.user.id);
+  if (!ctx.can_manage_team) {
+    return res.status(403).json({
+      error: 'upgrade_required',
+      message: 'Gerenciar equipe está disponível nos planos Pro e Pro+.',
+    });
+  }
+
+  const id = String(req.params.id);
+  const barbeiro = ctx.barbeiros.find((b) => b.id === id);
+  if (!barbeiro) {
+    return res.status(404).json({ error: 'Profissional não encontrado.' });
+  }
+
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('email')
+    .eq('id', auth.user.id)
+    .maybeSingle();
+  const ownerEmail = profile?.email ? String(profile.email) : auth.user.email;
+  if (!ownerEmail) {
+    return res.status(400).json({ error: 'Conta sem e-mail para sessão WhatsApp.' });
+  }
+
+  const result = await sendBarberWeeklyCommissionDigest({
+    profileId: auth.user.id,
+    ownerEmail,
+    barbeiro,
+    force: Boolean(req.body?.force ?? true),
+  });
+
+  if (!result.ok) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  res.json({ ok: true, message: result.message });
+});
+
+/**
  * Página pública do profissional: só os ganhos dele no mês.
  * Sem autenticação — o token é o segredo.
  */
@@ -441,7 +502,7 @@ router.get('/public/commission/:token', async (req: Request, res: Response) => {
   const { data: barbeiro, error } = await supabase
     .from('barbeiros')
     .select(
-      'id, user_id, nome, google_calendar_email, ativo, commission_percent, commission_share_token, created_at',
+      BARBEIRO_ROW_SELECT,
     )
     .eq('commission_share_token', token)
     .maybeSingle();
@@ -592,6 +653,27 @@ router.patch('/:id', async (req: Request, res: Response) => {
     }
     patch.commission_percent = Math.round(pct * 100) / 100;
   }
+  if (req.body?.whatsapp_phone !== undefined || req.body?.whatsappPhone !== undefined) {
+    const raw = req.body?.whatsapp_phone ?? req.body?.whatsappPhone;
+    if (raw == null || String(raw).trim() === '') {
+      patch.whatsapp_phone = null;
+      patch.commission_digest_enabled = false;
+    } else {
+      const phone = digitsPhone(String(raw));
+      if (!phone || phone.length < 10) {
+        return res.status(400).json({ error: 'WhatsApp do profissional inválido.' });
+      }
+      patch.whatsapp_phone = phone;
+    }
+  }
+  if (
+    req.body?.commission_digest_enabled !== undefined ||
+    req.body?.commissionDigestEnabled !== undefined
+  ) {
+    patch.commission_digest_enabled = Boolean(
+      req.body?.commission_digest_enabled ?? req.body?.commissionDigestEnabled,
+    );
+  }
 
   if (Object.keys(patch).length === 0) {
     return res.status(400).json({ error: 'Nenhum campo para atualizar.' });
@@ -602,9 +684,7 @@ router.patch('/:id', async (req: Request, res: Response) => {
     .update(patch)
     .eq('id', id)
     .eq('user_id', auth.user.id)
-    .select(
-      'id, user_id, nome, google_calendar_email, ativo, commission_percent, commission_share_token, created_at',
-    )
+    .select(BARBEIRO_ROW_SELECT)
     .maybeSingle();
 
   if (error) return res.status(500).json({ error: error.message });

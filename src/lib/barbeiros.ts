@@ -10,15 +10,21 @@ export type BarbeiroRow = {
   commission_percent: number;
   /** Token opaco do link privado de comissão (somente o dono vê no painel). */
   commission_share_token: string | null;
+  /** WhatsApp do profissional (dígitos) para modo barbeiro / digest. */
+  whatsapp_phone: string | null;
+  /** Envia resumo de comissão toda segunda pelo Zap do salão. */
+  commission_digest_enabled: boolean;
+  commission_digest_last_sent_at: string | null;
   created_at?: string;
 };
 
 const BARBEIRO_SELECT =
-  'id, user_id, nome, google_calendar_email, ativo, commission_percent, commission_share_token, created_at';
+  'id, user_id, nome, google_calendar_email, ativo, commission_percent, commission_share_token, whatsapp_phone, commission_digest_enabled, commission_digest_last_sent_at, created_at';
 
 function normalizeBarbeiroRow(row: Record<string, unknown>): BarbeiroRow {
   const pct = Number(row.commission_percent);
   const token = row.commission_share_token;
+  const phone = row.whatsapp_phone;
   return {
     id: String(row.id),
     user_id: String(row.user_id),
@@ -28,6 +34,14 @@ function normalizeBarbeiroRow(row: Record<string, unknown>): BarbeiroRow {
     commission_percent: Number.isFinite(pct) ? Math.min(100, Math.max(0, pct)) : 0,
     commission_share_token:
       token != null && String(token).trim() !== '' ? String(token) : null,
+    whatsapp_phone:
+      phone != null && String(phone).trim() !== ''
+        ? String(phone).replace(/\D/g, '')
+        : null,
+    commission_digest_enabled: Boolean(row.commission_digest_enabled),
+    commission_digest_last_sent_at: row.commission_digest_last_sent_at
+      ? String(row.commission_digest_last_sent_at)
+      : null,
     created_at: row.created_at ? String(row.created_at) : undefined,
   };
 }

@@ -156,6 +156,7 @@ export const hasSchedulingIntent = (
 type AiJsonPayload = {
   isScheduling?: boolean;
   isCancelling?: boolean;
+  isRescheduling?: boolean;
   extractedDate?: string | null;
   extractedTime?: string | null;
   barberSelection?: string | null;
@@ -271,6 +272,7 @@ export const analyzeMessage = async (
         return {
             isScheduling: false,
             isCancelling: false,
+            isRescheduling: false,
             response: null,
             date: null as string | null,
             extractedDate: null as string | null,
@@ -287,6 +289,7 @@ export const analyzeMessage = async (
         return {
             isScheduling: false,
             isCancelling: false,
+            isRescheduling: false,
             response: 'No momento não consigo processar mensagens. A equipa foi avisada.',
             date: null,
             extractedDate: null,
@@ -408,6 +411,9 @@ export const analyzeMessage = async (
         - NUNCA escreva "Confirmado:" — o sistema confirma depois do "sim" do cliente.
         - Quando o cliente escolher um horário, peça confirmação de forma natural no dia certo (ex.: "Posso marcar *amanhã* às *15h*?").
         - isScheduling=true SOMENTE se o cliente já afirmou (sim/confirma/pode marcar) sobre uma proposta.
+        - isRescheduling=true se o cliente quer MUDAR um horário já marcado (remarcar/reagendar/não posso ir / trocar horário), mesmo sem cancelar explicitamente.
+        - Se isRescheduling=true, NÃO use isCancelling sozinho — o sistema cancela o antigo e oferece novos horários.
+        - isCancelling=true só para cancelar sem remarcar.
         - Exemplos de tom (não copie literalmente): "*Amanhã* de manhã tem *9h* e *10h* — qual prefere?" | "Fecho *amanhã* às *15h* então?" | "Temos o *Marcos* e o *Robson* — prefere algum?"
 
         NEGRITO WHATSAPP (obrigatório no campo "response"):
@@ -439,6 +445,7 @@ export const analyzeMessage = async (
         {
             "isScheduling": boolean,
             "isCancelling": boolean,
+            "isRescheduling": boolean,
             "extractedDate": "YYYY-MM-DD ou null",
             "extractedTime": "HH:mm ou null",
             "barberSelection": "nome exacto, SEM_PREFERENCIA ou null",
@@ -513,7 +520,8 @@ export const analyzeMessage = async (
 
         return {
             isScheduling,
-            isCancelling: Boolean(parsed.isCancelling),
+            isCancelling: Boolean(parsed.isCancelling) && !Boolean(parsed.isRescheduling),
+            isRescheduling: Boolean(parsed.isRescheduling),
             date: finalIsoDate,
             extractedDate:
                 typeof parsed.extractedDate === 'string' && parsed.extractedDate !== 'null'
@@ -540,6 +548,7 @@ export const analyzeMessage = async (
         return {
             isScheduling: false,
             isCancelling: false,
+            isRescheduling: false,
             response: isLeakedApiKeyError(error)
                 ? 'Estou indisponível no momento. Tente de novo em alguns minutos.'
                 : 'Desculpe, tive um problema. Pode repetir?',

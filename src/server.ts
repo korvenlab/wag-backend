@@ -12,6 +12,7 @@ import calendarRoutes from './routes/calendar';
 import bookingRoutes from './routes/booking';
 import analyticsRoutes from './routes/analytics';
 import clubRoutes from './routes/club';
+import remindersRoutes from './routes/reminders';
 import { profileHasWagooAccess } from './lib/profileAccess';
 import { profileHasMultiBarberPlan, profileSubscriptionTier } from './lib/profileMultiBarber';
 import { getMaxBarbeirosSlots, WAGOO_PLANS, tierSupportsReminders, tierSupportsAi, tierSupportsPublicBooking } from './lib/wagooSubscription';
@@ -20,6 +21,7 @@ import { syncCalendarShareSlug } from './lib/storeSlug';
 import { pushAdminEvent } from './services/adminEvents';
 import { startWhatsApp, autoReconnectAll, disconnectWhatsApp, installWhatsAppProcessSafetyNet } from './services/whatsapp';
 import { clampRemindBeforeMinutes, startReminderWorker } from './services/reminders';
+import { startCommissionDigestWorker } from './lib/barberCommissionDigest';
 import { normalizeResponseTemplates } from './lib/responseTemplates';
 import { generateAuthUrl, getTokensFromCode } from './services/googleAuth';
 import { getUserFromBearerHeader } from './lib/supabaseAuthUser';
@@ -95,6 +97,7 @@ app.use('/api/calendar', calendarRoutes);
 app.use('/api/booking', bookingRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/club', clubRoutes);
+app.use('/api/reminders', remindersRoutes);
 
 // --- 1. ROTA DE PERFIL (somente dono da sessão — Bearer Supabase) ---
 app.get('/api/user/profile', async (req: Request, res: Response) => {
@@ -518,4 +521,5 @@ app.listen(port, '0.0.0.0', () => {
   pushAdminEvent('core', `API Wagoo inicializada na porta ${port}`, 'online');
   autoReconnectAll().catch((err) => log.error('WA', 'Erro na reconexão automática', err));
   startReminderWorker();
+  startCommissionDigestWorker();
 });

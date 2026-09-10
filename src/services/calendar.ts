@@ -715,3 +715,114 @@ export async function buildSemPreferenciaHintsForAi(
     const lines = slots.map((s) => `${s.label} (${s.barberName})`);
     return `SUGESTÕES_SEM_PREFERÊNCIA (sempre ofereça o mais cedo primeiro): ${lines.join(', ')}`;
 }
+
+export type SuggestedFreeSlot = {
+  dateIso: string;
+  label: string;
+  dayLabel: string;
+  barberName: string | null;
+  barberEmail: string | null;
+};
+
+/**
+ * Próximos N horários livres (hoje + dias seguintes) para remarcação autônoma no WhatsApp.
+ */
+export async function suggestNextFreeSlots(
+  email: string,
+  durationMin: number,
+  workingHours: unknown,
+  options: SchedulingAvailabilityOptions & {
+    barbers?: BarberSlotRef[];
+    maxSlots?: number;
+    maxDays?: number;
+  },
+): Promise<SuggestedFreeSlot[]> {
+  const maxSlots = Math.min(6, Math.max(1, options.maxSlots ?? 3));
+  const maxDays = Math.min(14, Math.max(1, options.maxDays ?? 7));
+  const step = Math.max(5, Number(durationMin) || 30);
+  const now = dayjs().tz(BR_TZ);
+  const out: SuggestedFreeSlot[] = [];
+
+  for (let d = 0; d < maxDays && out.length < maxSlots; d++) {
+    const day = now.add(d, 'day').startOf('day');
+    const dayIso = day.format('YYYY-MM-DD');
+    const windows = dayWindowsFromWorkingHours(workingHours, dayIso);
+    const scanWindows =
+      windows.length > 0 ? windows : [{ startHm: '08:00', endHm: '20:00' }];
+
+    const events = await listCalendarEvents(
+      email,
+      day.toISOString(),
+      day.endOf('day').toISOString(),
+    );
+
+    for (const w of scanWindows) {
+      if (out.length >= maxSlots) break;
+      const [sh, sm] = w.startHm.split(':').map(Number);
+      const [eh, em] = w.endHm.split(':').map(Number);
+      let cursor = day.hour(sh).minute(sm).second(0).millisecond(0);
+      const end = day.hour(eh).minute(em).second(0).millisecond(0);
+
+      while (!cursor.add(step, 'minute').isAfter(end) && out.length < maxSlots) {
+        if (cursor.isBefore(now)) {
+          cursor = cursor.add(step, 'minute');
+          continue;
+        }
+        const slotStart = cursor.toDate();
+        const slotEnd = addMinutes(slotStart, step);
+
+        let free = false;
+        let barberName: string | null = options.barberName ?? null;
+        let barberEmail: string | null = null;
+
+        if (!options.multiBarber) {
+          free = !events.some((ev) => {
+            const { start, end: evEnd } = eventWindow(ev);
+            return rangesOverlap(slotStart, slotEnd, start, evEnd);
+          });
+          if (free && options.barbers?.length === 1) {
+            barberName = options.barbers[0].nome;
+            barberEmail = options.barbers[0].google_calendar_email ?? null;
+          }
+        } else if (options.barberName) {
+          free = isBarberFreeAtSlot(events, slotStart, slotEnd, options.barberName);
+          const match = options.barbers?.find(
+            (b) => b.nome.toLowerCase() === options.barberName!.toLowerCase(),
+          );
+          barberEmail = match?.google_calendar_email ?? null;
+        } else if (options.barbers?.length) {
+          const assignment = pickBarberForSemPreferenciaSlot(
+            events,
+            slotStart,
+            step,
+            options.barbers,
+          );
+          if (assignment) {
+            free = true;
+            barberName = assignment.barberName;
+            barberEmail =
+              options.barbers.find((b) => b.nome === assignment.barberName)
+                ?.google_calendar_email ?? null;
+          }
+        } else {
+          free = true;
+        }
+
+        if (free) {
+          const dayLabel =
+            d === 0 ? 'hoje' : d === 1 ? 'amanhã' : cursor.format('dddd DD/MM');
+          out.push({
+            dateIso: cursor.format(),
+            label: cursor.format('HH:mm'),
+            dayLabel,
+            barberName,
+            barberEmail,
+          });
+        }
+        cursor = cursor.add(step, 'minute');
+      }
+    }
+  }
+
+  return out;
+}

@@ -22,6 +22,7 @@ import {
   buildFreeRangesSummary,
   findEventByPhone,
   deleteEvent,
+  suggestNextFreeSlots,
 } from './calendar';
 import { pushAdminEvent } from './adminEvents';
 import { profileHasWagooAccess } from '../lib/profileAccess';
@@ -133,6 +134,12 @@ interface ChatContext {
       serviceName?: string | null;
       durationMinutes?: number | null;
     } | null;
+    /** Opções 1/2/3 oferecidas na remarcação autônoma. */
+    rescheduleOptions?: Array<{
+      dateIso: string;
+      barberName: string | null;
+      barberEmail: string | null;
+    }> | null;
   };
 }
 
@@ -921,6 +928,122 @@ export async function startWhatsApp(email: string, res: Response | null) {
           }
         }
 
+        // --- 🔁 REMARCAÇÃO AUTÔNOMA (cancela antigo + oferece 3 slots) ---
+        const rescheduleIntent =
+          Boolean(aiResult.isRescheduling) ||
+          (/\b(remarcar|reagendar|remarcacao|reagendamento|trocar (o )?horario|mudar (o )?horario|outro horario)\b/.test(
+            textMessage
+              .toLowerCase()
+              .normalize('NFD')
+              .replace(/[\u0300-\u036f]/g, ''),
+          ) &&
+            (Boolean(aiResult.isCancelling) || hasSchedulingIntent(textMessage)));
+
+        if (rescheduleIntent) {
+          const clientPhone = remoteJid.split('@')[0].replace(/\D/g, '');
+          const event = await findEventByPhone(email, clientPhone);
+          if (event) {
+            const success = await deleteEvent(email, event.id);
+            if (success && p.id && event.id) {
+              await cancelAppointmentReminder(p.id as string, event.id);
+            }
+          }
+
+          const barberRefsForReschedule = activeBarbeiros.map((b) => ({
+            nome: b.nome,
+            google_calendar_email: b.google_calendar_email,
+          }));
+          const sched = memoryCache[cacheKey].scheduling;
+          const preferredBarber =
+            multiBarber && sched?.barberConfirmed && sched.selectedBarberName
+              ? sched.selectedBarberName
+              : activeBarbeiros.length === 1
+                ? activeBarbeiros[0].nome
+                : null;
+
+          const suggestions = await suggestNextFreeSlots(
+            email,
+            p.service_duration ?? 30,
+            p.working_hours,
+            {
+              multiBarber,
+              barbers: barberRefsForReschedule,
+              barberName: preferredBarber,
+              semPreferencia: multiBarber && !preferredBarber,
+              maxSlots: 3,
+              maxDays: 7,
+            },
+          );
+
+          if (!suggestions.length) {
+            const reply = emphasizeWa(
+              ensureOpeningGreeting(
+                'Cancei o horário anterior. No momento não achei vaga nos próximos dias — me diga um dia que prefere.',
+                shouldGreet,
+                undefined,
+                openingGreeting,
+              ),
+            );
+            await sock.sendMessage(remoteJid, { text: reply });
+            memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+            memoryCache[cacheKey].scheduling = {
+              barberConfirmed: !multiBarber || Boolean(preferredBarber),
+              selectedBarberName: preferredBarber,
+              selectedBarberEmail:
+                preferredBarber
+                  ? activeBarbeiros.find((b) => b.nome === preferredBarber)
+                      ?.google_calendar_email ?? null
+                  : null,
+              pendingConfirmation: null,
+            };
+            return;
+          }
+
+          const lines = suggestions.map((s, i) => {
+            const prof =
+              multiBarber && s.barberName ? ` com *${s.barberName}*` : '';
+            return `${i + 1}) *${s.dayLabel}* às *${s.label}*${prof}`;
+          });
+          const reply = emphasizeWa(
+            ensureOpeningGreeting(
+              `Pronto — liberei o horário anterior.\n\nPosso remarcar em um destes?\n${lines.join('\n')}\n\nResponda com o número ou o horário.`,
+              shouldGreet,
+              undefined,
+              openingGreeting,
+            ),
+            ...suggestions.flatMap((s) =>
+              [s.dayLabel, s.label, s.barberName].filter(Boolean) as string[],
+            ),
+          );
+          await sock.sendMessage(remoteJid, { text: reply });
+          memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+
+          // Se o cliente responder "1"/"2"/"3", o fluxo normal de proposta captura via IA.
+          // Também deixamos a 1ª opção como pending se ele disser só "sim".
+          const first = suggestions[0];
+          memoryCache[cacheKey].scheduling = {
+            barberConfirmed: !multiBarber || Boolean(first.barberName || preferredBarber),
+            selectedBarberName: first.barberName || preferredBarber,
+            selectedBarberEmail:
+              first.barberEmail ||
+              (preferredBarber
+                ? activeBarbeiros.find((b) => b.nome === preferredBarber)
+                    ?.google_calendar_email ?? null
+                : null),
+            pendingConfirmation: null,
+            rescheduleOptions: suggestions.map((s) => ({
+              dateIso: s.dateIso,
+              barberName: s.barberName,
+              barberEmail: s.barberEmail,
+            })),
+          };
+          log.info(WA, 'remarcação — slots oferecidos', {
+            email,
+            count: suggestions.length,
+          });
+          return;
+        }
+
         // --- 🗑️ CANCELAMENTO ---
         if (aiResult.isCancelling) {
             const clientPhone = remoteJid.split('@')[0].replace(/\D/g, '');
@@ -945,6 +1068,40 @@ export async function startWhatsApp(email: string, res: Response | null) {
                 });
                 return;
             }
+        }
+
+        // Cliente escolheu opção 1/2/3 da remarcação.
+        const rescheduleOpts = memoryCache[cacheKey].scheduling?.rescheduleOptions;
+        if (rescheduleOpts?.length) {
+          const pickMatch = textMessage.trim().match(/^\s*([123])\s*[).:-]?\s*$/);
+          if (pickMatch) {
+            const idx = Number(pickMatch[1]) - 1;
+            const picked = rescheduleOpts[idx];
+            if (picked) {
+              memoryCache[cacheKey].scheduling!.pendingConfirmation = {
+                dateIso: picked.dateIso,
+                barberName: picked.barberName,
+                barberEmail: picked.barberEmail,
+                serviceId: null,
+                serviceName: null,
+                durationMinutes: null,
+              };
+              memoryCache[cacheKey].scheduling!.rescheduleOptions = null;
+              if (picked.barberName) {
+                memoryCache[cacheKey].scheduling!.barberConfirmed = true;
+                memoryCache[cacheKey].scheduling!.selectedBarberName = picked.barberName;
+                memoryCache[cacheKey].scheduling!.selectedBarberEmail = picked.barberEmail;
+              }
+              const when = formatDateTimeBR(picked.dateIso);
+              const reply = emphasizeWa(
+                `Posso confirmar ${when}${picked.barberName ? ` com ${picked.barberName}` : ''}? Responda *sim*.`,
+                picked.barberName || undefined,
+              );
+              await sock.sendMessage(remoteJid, { text: reply });
+              memoryCache[cacheKey].messages.push({ role: 'assistant', content: reply });
+              return;
+            }
+          }
         }
 
         const askingWho =
