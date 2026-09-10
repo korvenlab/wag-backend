@@ -1965,9 +1965,7 @@ router.get('/users/:id/dossier', async (req: Request, res: Response) => {
         .limit(20),
       supabase
         .from('profiles')
-        .select(
-          'is_ai_enabled, whatsapp_session, store_name, googleAuth, complimentary_access_until, has_paid, subscription_tier, multi_barber_plan, is_active, deleted_at',
-        )
+        .select(PROFILE_ADMIN_SELECT)
         .eq('id', id)
         .maybeSingle(),
     ]);
