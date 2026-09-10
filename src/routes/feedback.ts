@@ -1,5 +1,6 @@
 import express, { NextFunction, Request, Response } from 'express';
 import { supabase } from '../lib/supabase';
+import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 
 const router = express.Router();
 
@@ -24,8 +25,11 @@ function sendApiError(
 /** Mesmo valor enviado como `WAGOO_METRICS_API_KEY` no dashboard Korven. */
 function getUpstreamSecret(): string {
   return (
-    (process.env.ADMIN_API_SECRET || process.env.API_SECRET || process.env.METRICS_API_KEY || '').trim()
-  );
+    process.env.ADMIN_API_SECRET ||
+    process.env.API_SECRET ||
+    process.env.METRICS_API_KEY ||
+    ''
+  ).trim();
 }
 
 function extractProvidedSecret(req: Request): string | undefined {
@@ -61,13 +65,114 @@ function requireUpstreamAuth(req: Request, res: Response, next: NextFunction): v
   next();
 }
 
-router.use(requireUpstreamAuth);
-
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** Lista mensagens para o Korven Dashboard (API key). */
-router.get('/messages', async (req: Request, res: Response) => {
+function dashboardFeedbackIngestUrl(): string {
+  const explicit = (process.env.DASHBOARD_FEEDBACK_INGEST_URL || '').trim();
+  if (explicit) return explicit.replace(/\/+$/, '');
+  return 'https://dashboard.korvenlab.com/api/dashboard/ingest/feedback';
+}
+
+/**
+ * App autenticado: grava no Supabase central do dashboard (não no banco Wagoo).
+ * POST /feedback/messages  Authorization: Bearer <access_token>
+ */
+router.post('/messages', async (req: Request, res: Response) => {
+  try {
+    const auth = await getUserFromBearerHeader(supabase, req.headers.authorization);
+    if (!auth.ok) {
+      sendApiError(res, 401, 'UNAUTHORIZED', 'Sessão inválida ou ausente.');
+      return;
+    }
+
+    const bodyRaw = typeof req.body?.body === 'string' ? req.body.body.trim() : '';
+    if (bodyRaw.length < 5 || bodyRaw.length > 8000) {
+      sendApiError(
+        res,
+        400,
+        'VALIDATION_ERROR',
+        'body deve ter entre 5 e 8000 caracteres.',
+      );
+      return;
+    }
+
+    const secret = getUpstreamSecret();
+    if (!secret) {
+      sendApiError(
+        res,
+        503,
+        'UNAVAILABLE',
+        'Segredo de ingestão não configurado no wag-backend.',
+      );
+      return;
+    }
+
+    const user = auth.user;
+    const fullName =
+      typeof req.body?.user_full_name === 'string'
+        ? req.body.user_full_name.trim().slice(0, 200)
+        : typeof user.user_metadata?.name === 'string'
+          ? String(user.user_metadata.name).trim().slice(0, 200)
+          : null;
+
+    const payload = {
+      source: 'wagoo' as const,
+      external_user_id: user.id,
+      organization_id:
+        typeof req.body?.organization_id === 'string'
+          ? req.body.organization_id.trim() || null
+          : null,
+      user_email: user.email ? String(user.email).trim().toLowerCase() : null,
+      user_full_name: fullName || null,
+      body: bodyRaw,
+    };
+
+    const ingestUrl = dashboardFeedbackIngestUrl();
+    const upstream = await fetch(ingestUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        Accept: 'application/json',
+        Authorization: `Bearer ${secret}`,
+        'X-API-Key': secret,
+        'x-admin-secret': secret,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const text = await upstream.text();
+    let json: unknown = {};
+    try {
+      json = text ? JSON.parse(text) : {};
+    } catch {
+      json = {};
+    }
+    const root =
+      json && typeof json === 'object' && !Array.isArray(json)
+        ? (json as Record<string, unknown>)
+        : {};
+
+    if (!upstream.ok || root.ok === false) {
+      const msg =
+        typeof root.error === 'string'
+          ? root.error
+          : `Falha ao enviar ao dashboard (HTTP ${upstream.status}).`;
+      sendApiError(res, 502, 'UNAVAILABLE', msg);
+      return;
+    }
+
+    res.status(201).type(JSON_UTF8).json({
+      ok: true as const,
+      data: root.data ?? null,
+    });
+  } catch (e: unknown) {
+    sendApiError(res, 503, 'INTERNAL_ERROR', e instanceof Error ? e.message : String(e));
+  }
+});
+
+/** Lista mensagens legadas no banco Wagoo (sync histórico para o Korven). */
+router.get('/messages', requireUpstreamAuth, async (req: Request, res: Response) => {
   const rawLimit = req.query.limit;
   const limit = Math.min(500, Math.max(1, parseInt(String(rawLimit ?? '200'), 10) || 200));
 
@@ -92,7 +197,7 @@ router.get('/messages', async (req: Request, res: Response) => {
   }
 });
 
-router.delete('/messages/:id', async (req: Request, res: Response) => {
+router.delete('/messages/:id', requireUpstreamAuth, async (req: Request, res: Response) => {
   const id = String(req.params.id || '').trim();
   if (!UUID_RE.test(id)) {
     sendApiError(res, 400, 'VALIDATION_ERROR', 'id da mensagem inválido (UUID).');
@@ -100,7 +205,10 @@ router.delete('/messages/:id', async (req: Request, res: Response) => {
   }
 
   try {
-    const { error, count } = await supabase.from('feedback_messages').delete({ count: 'exact' }).eq('id', id);
+    const { error, count } = await supabase
+      .from('feedback_messages')
+      .delete({ count: 'exact' })
+      .eq('id', id);
     if (error) {
       sendApiError(res, 502, 'UNAVAILABLE', error.message);
       return;
