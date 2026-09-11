@@ -2293,6 +2293,87 @@ router.get('/audit', (_req: Request, res: Response) => {
   res.status(200).type(JSON_UTF8).json({ ok: true, data: { items: adminAudit } });
 });
 
+/**
+ * Monitoramento operacional dos webhooks Mercado Pago (não é extrato financeiro).
+ * Fonte: mp_webhook_events + sinais runtime "MP webhook:*".
+ */
+router.get('/mercadopago/webhooks', async (req: Request, res: Response) => {
+  const limitRaw = Number(req.query.limit ?? 40);
+  const limit = Math.min(100, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 40));
+  const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+  const [{ data: events, error }, { data: last24, error: err24 }] = await Promise.all([
+    supabase
+      .from('mp_webhook_events')
+      .select('id, topic, data_id, action, live_mode, processed_at')
+      .order('processed_at', { ascending: false })
+      .limit(limit),
+    supabase
+      .from('mp_webhook_events')
+      .select('topic')
+      .gte('processed_at', sinceIso),
+  ]);
+
+  if (error) {
+    return sendApiError(res, 500, 'INTERNAL_ERROR', error.message);
+  }
+  if (err24) {
+    return sendApiError(res, 500, 'INTERNAL_ERROR', err24.message);
+  }
+
+  const byTopic: Record<string, number> = {};
+  for (const row of last24 || []) {
+    const t = String((row as { topic?: string }).topic || 'unknown');
+    byTopic[t] = (byTopic[t] || 0) + 1;
+  }
+
+  const adminMp = getAdminEvents(120).filter(
+    (e) =>
+      /^MP webhook:/i.test(e.message) ||
+      /Clube (renovado|cancelado|past_due|recorrente)/i.test(e.message),
+  );
+
+  const lastAt = events?.[0]
+    ? String((events[0] as { processed_at?: string }).processed_at || '')
+    : null;
+  const ageSec = lastAt
+    ? Math.max(0, Math.round((Date.now() - new Date(lastAt).getTime()) / 1000))
+    : null;
+
+  res.status(200).type(JSON_UTF8).json({
+    ok: true,
+    fetchedAt: new Date().toISOString(),
+    summary: {
+      last_24h_total: (last24 || []).length,
+      by_topic_24h: byTopic,
+      last_received_at: lastAt,
+      last_received_age_sec: ageSec,
+      healthy:
+        ageSec == null
+          ? null
+          : ageSec < 6 * 60 * 60
+            ? true
+            : ageSec < 48 * 60 * 60
+              ? null
+              : false,
+    },
+    events: (events || []).map((e) => ({
+      id: e.id,
+      topic: e.topic,
+      data_id: e.data_id,
+      action: e.action,
+      live_mode: e.live_mode,
+      processed_at: e.processed_at,
+    })),
+    runtime_signals: adminMp.slice(0, 30).map((e) => ({
+      id: e.id,
+      status: e.status,
+      message: e.message,
+      timestamp: e.timestamp,
+    })),
+  });
+});
+
 router.post('/events/test', (req: Request, res: Response) => {
   const { app, message, status } = req.body as {
     app?: AdminApp;
