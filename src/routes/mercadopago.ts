@@ -3,8 +3,11 @@ import { createHmac, timingSafeEqual } from 'crypto';
 import { verifyMercadoPagoWebhookSignature } from '../lib/mercadopagoWebhook';
 import {
   createMpMarketplacePayment,
+  createMpPreapproval,
+  createMpPreapprovalPlan,
   exchangeMpAuthorizationCode,
   getMpPayment,
+  getMpPreapproval,
   mpClientId,
   mpOAuthAuthorizeUrl,
   mpPlatformAccessToken,
@@ -151,22 +154,33 @@ function metadataFromPayment(payment: Record<string, unknown>): Record<string, s
 
 async function activateClubMemberFromMp(opts: {
   memberId: string;
-  paymentId: string;
+  paymentId?: string | null;
+  preapprovalId?: string | null;
   amountBrl?: number | null;
 }): Promise<void> {
   const periodStart = new Date();
   const periodEnd = new Date(periodStart);
-  periodEnd.setDate(periodEnd.getDate() + 30);
-  await supabase
-    .from('club_members')
-    .update({
-      status: 'active',
-      mp_payment_id: opts.paymentId,
-      current_period_start: periodStart.toISOString(),
-      current_period_end: periodEnd.toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', opts.memberId);
+  periodEnd.setMonth(periodEnd.getMonth() + 1);
+  const patch: Record<string, unknown> = {
+    status: 'active',
+    current_period_start: periodStart.toISOString(),
+    current_period_end: periodEnd.toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  if (opts.paymentId) patch.mp_payment_id = opts.paymentId;
+  if (opts.preapprovalId) patch.mp_preapproval_id = opts.preapprovalId;
+  await supabase.from('club_members').update(patch).eq('id', opts.memberId);
+}
+
+function extractBrickFormData(body: Record<string, unknown>): Record<string, unknown> | null {
+  if (body.formData && typeof body.formData === 'object' && !Array.isArray(body.formData)) {
+    return body.formData as Record<string, unknown>;
+  }
+  // Brick às vezes envia o payload direto
+  if (typeof body.token === 'string' || body.payment_method_id) {
+    return body;
+  }
+  return null;
 }
 
 /** Status + vínculo MP do salão (substitui Connect para sinal/clube). */
@@ -379,6 +393,7 @@ router.post(
     const slug = String(req.params.slug || '').trim();
     const appointmentId = String(req.params.appointmentId || '').trim();
     const method = String(req.body?.method || 'pix').toLowerCase();
+    const brickFormData = extractBrickFormData((req.body || {}) as Record<string, unknown>);
 
     const { data: site } = await supabase
       .from('profiles')
@@ -417,6 +432,13 @@ router.post(
     const amountBrl = Number(appt.deposit_amount_brl) || 0;
     if (amountBrl <= 0) return res.status(400).json({ error: 'Valor inválido.' });
 
+    const payerEmailFromBrick =
+      brickFormData?.payer &&
+      typeof brickFormData.payer === 'object' &&
+      typeof (brickFormData.payer as { email?: string }).email === 'string'
+        ? (brickFormData.payer as { email: string }).email
+        : null;
+
     const meta = {
       product: 'wagoo',
       external_user_id: String(site.id),
@@ -427,7 +449,7 @@ router.post(
       appointment_id: String(appt.id),
       profile_id: String(site.id),
       supabase_user_id: String(site.id),
-      email: '',
+      email: payerEmailFromBrick || '',
     };
 
     try {
@@ -437,10 +459,13 @@ router.post(
         description: `Sinal — ${site.store_name || 'Wagoo'} · ${appt.client_name}`,
         externalReference: String(appt.id),
         metadata: meta,
-        payerEmail: typeof req.body?.payer_email === 'string' ? req.body.payer_email : null,
+        payerEmail:
+          payerEmailFromBrick ||
+          (typeof req.body?.payer_email === 'string' ? req.body.payer_email : null),
         payerFirstName: String(appt.client_name || '').split(/\s+/)[0] || null,
-        paymentMethodId: method === 'pix' ? 'pix' : String(req.body?.payment_method_id || ''),
-        token: method === 'pix' ? undefined : String(req.body?.token || ''),
+        paymentMethodId: method === 'pix' && !brickFormData ? 'pix' : undefined,
+        token: method === 'pix' && !brickFormData ? undefined : undefined,
+        brickFormData,
         installments: Number(req.body?.installments) || 1,
         issuerId: req.body?.issuer_id ?? null,
         idempotencyKey: `deposit-${appt.id}-${method}-${Date.now()}`,
@@ -531,6 +556,7 @@ router.post('/public/club/:slug/members/:memberId/pay', async (req: Request, res
   const slug = String(req.params.slug || '').trim();
   const memberId = String(req.params.memberId || '').trim();
   const method = String(req.body?.method || 'pix').toLowerCase();
+  const brickFormData = extractBrickFormData((req.body || {}) as Record<string, unknown>);
 
   const { data: site } = await supabase
     .from('profiles')
@@ -553,11 +579,18 @@ router.post('/public/club/:slug/members/:memberId/pay', async (req: Request, res
 
   const { data: plan } = await supabase
     .from('club_plans')
-    .select('id, name, price_brl')
+    .select('id, name, price_brl, mp_plan_id')
     .eq('id', member.club_plan_id)
     .maybeSingle();
   const amountBrl = Number(plan?.price_brl) || 0;
   if (amountBrl <= 0) return res.status(400).json({ error: 'Plano sem preço.' });
+
+  const payerEmailFromBrick =
+    brickFormData?.payer &&
+    typeof brickFormData.payer === 'object' &&
+    typeof (brickFormData.payer as { email?: string }).email === 'string'
+      ? (brickFormData.payer as { email: string }).email
+      : null;
 
   const meta = {
     product: 'wagoo',
@@ -570,6 +603,7 @@ router.post('/public/club/:slug/members/:memberId/pay', async (req: Request, res
     club_plan_id: String(plan?.id || ''),
     profile_id: String(site.id),
     supabase_user_id: String(site.id),
+    email: payerEmailFromBrick || '',
   };
 
   try {
@@ -580,12 +614,13 @@ router.post('/public/club/:slug/members/:memberId/pay', async (req: Request, res
       externalReference: `club:${member.id}`,
       metadata: meta,
       payerEmail:
+        payerEmailFromBrick ||
         (typeof req.body?.payer_email === 'string' && req.body.payer_email) ||
         member.client_email ||
         null,
       payerFirstName: String(member.client_name || '').split(/\s+/)[0] || null,
-      paymentMethodId: method === 'pix' ? 'pix' : String(req.body?.payment_method_id || ''),
-      token: method === 'pix' ? undefined : String(req.body?.token || ''),
+      paymentMethodId: method === 'pix' && !brickFormData ? 'pix' : undefined,
+      brickFormData,
       installments: Number(req.body?.installments) || 1,
       issuerId: req.body?.issuer_id ?? null,
       idempotencyKey: `club-${member.id}-${method}-${Date.now()}`,
@@ -619,6 +654,123 @@ router.post('/public/club/:slug/members/:memberId/pay', async (req: Request, res
     });
   }
 });
+
+/** Assinatura recorrente do clube (cartão → Preapproval mensal). */
+router.post(
+  '/public/club/:slug/members/:memberId/subscribe',
+  async (req: Request, res: Response) => {
+    const slug = String(req.params.slug || '').trim();
+    const memberId = String(req.params.memberId || '').trim();
+    const brickFormData = extractBrickFormData((req.body || {}) as Record<string, unknown>);
+    const cardToken =
+      (brickFormData && typeof brickFormData.token === 'string' && brickFormData.token) ||
+      (typeof req.body?.token === 'string' ? req.body.token : '') ||
+      (typeof req.body?.card_token_id === 'string' ? req.body.card_token_id : '');
+
+    if (!cardToken) {
+      return res.status(400).json({ error: 'Token do cartão ausente (Brick).' });
+    }
+
+    const { data: site } = await supabase
+      .from('profiles')
+      .select('id, store_name, booking_slug')
+      .eq('booking_slug', slug)
+      .maybeSingle();
+    if (!site) return res.status(404).json({ error: 'Salão não encontrado.' });
+
+    const seller = await loadSellerTokens(String(site.id));
+    if (!seller) return res.status(400).json({ error: 'Mercado Pago não vinculado.' });
+
+    const { data: member } = await supabase
+      .from('club_members')
+      .select('id, profile_id, client_name, client_email, status, club_plan_id, mp_preapproval_id')
+      .eq('id', memberId)
+      .eq('profile_id', site.id)
+      .maybeSingle();
+    if (!member) return res.status(404).json({ error: 'Membro não encontrado.' });
+    if (member.status === 'active' && member.mp_preapproval_id) {
+      return res.json({
+        already_subscribed: true,
+        status: 'authorized',
+        preapproval_id: member.mp_preapproval_id,
+      });
+    }
+
+    const { data: plan } = await supabase
+      .from('club_plans')
+      .select('id, name, price_brl, mp_plan_id')
+      .eq('id', member.club_plan_id)
+      .maybeSingle();
+    const amountBrl = Number(plan?.price_brl) || 0;
+    if (!plan || amountBrl <= 0) {
+      return res.status(400).json({ error: 'Plano sem preço.' });
+    }
+
+    const payerEmail =
+      (brickFormData?.payer &&
+      typeof brickFormData.payer === 'object' &&
+      typeof (brickFormData.payer as { email?: string }).email === 'string'
+        ? (brickFormData.payer as { email: string }).email
+        : null) ||
+      (typeof req.body?.payer_email === 'string' ? req.body.payer_email : null) ||
+      member.client_email ||
+      'cliente@wagoobot.com';
+
+    const backUrl = `${frontendBaseUrl()}/a/${encodeURIComponent(slug)}/cliente?checkout=success`;
+
+    try {
+      let planId = plan.mp_plan_id ? String(plan.mp_plan_id) : '';
+      if (!planId) {
+        const createdPlan = await createMpPreapprovalPlan({
+          sellerAccessToken: seller.accessToken,
+          reason: `${plan.name} · ${site.store_name || 'Wagoo'}`,
+          amountBrl,
+          backUrl,
+        });
+        planId = createdPlan.id != null ? String(createdPlan.id) : '';
+        if (!planId) throw new Error('Falha ao criar plano recorrente no Mercado Pago.');
+        await supabase.from('club_plans').update({ mp_plan_id: planId }).eq('id', plan.id);
+      }
+
+      const preapproval = await createMpPreapproval({
+        sellerAccessToken: seller.accessToken,
+        planId,
+        reason: `${plan.name} · ${member.client_name}`,
+        payerEmail: String(payerEmail),
+        cardTokenId: cardToken,
+        externalReference: `club:${member.id}`,
+        backUrl,
+        amountBrl,
+      });
+
+      const preapprovalId = preapproval.id != null ? String(preapproval.id) : '';
+      const status = String(preapproval.status || '');
+      if (!preapprovalId) throw new Error('Assinatura sem ID.');
+
+      await activateClubMemberFromMp({
+        memberId: String(member.id),
+        preapprovalId,
+      });
+
+      pushAdminEvent(
+        'wagoo',
+        `Clube recorrente autorizado #${preapprovalId} · ${member.client_name}`,
+        'online',
+      );
+
+      return res.json({
+        preapproval_id: preapprovalId,
+        status,
+        recurring: true,
+      });
+    } catch (e) {
+      log.error('MP_SUB', 'assinatura clube falhou', e, { memberId });
+      return res.status(502).json({
+        error: e instanceof Error ? e.message : 'Falha ao criar assinatura recorrente.',
+      });
+    }
+  },
+);
 
 /**
  * Webhooks Mercado Pago → fulfill sinal/clube + Korven control plane.
@@ -654,7 +806,98 @@ router.post('/webhook', async (req: Request, res: Response) => {
       liveMode ? 'online' : 'degraded',
     );
 
-    if (!dataId || !(topic === 'payment' || topic.includes('payment'))) return;
+    if (!dataId) return;
+
+    // Assinaturas / preapproval
+    if (
+      topic.includes('subscription') ||
+      topic.includes('preapproval') ||
+      topic === 'subscription_authorized_payment' ||
+      topic === 'subscription_preapproval'
+    ) {
+      const { data: byPreapproval } = await supabase
+        .from('club_members')
+        .select('id, profile_id, mp_preapproval_id')
+        .eq('mp_preapproval_id', dataId)
+        .maybeSingle();
+
+      let memberId = byPreapproval?.id ? String(byPreapproval.id) : null;
+      let profileId = byPreapproval?.profile_id ? String(byPreapproval.profile_id) : null;
+
+      if (!memberId) {
+        // authorized payment id → buscar payment e external_reference club:
+        const platformToken = mpPlatformAccessToken();
+        let payment: Record<string, unknown> | null = null;
+        if (platformToken) {
+          try {
+            payment = await getMpPayment(dataId, platformToken);
+          } catch {
+            payment = null;
+          }
+        }
+        const ext =
+          payment && typeof payment.external_reference === 'string'
+            ? payment.external_reference
+            : '';
+        if (ext.startsWith('club:')) {
+          memberId = ext.slice(5);
+        }
+        // Ou preapproval lookup
+        if (!memberId && platformToken) {
+          try {
+            const pre = await getMpPreapproval(dataId, platformToken);
+            const pref =
+              typeof pre.external_reference === 'string' ? pre.external_reference : '';
+            if (pref.startsWith('club:')) memberId = pref.slice(5);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+
+      if (memberId) {
+        if (!profileId) {
+          const { data: m } = await supabase
+            .from('club_members')
+            .select('profile_id')
+            .eq('id', memberId)
+            .maybeSingle();
+          profileId = m?.profile_id ? String(m.profile_id) : null;
+        }
+        await activateClubMemberFromMp({
+          memberId,
+          preapprovalId: byPreapproval?.mp_preapproval_id
+            ? String(byPreapproval.mp_preapproval_id)
+            : dataId,
+          paymentId: topic.includes('authorized_payment') ? dataId : null,
+        });
+        pushAdminEvent('wagoo', `Clube renovado/autorizado · membro ${memberId}`, 'online');
+        if (profileId) {
+          void publishControlPlaneEvent({
+            eventId: `mp:sub:${dataId}:${topic}`,
+            eventType: 'payment.succeeded',
+            externalUserId: profileId,
+            organizationId: profileId,
+            dedupeKey: `mp:sub:${dataId}`,
+            payload: {
+              provider: 'mercadopago',
+              kind: 'club_membership',
+              mercadopago_payment_id: dataId,
+              plan: 'club_membership',
+              metadata: {
+                product: 'wagoo',
+                external_user_id: profileId,
+                kind: 'club_membership',
+                recurring: true,
+              },
+            },
+          });
+        }
+      }
+      return;
+    }
+
+    if (!(topic === 'payment' || topic.includes('payment'))) return;
 
     const platformToken = mpPlatformAccessToken();
     let payment: Record<string, unknown> | null = null;

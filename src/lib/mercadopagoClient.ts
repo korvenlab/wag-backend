@@ -157,12 +157,15 @@ export type CreateMpPaymentInput = {
   metadata: Record<string, string>;
   payerEmail?: string | null;
   payerFirstName?: string | null;
+  payerIdentification?: { type?: string; number?: string } | null;
   /** PIX: omit token. Cartão: token do Brick. */
   paymentMethodId?: string;
   token?: string;
   installments?: number;
   issuerId?: string | number | null;
   idempotencyKey: string;
+  /** formData cru do Payment/CardPayment Brick */
+  brickFormData?: Record<string, unknown> | null;
 };
 
 export async function createMpMarketplacePayment(
@@ -170,6 +173,52 @@ export async function createMpMarketplacePayment(
 ): Promise<Record<string, unknown>> {
   const amount = Math.round(Number(input.amountBrl) * 100) / 100;
   const fee = wagooMarketplaceFeeBrl(amount);
+  const brick = input.brickFormData || {};
+
+  const brickPayer =
+    brick.payer && typeof brick.payer === 'object' && !Array.isArray(brick.payer)
+      ? (brick.payer as Record<string, unknown>)
+      : {};
+  const brickId =
+    brickPayer.identification &&
+    typeof brickPayer.identification === 'object' &&
+    !Array.isArray(brickPayer.identification)
+      ? (brickPayer.identification as Record<string, unknown>)
+      : input.payerIdentification || {};
+
+  const token =
+    (typeof brick.token === 'string' && brick.token) ||
+    input.token ||
+    undefined;
+  const paymentMethodId =
+    (typeof brick.payment_method_id === 'string' && brick.payment_method_id) ||
+    input.paymentMethodId ||
+    (token ? undefined : 'pix');
+  const installments =
+    Number(brick.installments) || Number(input.installments) || 1;
+  const issuerId =
+    brick.issuer_id != null && brick.issuer_id !== ''
+      ? brick.issuer_id
+      : input.issuerId;
+
+  const email =
+    (typeof brickPayer.email === 'string' && brickPayer.email.trim()) ||
+    input.payerEmail?.trim() ||
+    'cliente@wagoobot.com';
+
+  const payer: Record<string, unknown> = {
+    email,
+    ...(input.payerFirstName
+      ? { first_name: input.payerFirstName.slice(0, 60) }
+      : {}),
+  };
+  if (brickId.type && brickId.number) {
+    payer.identification = {
+      type: String(brickId.type),
+      number: String(brickId.number).replace(/\D/g, ''),
+    };
+  }
+
   const body: Record<string, unknown> = {
     transaction_amount: amount,
     description: input.description.slice(0, 250),
@@ -177,23 +226,18 @@ export async function createMpMarketplacePayment(
     metadata: input.metadata,
     application_fee: fee,
     binary_mode: true,
-    payer: {
-      email: input.payerEmail?.trim() || 'cliente@wagoobot.com',
-      ...(input.payerFirstName
-        ? { first_name: input.payerFirstName.slice(0, 60) }
-        : {}),
-    },
+    payer,
   };
 
-  if (input.token) {
-    body.token = input.token;
-    body.installments = Math.max(1, Number(input.installments) || 1);
-    if (input.paymentMethodId) body.payment_method_id = input.paymentMethodId;
-    if (input.issuerId != null && input.issuerId !== '') {
-      body.issuer_id = Number(input.issuerId);
+  if (token) {
+    body.token = token;
+    body.installments = Math.max(1, installments);
+    if (paymentMethodId) body.payment_method_id = paymentMethodId;
+    if (issuerId != null && issuerId !== '') {
+      body.issuer_id = Number(issuerId);
     }
   } else {
-    body.payment_method_id = input.paymentMethodId || 'pix';
+    body.payment_method_id = paymentMethodId || 'pix';
   }
 
   return mpApiFetch('/v1/payments', {
@@ -209,4 +253,90 @@ export async function getMpPayment(
   accessToken: string,
 ): Promise<Record<string, unknown>> {
   return mpApiFetch(`/v1/payments/${paymentId}`, { accessToken });
+}
+
+export async function createMpPreapprovalPlan(opts: {
+  sellerAccessToken: string;
+  reason: string;
+  amountBrl: number;
+  backUrl: string;
+}): Promise<Record<string, unknown>> {
+  const amount = Math.round(Number(opts.amountBrl) * 100) / 100;
+  return mpApiFetch('/preapproval_plan', {
+    accessToken: opts.sellerAccessToken,
+    method: 'POST',
+    body: {
+      reason: opts.reason.slice(0, 250),
+      auto_recurring: {
+        frequency: 1,
+        frequency_type: 'months',
+        transaction_amount: amount,
+        currency_id: 'BRL',
+      },
+      payment_methods_allowed: {
+        payment_types: [{ id: 'credit_card' }, { id: 'debit_card' }],
+        payment_methods: [],
+      },
+      back_url: opts.backUrl,
+    },
+    idempotencyKey: `plan-${Buffer.from(opts.reason).toString('base64url').slice(0, 24)}-${amount}`,
+  });
+}
+
+export async function createMpPreapproval(opts: {
+  sellerAccessToken: string;
+  planId: string;
+  reason: string;
+  payerEmail: string;
+  cardTokenId: string;
+  externalReference: string;
+  backUrl: string;
+  amountBrl: number;
+}): Promise<Record<string, unknown>> {
+  const amount = Math.round(Number(opts.amountBrl) * 100) / 100;
+  const body: Record<string, unknown> = {
+    preapproval_plan_id: opts.planId,
+    reason: opts.reason.slice(0, 250),
+    external_reference: opts.externalReference.slice(0, 256),
+    payer_email: opts.payerEmail.trim(),
+    card_token_id: opts.cardTokenId,
+    auto_recurring: {
+      frequency: 1,
+      frequency_type: 'months',
+      transaction_amount: amount,
+      currency_id: 'BRL',
+    },
+    back_url: opts.backUrl,
+    status: 'authorized',
+  };
+  // Tentativa de fee marketplace (se a API rejeitar, o caller pode retry sem).
+  body.application_fee = wagooMarketplaceFeeBrl(amount);
+
+  try {
+    return await mpApiFetch('/preapproval', {
+      accessToken: opts.sellerAccessToken,
+      method: 'POST',
+      body,
+      idempotencyKey: `preapproval-${opts.externalReference}-${Date.now()}`,
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/application_fee|invalid|not.*allow/i.test(msg)) {
+      delete body.application_fee;
+      return mpApiFetch('/preapproval', {
+        accessToken: opts.sellerAccessToken,
+        method: 'POST',
+        body,
+        idempotencyKey: `preapproval-${opts.externalReference}-${Date.now()}-nofee`,
+      });
+    }
+    throw e;
+  }
+}
+
+export async function getMpPreapproval(
+  preapprovalId: string,
+  accessToken: string,
+): Promise<Record<string, unknown>> {
+  return mpApiFetch(`/preapproval/${preapprovalId}`, { accessToken });
 }
