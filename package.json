@@ -7,7 +7,7 @@
     "start": "node dist/server.js",
     "build": "tsc",
     "dev": "ts-node src/server.ts",
-    "test": "npm run build && node --test dist/lib/controlPlaneSignature.test.js"
+    "test": "npm run build && node --test dist/lib/controlPlaneSignature.test.js dist/lib/mercadopagoWebhook.test.js dist/lib/connectFees.test.js dist/lib/mpTokenCrypto.test.js"
   },
   "dependencies": {
     "@google/generative-ai": "latest",

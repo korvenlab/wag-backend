@@ -1,7 +1,11 @@
 import express, { Request, Response } from 'express';
 import { createHmac, timingSafeEqual } from 'crypto';
-import { verifyMercadoPagoWebhookSignature } from '../lib/mercadopagoWebhook';
 import {
+  MP_WEBHOOK_MAX_SKEW_SEC,
+  verifyMercadoPagoWebhookSignature,
+} from '../lib/mercadopagoWebhook';
+import {
+  cancelMpPreapproval,
   createMpMarketplacePayment,
   createMpPreapproval,
   createMpPreapprovalPlan,
@@ -14,6 +18,8 @@ import {
   mpPlatformPublicKey,
   refreshMpAccessToken,
 } from '../lib/mercadopagoClient';
+import { decryptMpSecret, encryptMpSecret } from '../lib/mpTokenCrypto';
+import { clientIp, isRateLimited } from '../lib/mpRateLimit';
 import { frontendBaseUrl } from '../lib/stripeClient';
 import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
 import { supabase } from '../lib/supabase';
@@ -26,9 +32,13 @@ import {
   WAGOO_APPLICATION_FEE_PERCENT,
   FEE_COPY,
   buildFeeSchedulePayload,
+  computeDepositBrl,
 } from '../lib/connectFees';
 
 const router = express.Router();
+
+const PREAPPROVAL_OK = new Set(['authorized', 'approved', 'active', 'pending']);
+const PREAPPROVAL_BAD = new Set(['cancelled', 'canceled', 'paused']);
 
 type MpWebhookBody = {
   id?: number | string;
@@ -108,20 +118,37 @@ async function loadSellerTokens(profileId: string): Promise<{
     .maybeSingle();
   if (!data?.mp_access_token || !data.mp_user_id) return null;
 
-  let accessToken = String(data.mp_access_token);
+  let accessToken: string;
+  let refreshToken: string | null = null;
+  try {
+    accessToken = decryptMpSecret(String(data.mp_access_token)) || '';
+    refreshToken = data.mp_refresh_token
+      ? decryptMpSecret(String(data.mp_refresh_token))
+      : null;
+  } catch (e) {
+    log.error('MP_OAUTH', 'falha ao descriptografar tokens', {
+      profileId,
+      error: e instanceof Error ? e.message : String(e),
+    });
+    return null;
+  }
+  if (!accessToken) return null;
+
   let publicKey = data.mp_public_key ? String(data.mp_public_key) : null;
   const expiresAt = data.mp_token_expires_at ? new Date(String(data.mp_token_expires_at)).getTime() : 0;
   const needsRefresh =
-    Boolean(data.mp_refresh_token) && expiresAt > 0 && expiresAt < Date.now() + 60_000;
+    Boolean(refreshToken) && expiresAt > 0 && expiresAt < Date.now() + 60_000;
 
-  if (needsRefresh && data.mp_refresh_token) {
+  if (needsRefresh && refreshToken) {
     try {
-      const refreshed = await refreshMpAccessToken(String(data.mp_refresh_token));
+      const refreshed = await refreshMpAccessToken(refreshToken);
       accessToken = refreshed.access_token;
       publicKey = refreshed.public_key || publicKey;
       const patch: Record<string, unknown> = {
-        mp_access_token: refreshed.access_token,
-        mp_refresh_token: refreshed.refresh_token || data.mp_refresh_token,
+        mp_access_token: encryptMpSecret(refreshed.access_token),
+        mp_refresh_token: encryptMpSecret(
+          refreshed.refresh_token || refreshToken,
+        ),
         mp_public_key: publicKey,
       };
       if (refreshed.expires_in) {
@@ -157,6 +184,7 @@ async function activateClubMemberFromMp(opts: {
   paymentId?: string | null;
   preapprovalId?: string | null;
   amountBrl?: number | null;
+  feeApplied?: boolean | null;
 }): Promise<void> {
   const periodStart = new Date();
   const periodEnd = new Date(periodStart);
@@ -168,6 +196,20 @@ async function activateClubMemberFromMp(opts: {
     updated_at: new Date().toISOString(),
   };
   if (opts.paymentId) patch.mp_payment_id = opts.paymentId;
+  if (opts.preapprovalId) patch.mp_preapproval_id = opts.preapprovalId;
+  if (opts.feeApplied != null) patch.mp_fee_applied = opts.feeApplied;
+  await supabase.from('club_members').update(patch).eq('id', opts.memberId);
+}
+
+async function setClubMemberStatusFromMp(opts: {
+  memberId: string;
+  status: 'past_due' | 'canceled' | 'paused' | 'active';
+  preapprovalId?: string | null;
+}): Promise<void> {
+  const patch: Record<string, unknown> = {
+    status: opts.status === 'paused' ? 'past_due' : opts.status,
+    updated_at: new Date().toISOString(),
+  };
   if (opts.preapprovalId) patch.mp_preapproval_id = opts.preapprovalId;
   await supabase.from('club_members').update(patch).eq('id', opts.memberId);
 }
@@ -181,6 +223,32 @@ function extractBrickFormData(body: Record<string, unknown>): Record<string, unk
     return body;
   }
   return null;
+}
+
+async function claimWebhookEvent(opts: {
+  topic: string;
+  dataId: string;
+  action?: string | null;
+  liveMode?: boolean;
+  payload?: unknown;
+}): Promise<boolean> {
+  const { error } = await supabase.from('mp_webhook_events').insert({
+    topic: opts.topic.slice(0, 120),
+    data_id: opts.dataId.slice(0, 120),
+    action: opts.action || null,
+    live_mode: opts.liveMode ?? null,
+    payload: opts.payload ?? null,
+  });
+  if (error) {
+    // unique violation → já processado
+    if (String(error.code) === '23505' || /duplicate|unique/i.test(error.message || '')) {
+      return false;
+    }
+    log.warn('MP_WEBHOOK', 'falha ao registrar evento (seguindo mesmo assim)', {
+      error: error.message,
+    });
+  }
+  return true;
 }
 
 /** Status + vínculo MP do salão (substitui Connect para sinal/clube). */
@@ -254,8 +322,8 @@ router.get('/oauth/callback', async (req: Request, res: Response) => {
       .from('profiles')
       .update({
         mp_user_id: tokens.user_id != null ? String(tokens.user_id) : null,
-        mp_access_token: tokens.access_token,
-        mp_refresh_token: tokens.refresh_token || null,
+        mp_access_token: encryptMpSecret(tokens.access_token),
+        mp_refresh_token: encryptMpSecret(tokens.refresh_token || null),
         mp_public_key: tokens.public_key || null,
         mp_token_expires_at: expiresAt,
         mp_linked_at: new Date().toISOString(),
@@ -338,6 +406,14 @@ router.patch('/deposit-settings', async (req: Request, res: Response) => {
   });
 });
 
+/** Preview de taxas (substitui /api/stripe/connect/fee-preview para sinal/clube). */
+router.get('/fee-preview', async (req: Request, res: Response) => {
+  const total = Number(req.query.total_brl ?? req.query.total ?? 0);
+  const percent = Number(req.query.deposit_percent ?? 30);
+  const deposit = computeDepositBrl(total, percent);
+  res.json(buildFeeSchedulePayload(deposit));
+});
+
 /** Sessão pública para tela de pagamento do sinal. */
 router.get(
   '/public/booking/:slug/appointments/:appointmentId',
@@ -392,6 +468,9 @@ router.post(
   async (req: Request, res: Response) => {
     const slug = String(req.params.slug || '').trim();
     const appointmentId = String(req.params.appointmentId || '').trim();
+    if (isRateLimited(`mp-pay:${clientIp(req)}:${appointmentId}`, { limit: 12, windowMs: 60_000 })) {
+      return res.status(429).json({ error: 'Muitas tentativas. Aguarde um minuto.' });
+    }
     const method = String(req.body?.method || 'pix').toLowerCase();
     const brickFormData = extractBrickFormData((req.body || {}) as Record<string, unknown>);
 
@@ -468,7 +547,7 @@ router.post(
         brickFormData,
         installments: Number(req.body?.installments) || 1,
         issuerId: req.body?.issuer_id ?? null,
-        idempotencyKey: `deposit-${appt.id}-${method}-${Date.now()}`,
+        idempotencyKey: `deposit-${appt.id}-${brickFormData ? 'brick' : method}`,
       });
 
       const paymentId = payment.id != null ? String(payment.id) : '';
@@ -555,6 +634,9 @@ router.get('/public/club/:slug/members/:memberId', async (req: Request, res: Res
 router.post('/public/club/:slug/members/:memberId/pay', async (req: Request, res: Response) => {
   const slug = String(req.params.slug || '').trim();
   const memberId = String(req.params.memberId || '').trim();
+  if (isRateLimited(`mp-club-pay:${clientIp(req)}:${memberId}`, { limit: 12, windowMs: 60_000 })) {
+    return res.status(429).json({ error: 'Muitas tentativas. Aguarde um minuto.' });
+  }
   const method = String(req.body?.method || 'pix').toLowerCase();
   const brickFormData = extractBrickFormData((req.body || {}) as Record<string, unknown>);
 
@@ -623,7 +705,7 @@ router.post('/public/club/:slug/members/:memberId/pay', async (req: Request, res
       brickFormData,
       installments: Number(req.body?.installments) || 1,
       issuerId: req.body?.issuer_id ?? null,
-      idempotencyKey: `club-${member.id}-${method}-${Date.now()}`,
+      idempotencyKey: `club-${member.id}-${brickFormData ? 'brick' : method}`,
     });
 
     const paymentId = payment.id != null ? String(payment.id) : '';
@@ -661,6 +743,9 @@ router.post(
   async (req: Request, res: Response) => {
     const slug = String(req.params.slug || '').trim();
     const memberId = String(req.params.memberId || '').trim();
+    if (isRateLimited(`mp-sub:${clientIp(req)}:${memberId}`, { limit: 8, windowMs: 60_000 })) {
+      return res.status(429).json({ error: 'Muitas tentativas. Aguarde um minuto.' });
+    }
     const brickFormData = extractBrickFormData((req.body || {}) as Record<string, unknown>);
     const cardToken =
       (brickFormData && typeof brickFormData.token === 'string' && brickFormData.token) ||
@@ -732,7 +817,7 @@ router.post(
         await supabase.from('club_plans').update({ mp_plan_id: planId }).eq('id', plan.id);
       }
 
-      const preapproval = await createMpPreapproval({
+      const { preapproval, feeApplied } = await createMpPreapproval({
         sellerAccessToken: seller.accessToken,
         planId,
         reason: `${plan.name} · ${member.client_name}`,
@@ -741,27 +826,66 @@ router.post(
         externalReference: `club:${member.id}`,
         backUrl,
         amountBrl,
+        idempotencyKey: `preapproval-club-${member.id}`,
       });
 
       const preapprovalId = preapproval.id != null ? String(preapproval.id) : '';
-      const status = String(preapproval.status || '');
+      const status = String(preapproval.status || '').toLowerCase();
       if (!preapprovalId) throw new Error('Assinatura sem ID.');
+
+      if (PREAPPROVAL_BAD.has(status)) {
+        return res.status(402).json({
+          error: 'Assinatura não autorizada pelo Mercado Pago.',
+          status,
+          preapproval_id: preapprovalId,
+        });
+      }
+
+      if (!PREAPPROVAL_OK.has(status) && status) {
+        // Guarda id mas não ativa até webhook confirmar
+        await supabase
+          .from('club_members')
+          .update({
+            mp_preapproval_id: preapprovalId,
+            mp_fee_applied: feeApplied,
+            status: 'pending',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', member.id);
+        return res.json({
+          preapproval_id: preapprovalId,
+          status,
+          recurring: true,
+          pending: true,
+          fee_applied: feeApplied,
+        });
+      }
 
       await activateClubMemberFromMp({
         memberId: String(member.id),
         preapprovalId,
+        feeApplied,
       });
 
-      pushAdminEvent(
-        'wagoo',
-        `Clube recorrente autorizado #${preapprovalId} · ${member.client_name}`,
-        'online',
-      );
+      if (!feeApplied) {
+        pushAdminEvent(
+          'wagoo',
+          `Clube recorrente #${preapprovalId} SEM taxa Wagoo (API MP rejeitou fee)`,
+          'degraded',
+        );
+      } else {
+        pushAdminEvent(
+          'wagoo',
+          `Clube recorrente autorizado #${preapprovalId} · ${member.client_name}`,
+          'online',
+        );
+      }
 
       return res.json({
         preapproval_id: preapprovalId,
-        status,
+        status: status || 'authorized',
         recurring: true,
+        fee_applied: feeApplied,
       });
     } catch (e) {
       log.error('MP_SUB', 'assinatura clube falhou', e, { memberId });
@@ -769,6 +893,95 @@ router.post(
         error: e instanceof Error ? e.message : 'Falha ao criar assinatura recorrente.',
       });
     }
+  },
+);
+
+/** Dono cancela assinatura recorrente de um membro. */
+router.post('/members/:memberId/cancel', async (req: Request, res: Response) => {
+  const auth = await getUserFromBearerHeader(supabase, req.headers.authorization);
+  if (!auth.ok) return res.status(401).json({ error: 'Faça login.' });
+  const memberId = String(req.params.memberId || '').trim();
+
+  const { data: member } = await supabase
+    .from('club_members')
+    .select('id, profile_id, client_name, mp_preapproval_id, status')
+    .eq('id', memberId)
+    .eq('profile_id', auth.user.id)
+    .maybeSingle();
+  if (!member) return res.status(404).json({ error: 'Membro não encontrado.' });
+
+  const seller = await loadSellerTokens(String(member.profile_id));
+  if (member.mp_preapproval_id && seller) {
+    try {
+      await cancelMpPreapproval(String(member.mp_preapproval_id), seller.accessToken);
+    } catch (e) {
+      log.warn('MP_SUB', 'cancel preapproval falhou (seguindo local)', {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  await setClubMemberStatusFromMp({
+    memberId: String(member.id),
+    status: 'canceled',
+    preapprovalId: member.mp_preapproval_id ? String(member.mp_preapproval_id) : null,
+  });
+  pushAdminEvent('wagoo', `Clube cancelado · ${member.client_name}`, 'degraded');
+  return res.json({ ok: true, status: 'canceled' });
+});
+
+/** Cliente cancela própria assinatura (telefone bate com o cadastro). */
+router.post(
+  '/public/club/:slug/members/:memberId/cancel',
+  async (req: Request, res: Response) => {
+    const slug = String(req.params.slug || '').trim();
+    const memberId = String(req.params.memberId || '').trim();
+    const phoneDigits = String(req.body?.phone || '')
+      .replace(/\D/g, '')
+      .slice(-11);
+    if (phoneDigits.length < 10) {
+      return res.status(400).json({ error: 'Informe o telefone cadastrado.' });
+    }
+
+    const { data: site } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('booking_slug', slug)
+      .maybeSingle();
+    if (!site) return res.status(404).json({ error: 'Salão não encontrado.' });
+
+    const { data: member } = await supabase
+      .from('club_members')
+      .select('id, profile_id, client_phone, mp_preapproval_id, status')
+      .eq('id', memberId)
+      .eq('profile_id', site.id)
+      .maybeSingle();
+    if (!member) return res.status(404).json({ error: 'Assinatura não encontrada.' });
+
+    const memberPhone = String(member.client_phone || '')
+      .replace(/\D/g, '')
+      .slice(-11);
+    if (!memberPhone || memberPhone !== phoneDigits) {
+      return res.status(403).json({ error: 'Telefone não confere.' });
+    }
+
+    const seller = await loadSellerTokens(String(site.id));
+    if (member.mp_preapproval_id && seller) {
+      try {
+        await cancelMpPreapproval(String(member.mp_preapproval_id), seller.accessToken);
+      } catch (e) {
+        log.warn('MP_SUB', 'cancel público falhou no MP', {
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+
+    await setClubMemberStatusFromMp({
+      memberId: String(member.id),
+      status: 'canceled',
+      preapprovalId: member.mp_preapproval_id ? String(member.mp_preapproval_id) : null,
+    });
+    return res.json({ ok: true, status: 'canceled' });
   },
 );
 
@@ -790,9 +1003,10 @@ router.post('/webhook', async (req: Request, res: Response) => {
     xRequestId: headerStr(req, 'x-request-id'),
     dataId,
     secret,
+    maxSkewSec: MP_WEBHOOK_MAX_SKEW_SEC,
   });
   if (!okSig) {
-    log.warn('MP_WEBHOOK', 'assinatura inválida', { topic, dataId });
+    log.warn('MP_WEBHOOK', 'assinatura inválida ou ts fora da janela', { topic, dataId });
     return res.status(401).json({ error: 'invalid_signature' });
   }
 
@@ -807,6 +1021,18 @@ router.post('/webhook', async (req: Request, res: Response) => {
     );
 
     if (!dataId) return;
+
+    const fresh = await claimWebhookEvent({
+      topic,
+      dataId,
+      action: body.action ? String(body.action) : null,
+      liveMode,
+      payload: body,
+    });
+    if (!fresh) {
+      log.info('MP_WEBHOOK', 'evento duplicado ignorado', { topic, dataId });
+      return;
+    }
 
     // Assinaturas / preapproval
     if (
@@ -823,6 +1049,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
       let memberId = byPreapproval?.id ? String(byPreapproval.id) : null;
       let profileId = byPreapproval?.profile_id ? String(byPreapproval.profile_id) : null;
+      let preapprovalStatus: string | null = null;
 
       if (!memberId) {
         // authorized payment id → buscar payment e external_reference club:
@@ -846,9 +1073,21 @@ router.post('/webhook', async (req: Request, res: Response) => {
         if (!memberId && platformToken) {
           try {
             const pre = await getMpPreapproval(dataId, platformToken);
+            preapprovalStatus = String(pre.status || '').toLowerCase();
             const pref =
               typeof pre.external_reference === 'string' ? pre.external_reference : '';
             if (pref.startsWith('club:')) memberId = pref.slice(5);
+          } catch {
+            /* ignore */
+          }
+        }
+      } else {
+        const seller = profileId ? await loadSellerTokens(profileId) : null;
+        const token = seller?.accessToken || mpPlatformAccessToken();
+        if (token) {
+          try {
+            const pre = await getMpPreapproval(dataId, token);
+            preapprovalStatus = String(pre.status || '').toLowerCase();
           } catch {
             /* ignore */
           }
@@ -864,6 +1103,40 @@ router.post('/webhook', async (req: Request, res: Response) => {
             .maybeSingle();
           profileId = m?.profile_id ? String(m.profile_id) : null;
         }
+
+        if (preapprovalStatus && PREAPPROVAL_BAD.has(preapprovalStatus)) {
+          await setClubMemberStatusFromMp({
+            memberId,
+            status: preapprovalStatus === 'paused' ? 'paused' : 'canceled',
+            preapprovalId: byPreapproval?.mp_preapproval_id
+              ? String(byPreapproval.mp_preapproval_id)
+              : dataId,
+          });
+          pushAdminEvent(
+            'wagoo',
+            `Clube ${preapprovalStatus} · membro ${memberId}`,
+            'degraded',
+          );
+          return;
+        }
+
+        // Falha de cobrança autorizada (authorized_payment rejected)
+        if (
+          topic.includes('authorized_payment') &&
+          body.action &&
+          /reject|fail|cancel/i.test(String(body.action))
+        ) {
+          await setClubMemberStatusFromMp({
+            memberId,
+            status: 'past_due',
+            preapprovalId: byPreapproval?.mp_preapproval_id
+              ? String(byPreapproval.mp_preapproval_id)
+              : null,
+          });
+          pushAdminEvent('wagoo', `Clube past_due · membro ${memberId}`, 'degraded');
+          return;
+        }
+
         await activateClubMemberFromMp({
           memberId,
           preapprovalId: byPreapproval?.mp_preapproval_id

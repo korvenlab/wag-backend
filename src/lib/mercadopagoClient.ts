@@ -292,9 +292,15 @@ export async function createMpPreapproval(opts: {
   externalReference: string;
   backUrl: string;
   amountBrl: number;
-}): Promise<Record<string, unknown>> {
+  idempotencyKey?: string;
+}): Promise<{ preapproval: Record<string, unknown>; feeApplied: boolean }> {
   const amount = Math.round(Number(opts.amountBrl) * 100) / 100;
-  const body: Record<string, unknown> = {
+  const fee = wagooMarketplaceFeeBrl(amount);
+  const idemBase =
+    opts.idempotencyKey ||
+    `preapproval-${opts.externalReference.replace(/[^a-zA-Z0-9:_-]/g, '').slice(0, 64)}`;
+
+  const baseBody: Record<string, unknown> = {
     preapproval_plan_id: opts.planId,
     reason: opts.reason.slice(0, 250),
     external_reference: opts.externalReference.slice(0, 256),
@@ -309,29 +315,49 @@ export async function createMpPreapproval(opts: {
     back_url: opts.backUrl,
     status: 'authorized',
   };
-  // Tentativa de fee marketplace (se a API rejeitar, o caller pode retry sem).
-  body.application_fee = wagooMarketplaceFeeBrl(amount);
 
+  // 1) application_fee (marketplace)
   try {
-    return await mpApiFetch('/preapproval', {
+    const preapproval = await mpApiFetch('/preapproval', {
       accessToken: opts.sellerAccessToken,
       method: 'POST',
-      body,
-      idempotencyKey: `preapproval-${opts.externalReference}-${Date.now()}`,
+      body: { ...baseBody, application_fee: fee },
+      idempotencyKey: `${idemBase}-fee`,
     });
+    return { preapproval, feeApplied: true };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (/application_fee|invalid|not.*allow/i.test(msg)) {
-      delete body.application_fee;
-      return mpApiFetch('/preapproval', {
-        accessToken: opts.sellerAccessToken,
-        method: 'POST',
-        body,
-        idempotencyKey: `preapproval-${opts.externalReference}-${Date.now()}-nofee`,
-      });
-    }
-    throw e;
+    log.warn('MP_API', 'preapproval com application_fee rejeitado; tentando marketplace_fee', {
+      msg,
+    });
   }
+
+  // 2) marketplace_fee (alias em alguns fluxos)
+  try {
+    const preapproval = await mpApiFetch('/preapproval', {
+      accessToken: opts.sellerAccessToken,
+      method: 'POST',
+      body: { ...baseBody, marketplace_fee: fee },
+      idempotencyKey: `${idemBase}-mktfee`,
+    });
+    return { preapproval, feeApplied: true };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    log.error(
+      'MP_API',
+      'preapproval sem taxa Wagoo — API rejeitou fee; assinatura criada sem application_fee',
+      { msg, externalReference: opts.externalReference, fee },
+    );
+  }
+
+  // 3) Sem fee (último recurso — marca feeApplied=false para ops)
+  const preapproval = await mpApiFetch('/preapproval', {
+    accessToken: opts.sellerAccessToken,
+    method: 'POST',
+    body: baseBody,
+    idempotencyKey: `${idemBase}-nofee`,
+  });
+  return { preapproval, feeApplied: false };
 }
 
 export async function getMpPreapproval(
@@ -339,4 +365,30 @@ export async function getMpPreapproval(
   accessToken: string,
 ): Promise<Record<string, unknown>> {
   return mpApiFetch(`/preapproval/${preapprovalId}`, { accessToken });
+}
+
+/** Cancela assinatura recorrente (status=cancelled). */
+export async function cancelMpPreapproval(
+  preapprovalId: string,
+  accessToken: string,
+): Promise<Record<string, unknown>> {
+  return mpApiFetch(`/preapproval/${preapprovalId}`, {
+    accessToken,
+    method: 'PUT',
+    body: { status: 'cancelled' },
+    idempotencyKey: `cancel-preapproval-${preapprovalId}`,
+  });
+}
+
+/** Pausa assinatura (status=paused). */
+export async function pauseMpPreapproval(
+  preapprovalId: string,
+  accessToken: string,
+): Promise<Record<string, unknown>> {
+  return mpApiFetch(`/preapproval/${preapprovalId}`, {
+    accessToken,
+    method: 'PUT',
+    body: { status: 'paused' },
+    idempotencyKey: `pause-preapproval-${preapprovalId}`,
+  });
 }

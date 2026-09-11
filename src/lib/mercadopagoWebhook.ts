@@ -1,27 +1,49 @@
 import { createHmac, timingSafeEqual } from 'crypto';
 
+/** Janela padrão anti-replay (5 min). */
+export const MP_WEBHOOK_MAX_SKEW_SEC = 300;
+
+export function parseMercadoPagoSignature(
+  xSignature: string | undefined,
+): { ts: string; v1: string } | null {
+  if (!xSignature) return null;
+  const parts = Object.fromEntries(
+    xSignature.split(',').map((chunk) => {
+      const [k, ...rest] = chunk.trim().split('=');
+      return [k.trim(), rest.join('=').trim()];
+    }),
+  );
+  if (!parts.ts || !parts.v1) return null;
+  return { ts: parts.ts, v1: parts.v1 };
+}
+
 /**
  * Valida x-signature do Mercado Pago (Webhooks).
  * Manifest: id:[data.id];request-id:[x-request-id];ts:[ts];
+ * Opcionalmente rejeita timestamps fora da janela (anti-replay).
  */
 export function verifyMercadoPagoWebhookSignature(input: {
   xSignature: string | undefined;
   xRequestId: string | undefined;
   dataId: string | undefined;
   secret: string;
+  /** Epoch seconds agora; default Date.now()/1000 */
+  nowSec?: number;
+  maxSkewSec?: number;
 }): boolean {
   const secret = input.secret.trim();
   if (!secret || !input.xSignature) return false;
 
-  const parts = Object.fromEntries(
-    input.xSignature.split(',').map((chunk) => {
-      const [k, ...rest] = chunk.trim().split('=');
-      return [k.trim(), rest.join('=').trim()];
-    }),
-  );
-  const ts = parts.ts;
-  const v1 = parts.v1;
-  if (!ts || !v1) return false;
+  const parts = parseMercadoPagoSignature(input.xSignature);
+  if (!parts) return false;
+  const { ts, v1 } = parts;
+
+  const maxSkew = input.maxSkewSec ?? MP_WEBHOOK_MAX_SKEW_SEC;
+  const nowSec = input.nowSec ?? Math.floor(Date.now() / 1000);
+  const tsNum = Number(ts);
+  if (!Number.isFinite(tsNum) || Math.abs(nowSec - tsNum) > maxSkew) {
+    return false;
+  }
 
   const manifestParts: string[] = [];
   if (input.dataId) {

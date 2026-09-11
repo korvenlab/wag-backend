@@ -267,6 +267,8 @@ export type StoreInvoicingSummary = {
    * Não desconta comissão de barbeiro.
    */
   caixa_stripe_brl: number;
+  /** Alias de caixa_stripe_brl (sinais/clube online MP ou Stripe legado). */
+  caixa_online_brl: number;
   sinais_bruto_brl: number;
   sinais_liquido_brl: number;
   clube_bruto_brl: number;
@@ -396,6 +398,7 @@ export function buildStoreInvoicingSummary(opts: {
     taxa_wagoo_brl: Math.round(taxaWagoo * 100) / 100,
     taxa_stripe_brl: Math.round(taxaStripe * 100) / 100,
     caixa_stripe_brl: caixaStripe,
+    caixa_online_brl: caixaStripe,
     sinais_bruto_brl: Math.round(sinaisBruto * 100) / 100,
     sinais_liquido_brl: Math.round(sinaisLiquido * 100) / 100,
     clube_bruto_brl: clubNet.bruto,

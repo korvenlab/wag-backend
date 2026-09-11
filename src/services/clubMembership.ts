@@ -29,6 +29,10 @@ export function clubClientPortalUrl(slug: string): string {
 }
 
 /** Garante Product + Price recorrente + Payment Link na conta Connect. */
+/**
+ * @deprecated Stripe Connect Payment Links — clube migrou para Mercado Pago Brick/Preapproval.
+ * Mantido só para histórico; não chamar em fluxos novos.
+ */
 export async function ensureClubStripeAssets(opts: {
   plan: ClubPlanRow;
   connectAccountId: string;

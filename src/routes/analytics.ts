@@ -336,6 +336,8 @@ export async function buildAnalyticsSummaryPayload(
       auto_commission_brl: barbers.reduce((s, b) => s + b.auto_commission_brl, 0),
       caixa_loja_brl: store.caixa_loja_brl,
       caixa_stripe_brl: store.caixa_stripe_brl,
+      /** Alias canônico (sinais/clube MP + legado Stripe). */
+      caixa_online_brl: store.caixa_stripe_brl,
       faturamento_servicos_brl: store.faturamento_servicos_brl,
       barbeiros_equipe: store.barbeiros_equipe,
     },
