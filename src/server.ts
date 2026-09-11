@@ -4,6 +4,7 @@ dotenv.config();
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import stripeRoutes from './routes/stripe';
+import mercadopagoRoutes from './routes/mercadopago';
 import adminDashboardRoutes from './routes/adminDashboard';
 import feedbackRoutes from './routes/feedback';
 import promoRoutes from './routes/promo';
@@ -78,6 +79,8 @@ app.use(cors({
     'Content-Type',
     'Authorization',
     'stripe-signature',
+    'x-signature',
+    'x-request-id',
     'x-admin-secret',
     'x-api-key',
     'X-API-Key',
@@ -89,6 +92,7 @@ app.use(cors({
 
 app.use('/api/stripe', stripeRoutes);
 app.use(express.json({ limit: '4mb' }));
+app.use('/api/mercadopago', mercadopagoRoutes);
 app.use('/feedback', feedbackRoutes);
 app.use('/api/admin', adminDashboardRoutes);
 app.use('/api/promo', promoRoutes);

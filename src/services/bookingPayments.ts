@@ -19,6 +19,7 @@ export async function fulfillBookingDepositPayment(opts: {
   appointmentId: string;
   paymentIntentId?: string | null;
   checkoutSessionId?: string | null;
+  mpPaymentId?: string | null;
 }): Promise<{ ok: boolean; already?: boolean; error?: string }> {
   const { data: appt, error } = await supabase
     .from('booking_appointments')
@@ -47,6 +48,7 @@ export async function fulfillBookingDepositPayment(opts: {
   };
   if (opts.paymentIntentId) patch.stripe_payment_intent_id = opts.paymentIntentId;
   if (opts.checkoutSessionId) patch.stripe_checkout_session_id = opts.checkoutSessionId;
+  if (opts.mpPaymentId) patch.mp_payment_id = opts.mpPaymentId;
 
   const { error: upErr } = await supabase
     .from('booking_appointments')

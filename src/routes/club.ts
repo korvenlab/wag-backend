@@ -11,7 +11,6 @@ import {
   clubClientPortalUrl,
   createClubCheckoutSession,
   digitsPhone,
-  ensureClubStripeAssets,
   findActiveClubMemberByPhone,
   type ClubPlanRow,
 } from '../services/clubMembership';
@@ -94,7 +93,7 @@ async function requireOwner(req: Request) {
   const { data: profile } = await supabase
     .from('profiles')
     .select(
-      'id, store_name, booking_slug, booking_published, has_paid, complimentary_access_until, subscription_tier, multi_barber_plan, stripe_connect_account_id, stripe_connect_charges_enabled',
+      'id, store_name, booking_slug, booking_published, has_paid, complimentary_access_until, subscription_tier, multi_barber_plan, stripe_connect_account_id, stripe_connect_charges_enabled, mp_user_id, mp_access_token',
     )
     .eq('id', auth.user.id)
     .maybeSingle();
@@ -126,7 +125,7 @@ async function loadPublishedSiteBySlug(slug: string) {
   const { data } = await supabase
     .from('profiles')
     .select(
-      'id, store_name, booking_slug, booking_logo_url, booking_cover_url, booking_tagline, booking_phone, booking_address, booking_published, working_hours, subscription_tier, multi_barber_plan, has_paid, stripe_connect_account_id, stripe_connect_charges_enabled',
+      'id, store_name, booking_slug, booking_logo_url, booking_cover_url, booking_tagline, booking_phone, booking_address, booking_published, working_hours, subscription_tier, multi_barber_plan, has_paid, stripe_connect_account_id, stripe_connect_charges_enabled, mp_user_id, mp_access_token',
     )
     .eq('booking_slug', slug)
     .maybeSingle();
@@ -157,30 +156,29 @@ router.get('/me', async (req: Request, res: Response) => {
   ]);
 
   const slug = gate.profile.booking_slug as string | null;
-  const ready =
-    Boolean(gate.profile.stripe_connect_account_id) &&
-    Boolean(gate.profile.stripe_connect_charges_enabled);
+  const ready = Boolean(gate.profile.mp_user_id && gate.profile.mp_access_token);
 
   res.json({
     plan: plan ?? null,
     members: members ?? [],
     client_portal_url: slug ? clubClientPortalUrl(slug) : null,
-    payment_link_url: plan?.payment_link_url ?? null,
+    payment_link_url: null,
     connect_ready: ready,
+    mp_ready: ready,
+    provider: 'mercadopago',
     wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
   });
 });
 
-/** Cria/atualiza plano e (re)gera Payment Link Stripe. */
+/** Cria/atualiza plano do clube (cobrança Mercado Pago na tela Wagoo). */
 router.put('/me', express.json(), async (req: Request, res: Response) => {
   const gate = await requireOwner(req);
   if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
 
-  const connectId = gate.profile.stripe_connect_account_id as string | null;
-  const chargesOk = Boolean(gate.profile.stripe_connect_charges_enabled);
-  if (!connectId || !chargesOk) {
+  const mpReady = Boolean(gate.profile.mp_user_id && gate.profile.mp_access_token);
+  if (!mpReady) {
     return res.status(400).json({
-      error: 'Conecte a conta em Pagamentos e termine o cadastro Stripe antes de ativar o clube.',
+      error: 'Vincule o Mercado Pago em Pagamentos antes de ativar o clube.',
     });
   }
 
@@ -242,21 +240,10 @@ router.put('/me', express.json(), async (req: Request, res: Response) => {
     plan = data as ClubPlanRow;
   }
 
-  const ensured = await ensureClubStripeAssets({
-    plan,
-    connectAccountId: connectId,
-    storeName: String(gate.profile.store_name || ''),
-    slug,
-  });
-
-  if (!ensured.ok) {
-    return res.status(500).json({ error: ensured.error });
-  }
-
   res.json({
-    plan: ensured.plan,
+    plan,
     client_portal_url: clubClientPortalUrl(slug),
-    payment_link_url: ensured.plan.payment_link_url,
+    payment_link_url: null,
     wagoo_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
   });
 });
@@ -276,8 +263,7 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
     .eq('active', true)
     .maybeSingle();
 
-  const connectReady =
-    Boolean(site.stripe_connect_account_id) && Boolean(site.stripe_connect_charges_enabled);
+  const connectReady = Boolean(site.mp_user_id && site.mp_access_token);
 
   res.json({
     store: {
@@ -491,8 +477,8 @@ router.post('/public/:slug/subscribe', express.json(), async (req: Request, res:
     });
   }
 
-  const connectId = site.stripe_connect_account_id as string | null;
-  if (!connectId || !site.stripe_connect_charges_enabled) {
+  const mpReady = Boolean(site.mp_user_id && site.mp_access_token);
+  if (!mpReady) {
     return res.status(400).json({ error: 'Este salão ainda não aceita pagamento do clube.' });
   }
 
@@ -503,7 +489,7 @@ router.post('/public/:slug/subscribe', express.json(), async (req: Request, res:
     .eq('active', true)
     .maybeSingle();
 
-  if (!plan?.stripe_price_id) {
+  if (!plan || Number(plan.price_brl) <= 0) {
     return res.status(400).json({ error: 'Clube não está disponível nesta loja.' });
   }
 
@@ -562,7 +548,6 @@ router.post('/public/:slug/subscribe', express.json(), async (req: Request, res:
 
   const checkout = await createClubCheckoutSession({
     plan: plan as ClubPlanRow,
-    connectAccountId: connectId,
     slug,
     clientName,
     clientPhone,

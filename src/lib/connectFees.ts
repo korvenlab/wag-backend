@@ -10,25 +10,21 @@
 /** Taxa da plataforma Wagoo sobre cada pagamento de cliente (sinal). Sempre 2%, Pix ou cartão. */
 export const WAGOO_APPLICATION_FEE_PERCENT = 2;
 
-/** Stripe Pix (Brasil) — percentual sobre o valor pago. */
-export const STRIPE_PIX_FEE_PERCENT = 1.19;
+/** Stripe Pix (legado) / Mercado Pago Pix — estimado para UI. */
+export const STRIPE_PIX_FEE_PERCENT = 0.99;
 
-/** Stripe cartão (Brasil) — percentual + valor fixo em BRL. */
-export const STRIPE_CARD_FEE_PERCENT = 3.99;
-export const STRIPE_CARD_FEE_FIXED_BRL = 0.39;
+/** Cartão (Mercado Pago BR, estimativa UI). */
+export const STRIPE_CARD_FEE_PERCENT = 4.98;
+export const STRIPE_CARD_FEE_FIXED_BRL = 0;
 
 /** Textos curtos para UI (dono do salão / simulação) — sem jargão de provedor. */
 export const FEE_COPY = {
   wagoo: `Wagoo: ${WAGOO_APPLICATION_FEE_PERCENT}% do pagamento (Pix ou cartão).`,
-  stripePix: `No Pix: ${STRIPE_PIX_FEE_PERCENT}%.`,
-  stripeCard: `No cartão: ${STRIPE_CARD_FEE_PERCENT}% + R$ ${STRIPE_CARD_FEE_FIXED_BRL
-    .toFixed(2)
-    .replace('.', ',')}.`,
+  stripePix: `No Pix (Mercado Pago): ~${STRIPE_PIX_FEE_PERCENT}%.`,
+  stripeCard: `No cartão (Mercado Pago): ~${STRIPE_CARD_FEE_PERCENT}%.`,
   summary:
     `Do sinal, a Wagoo fica com ${WAGOO_APPLICATION_FEE_PERCENT}%. ` +
-    `No Pix sai mais ${STRIPE_PIX_FEE_PERCENT}%; no cartão, ${STRIPE_CARD_FEE_PERCENT}% + R$ ${STRIPE_CARD_FEE_FIXED_BRL
-      .toFixed(2)
-      .replace('.', ',')}.`,
+    `No Pix sai ~${STRIPE_PIX_FEE_PERCENT}%; no cartão, ~${STRIPE_CARD_FEE_PERCENT}% (Mercado Pago).`,
 } as const;
 
 /** Reserva o horário enquanto o cliente está no Checkout (minutos). */

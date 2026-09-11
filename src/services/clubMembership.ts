@@ -17,7 +17,7 @@ export type ClubPlanRow = {
   payment_link_url: string | null;
 };
 
-function digitsPhone(raw: string): string {
+export function digitsPhone(raw: string): string {
   return String(raw || '')
     .replace(/\D/g, '')
     .slice(0, 20);
@@ -196,59 +196,30 @@ export async function ensureClubStripeAssets(opts: {
 
 export async function createClubCheckoutSession(opts: {
   plan: ClubPlanRow;
-  connectAccountId: string;
+  connectAccountId?: string | null;
   slug: string;
   clientName: string;
   clientPhone: string;
   clientEmail?: string | null;
   memberId: string;
 }): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
-  if (!opts.plan.stripe_price_id) {
-    return { ok: false, error: 'Plano ainda sem preço Stripe. Ative o clube no painel.' };
+  const { data: seller } = await supabase
+    .from('profiles')
+    .select('mp_user_id, mp_access_token')
+    .eq('id', opts.plan.profile_id)
+    .maybeSingle();
+
+  if (!seller?.mp_user_id || !seller?.mp_access_token) {
+    return {
+      ok: false,
+      error: 'Salão ainda não vinculou o Mercado Pago para o clube.',
+    };
   }
 
-  const portal = clubClientPortalUrl(opts.slug);
-  const phone = digitsPhone(opts.clientPhone);
-  const meta = {
-    product: 'wagoo',
-    external_user_id: opts.plan.profile_id,
-    organization_id: opts.plan.profile_id,
-    plan: 'club_membership',
-    wagoo_payment: 'club_membership',
-    profile_id: opts.plan.profile_id,
-    club_plan_id: opts.plan.id,
-    club_member_id: opts.memberId,
-    client_phone: phone,
-    client_name: opts.clientName.slice(0, 120),
-  };
-
-  try {
-    const session = await stripe.checkout.sessions.create(
-      {
-        mode: 'subscription',
-        line_items: [{ price: opts.plan.stripe_price_id, quantity: 1 }],
-        payment_method_types: ['card'],
-        customer_email: opts.clientEmail?.trim() || undefined,
-        client_reference_id: opts.memberId,
-        subscription_data: {
-          application_fee_percent: WAGOO_APPLICATION_FEE_PERCENT,
-          metadata: meta,
-        },
-        metadata: meta,
-        success_url: `${portal}?checkout=success&phone=${encodeURIComponent(phone)}`,
-        cancel_url: `${portal}?checkout=cancel&phone=${encodeURIComponent(phone)}`,
-        locale: 'pt-BR',
-      },
-      { stripeAccount: opts.connectAccountId },
-    );
-
-    if (!session.url) return { ok: false, error: 'Não foi possível abrir o pagamento.' };
-    return { ok: true, url: session.url };
-  } catch (err) {
-    log.error('CLUB', 'checkout falhou', err, { memberId: opts.memberId });
-    const message = err instanceof Error ? err.message : 'Falha no Checkout.';
-    return { ok: false, error: message };
-  }
+  const base = frontendBaseUrl();
+  const slugEnc = encodeURIComponent(opts.slug);
+  const url = `${base}/a/${slugEnc}/cliente/pagar/${opts.memberId}`;
+  return { ok: true, url };
 }
 
 function statusFromSubscription(sub: Stripe.Subscription): 'active' | 'past_due' | 'canceled' {
@@ -381,8 +352,6 @@ export async function handleClubSubscriptionEvent(
     subscription: sub,
   });
 }
-
-export { digitsPhone };
 
 /**
  * Membro com assinatura ativa (e período ainda válido).

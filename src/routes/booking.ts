@@ -199,7 +199,7 @@ async function loadPublishedSite(slug: string) {
   const { data, error } = await supabase
     .from('profiles')
     .select(
-      'id, store_name, booking_slug, booking_logo_url, booking_cover_url, booking_tagline, booking_phone, booking_address, booking_published, working_hours, subscription_tier, multi_barber_plan, has_paid, stripe_connect_account_id, stripe_connect_charges_enabled, booking_deposit_enabled, booking_deposit_percent, booking_advance_pay_enabled',
+      'id, store_name, booking_slug, booking_logo_url, booking_cover_url, booking_tagline, booking_phone, booking_address, booking_published, working_hours, subscription_tier, multi_barber_plan, has_paid, stripe_connect_account_id, stripe_connect_charges_enabled, mp_user_id, mp_access_token, booking_deposit_enabled, booking_deposit_percent, booking_advance_pay_enabled',
     )
     .eq('booking_slug', slug)
     .maybeSingle();
@@ -212,21 +212,24 @@ async function loadPublishedSite(slug: string) {
 
 function siteRequiresDeposit(site: {
   booking_deposit_enabled?: boolean | null;
+  mp_user_id?: string | null;
+  mp_access_token?: string | null;
   stripe_connect_charges_enabled?: boolean | null;
   stripe_connect_account_id?: string | null;
 }): boolean {
-  return Boolean(
-    site.booking_deposit_enabled &&
-      site.stripe_connect_charges_enabled &&
-      site.stripe_connect_account_id,
-  );
+  if (!site.booking_deposit_enabled) return false;
+  if (site.mp_user_id && site.mp_access_token) return true;
+  return Boolean(site.stripe_connect_charges_enabled && site.stripe_connect_account_id);
 }
 
-/** Conta Connect pronta para cobrar (sinal obrigatório ou pagamento antecipado opcional). */
+/** Conta pronta para cobrar (Mercado Pago marketplace ou Stripe legado). */
 function siteCanChargeOnline(site: {
+  mp_user_id?: string | null;
+  mp_access_token?: string | null;
   stripe_connect_charges_enabled?: boolean | null;
   stripe_connect_account_id?: string | null;
 }): boolean {
+  if (site.mp_user_id && site.mp_access_token) return true;
   return Boolean(site.stripe_connect_charges_enabled && site.stripe_connect_account_id);
 }
 
@@ -234,6 +237,8 @@ function siteCanChargeOnline(site: {
 function siteAllowsOptionalAdvance(site: {
   booking_advance_pay_enabled?: boolean | null;
   booking_deposit_enabled?: boolean | null;
+  mp_user_id?: string | null;
+  mp_access_token?: string | null;
   stripe_connect_charges_enabled?: boolean | null;
   stripe_connect_account_id?: string | null;
 }): boolean {
@@ -782,7 +787,8 @@ router.get('/public/:slug', async (req: Request, res: Response) => {
   const depositPercent = Number(site.booking_deposit_percent) || 30;
   const clubTierOk = tierSupportsClub(profileSubscriptionTier(site));
   const connectReady =
-    Boolean(site.stripe_connect_account_id) && Boolean(site.stripe_connect_charges_enabled);
+    Boolean(site.mp_user_id && site.mp_access_token) ||
+    (Boolean(site.stripe_connect_account_id) && Boolean(site.stripe_connect_charges_enabled));
   const clubPortal =
     clubTierOk && site.booking_slug
       ? `${frontendBase()}/a/${site.booking_slug}/cliente`
