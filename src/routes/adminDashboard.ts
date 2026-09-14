@@ -2136,7 +2136,12 @@ function generateWagooPromoCode(): string {
 }
 
 function wagooPublicBaseUrl(): string {
-  return (process.env.FRONTEND_URL || 'https://wagobot.com').replace(/\/+$/, '');
+  // Domínio canónico do app: wagoobot.com (wagobot.com não resolve DNS).
+  const raw = (process.env.FRONTEND_URL || 'https://wagoobot.com').trim().replace(/\/+$/, '');
+  if (/^https?:\/\/(www\.)?wagobot\.com$/i.test(raw)) {
+    return 'https://wagoobot.com';
+  }
+  return raw || 'https://wagoobot.com';
 }
 
 /** Korven: lista links de cortesia Wagoo (`wagoo_promo_links`). */
