@@ -1,7 +1,13 @@
 import express, { Request, Response } from 'express';
 import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
-import { profileHasWagooAccess, rowHasPaidTrue } from '../lib/profileAccess';
+import { profileHasWagooAccess } from '../lib/profileAccess';
 import { supabase } from '../lib/supabase';
+import {
+  normalizeSubscriptionTier,
+  syncLegacyFlagsFromTier,
+  tierSupportsAi,
+  type WagooSubscriptionTier,
+} from '../lib/wagooSubscription';
 
 const router = express.Router();
 
@@ -12,6 +18,10 @@ type ProfilePromoRow = {
   complimentary_access_until?: string | null;
   subscription_tier?: string | null;
 };
+
+function resolvePromoPlanTier(raw: unknown): WagooSubscriptionTier {
+  return normalizeSubscriptionTier(raw) ?? 'basic';
+}
 
 /**
  * Resgata código guardado no front (ex.: query `?wagoo_promo=` → storage) após login Google.
@@ -114,21 +124,20 @@ router.post('/redeem', async (req: Request, res: Response) => {
 
     const newUntil = new Date(base.getTime() + days * 86_400_000).toISOString();
 
-    /** Cortesia: prazo + libera app (has_paid) + Basic se ainda não tiver plano pago. */
-    const alreadyPaid = rowHasPaidTrue(profile?.has_paid);
-    const currentTier = profile?.subscription_tier ?? null;
+    /** Plano definido no link de cortesia (Agenda Web / Basic / Pro / Pro+). */
+    const planTier = resolvePromoPlanTier(
+      (link as { plan_tier?: unknown }).plan_tier,
+    );
+    const flags = syncLegacyFlagsFromTier(planTier);
     const promoPatch: Record<string, unknown> = {
       id: userId,
       complimentary_access_until: newUntil,
-      is_ai_enabled: true,
+      has_paid: true,
+      subscription_tier: planTier,
+      multi_barber_plan: flags.multi_barber_plan,
+      is_ai_enabled: tierSupportsAi(planTier),
     };
     if (emailNorm) promoPatch.email = emailNorm;
-    if (!alreadyPaid) {
-      promoPatch.has_paid = true;
-      if (!currentTier || currentTier === 'agenda_web') {
-        promoPatch.subscription_tier = 'basic';
-      }
-    }
 
     let wrote = false;
     {
@@ -197,6 +206,7 @@ router.post('/redeem', async (req: Request, res: Response) => {
       ok: true,
       complimentary_access_until: newUntil,
       has_access: true,
+      subscription_tier: planTier,
     });
   } catch (e: unknown) {
     console.error('[promo/redeem]', e);

@@ -2167,7 +2167,7 @@ router.get('/wagoo/promo-links', async (_req: Request, res: Response) => {
   }
 });
 
-/** Korven: cria link de cortesia (padrão 60 dias ≈ 2 meses). */
+/** Korven: cria link de cortesia (padrão 60 dias ≈ 2 meses, plano Basic). */
 router.post('/wagoo/promo-links', async (req: Request, res: Response) => {
   try {
     const body = req.body as Record<string, unknown>;
@@ -2187,6 +2187,25 @@ router.post('/wagoo/promo-links', async (req: Request, res: Response) => {
       if (!Number.isNaN(d.getTime())) expiresAt = d.toISOString();
     }
 
+    const planRaw =
+      typeof body.plan_tier === 'string'
+        ? body.plan_tier
+        : typeof body.subscription_tier === 'string'
+          ? body.subscription_tier
+          : 'basic';
+    const planTier = ['agenda_web', 'basic', 'pro', 'pro_plus'].includes(planRaw)
+      ? planRaw
+      : null;
+    if (!planTier) {
+      sendApiError(
+        res,
+        400,
+        'VALIDATION_ERROR',
+        'plan_tier inválido. Use agenda_web, basic, pro ou pro_plus.',
+      );
+      return;
+    }
+
     let code = generateWagooPromoCode();
     for (let attempt = 0; attempt < 5; attempt++) {
       const { data, error } = await supabase
@@ -2197,6 +2216,7 @@ router.post('/wagoo/promo-links', async (req: Request, res: Response) => {
           complimentary_days: days,
           max_redemptions: maxRedemptions,
           expires_at: expiresAt,
+          plan_tier: planTier,
         })
         .select('*')
         .single();
@@ -2208,7 +2228,7 @@ router.post('/wagoo/promo-links', async (req: Request, res: Response) => {
           action: 'wagoo.promo_link.create',
           target: String(data.id),
           timestamp: new Date().toISOString(),
-          meta: { code: data.code },
+          meta: { code: data.code, plan_tier: planTier },
         });
         return res.status(200).type(JSON_UTF8).json({
           ok: true,
