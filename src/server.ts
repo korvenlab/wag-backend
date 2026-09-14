@@ -454,7 +454,7 @@ app.post('/api/auth/sync', async (req: Request, res: Response) => {
         id,
         email: userEmail,
         ...(googleAuthData && { googleAuth: googleAuthData })
-      }, { onConflict: 'email' });
+      }, { onConflict: 'id' });
 
     if (error) throw error;
     log.info('AUTH', 'sync OK', { email: userEmail, userId: id, hasGoogleToken: !!accessToken });

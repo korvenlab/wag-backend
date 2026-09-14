@@ -83,7 +83,7 @@ router.post('/redeem', async (req: Request, res: Response) => {
 
     const emailNorm = auth.user.email ? String(auth.user.email).trim().toLowerCase() : null;
 
-    /** Cortesia sem assinatura Stripe → trata como Basic (IA + Agenda Web). */
+    /** Cortesia sem assinatura Stripe → Basic (IA + Agenda Web) e has_paid para o app. */
     const hasStripeSub = Boolean(
       (prof as { stripe_subscription_id?: string | null } | null)?.stripe_subscription_id,
     );
@@ -91,10 +91,13 @@ router.post('/redeem', async (req: Request, res: Response) => {
     const promoPatch: Record<string, unknown> = {
       complimentary_access_until: newUntil,
       is_ai_enabled: true,
+      is_active: true,
     };
-    if (!hasStripeSub && (!currentTier || currentTier === 'agenda_web')) {
-      promoPatch.subscription_tier = 'basic';
+    if (!hasStripeSub) {
       promoPatch.has_paid = true;
+      if (!currentTier || currentTier === 'agenda_web') {
+        promoPatch.subscription_tier = 'basic';
+      }
     }
 
     const { data: updatedRows, error: upProf } = await supabase
@@ -113,7 +116,8 @@ router.post('/redeem', async (req: Request, res: Response) => {
         id: userId,
         complimentary_access_until: newUntil,
         is_ai_enabled: true,
-        has_paid: false,
+        has_paid: true,
+        subscription_tier: 'basic',
         is_active: true,
       };
       if (emailNorm) insRow.email = emailNorm;
