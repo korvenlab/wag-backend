@@ -1,13 +1,23 @@
 import express, { Request, Response } from 'express';
 import { getUserFromBearerHeader } from '../lib/supabaseAuthUser';
-import { profileHasWagooAccess } from '../lib/profileAccess';
+import { profileHasWagooAccess, rowHasPaidTrue } from '../lib/profileAccess';
 import { supabase } from '../lib/supabase';
 
 const router = express.Router();
 
+type ProfilePromoRow = {
+  id?: string;
+  email?: string | null;
+  has_paid?: unknown;
+  complimentary_access_until?: string | null;
+  subscription_tier?: string | null;
+};
+
 /**
  * Resgata código guardado no front (ex.: query `?wagoo_promo=` → storage) após login Google.
  * POST /api/promo/redeem  { "code": "abc123" }  Authorization: Bearer <access_token>
+ *
+ * Não usa colunas Stripe legadas (`stripe_subscription_id` não existe em profiles).
  */
 router.post('/redeem', async (req: Request, res: Response) => {
   try {
@@ -58,24 +68,20 @@ router.post('/redeem', async (req: Request, res: Response) => {
 
     if (redErr) {
       if (redErr.code === '23505' || redErr.message.includes('duplicate')) {
-        // Já resgatou: ainda assim reaplica o prazo se o perfil estiver sem acesso.
         const { data: existingProf } = await supabase
           .from('profiles')
-          .select('has_paid, complimentary_access_until, subscription_tier, stripe_subscription_id')
+          .select('has_paid, complimentary_access_until, subscription_tier')
           .eq('id', userId)
           .maybeSingle();
 
-        const hasAccess = profileHasWagooAccess(
-          existingProf as { has_paid?: boolean; complimentary_access_until?: string | null },
-        );
+        const hasAccess = profileHasWagooAccess(existingProf as ProfilePromoRow);
         if (hasAccess) {
           return res.status(200).json({
             ok: true,
             already: true,
             has_access: true,
             complimentary_access_until:
-              (existingProf as { complimentary_access_until?: string | null } | null)
-                ?.complimentary_access_until ?? null,
+              (existingProf as ProfilePromoRow | null)?.complimentary_access_until ?? null,
           });
         }
         // Perfil sem acesso apesar do resgate — cai no fluxo de grant abaixo sem novo insert.
@@ -86,7 +92,7 @@ router.post('/redeem', async (req: Request, res: Response) => {
 
     const { data: prof, error: profErr } = await supabase
       .from('profiles')
-      .select('id, complimentary_access_until, subscription_tier, has_paid, stripe_subscription_id, email')
+      .select('id, complimentary_access_until, subscription_tier, has_paid, email')
       .or(
         emailNorm
           ? `id.eq.${userId},email.eq."${emailNorm.replace(/"/g, '')}"`
@@ -97,10 +103,10 @@ router.post('/redeem', async (req: Request, res: Response) => {
 
     if (profErr) return res.status(500).json({ error: profErr.message });
 
+    const profile = prof as ProfilePromoRow | null;
     const now = Date.now();
     let base = new Date(now);
-    const currentUntil = (prof as { complimentary_access_until?: string | null } | null)
-      ?.complimentary_access_until;
+    const currentUntil = profile?.complimentary_access_until;
     if (currentUntil) {
       const cur = new Date(currentUntil).getTime();
       if (Number.isFinite(cur) && cur > now) base = new Date(cur);
@@ -108,25 +114,22 @@ router.post('/redeem', async (req: Request, res: Response) => {
 
     const newUntil = new Date(base.getTime() + days * 86_400_000).toISOString();
 
-    /** Cortesia sem Stripe → libera app (has_paid) + Basic. */
-    const hasStripeSub = Boolean(
-      (prof as { stripe_subscription_id?: string | null } | null)?.stripe_subscription_id,
-    );
-    const currentTier = (prof as { subscription_tier?: string | null } | null)?.subscription_tier;
+    /** Cortesia: prazo + libera app (has_paid) + Basic se ainda não tiver plano pago. */
+    const alreadyPaid = rowHasPaidTrue(profile?.has_paid);
+    const currentTier = profile?.subscription_tier ?? null;
     const promoPatch: Record<string, unknown> = {
       id: userId,
       complimentary_access_until: newUntil,
       is_ai_enabled: true,
     };
     if (emailNorm) promoPatch.email = emailNorm;
-    if (!hasStripeSub) {
+    if (!alreadyPaid) {
       promoPatch.has_paid = true;
       if (!currentTier || currentTier === 'agenda_web') {
         promoPatch.subscription_tier = 'basic';
       }
     }
 
-    // 1) Update por id
     let wrote = false;
     {
       const { data: updatedRows, error: upProf } = await supabase
@@ -141,7 +144,6 @@ router.post('/redeem', async (req: Request, res: Response) => {
       wrote = Boolean(updatedRows?.length);
     }
 
-    // 2) Se o perfil só existe com o mesmo e-mail (id desalinhado), atualiza por e-mail e realinha o id.
     if (!wrote && emailNorm) {
       const { data: byEmail, error: upEmailErr } = await supabase
         .from('profiles')
@@ -155,7 +157,6 @@ router.post('/redeem', async (req: Request, res: Response) => {
       wrote = Boolean(byEmail?.length);
     }
 
-    // 3) Upsert por id (novo usuário)
     if (!wrote) {
       const { error: insErr } = await supabase.from('profiles').upsert(promoPatch, { onConflict: 'id' });
       if (insErr) {
@@ -175,20 +176,15 @@ router.post('/redeem', async (req: Request, res: Response) => {
     }
 
     const { data: fresh } = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
-    let has_access = profileHasWagooAccess(
-      fresh as { has_paid?: boolean; complimentary_access_until?: string | null },
-    );
+    let has_access = profileHasWagooAccess(fresh as ProfilePromoRow);
 
-    // Fallback: perfil ainda só no e-mail
     if (!has_access && emailNorm) {
       const { data: freshEmail } = await supabase
         .from('profiles')
         .select('*')
         .eq('email', emailNorm)
         .maybeSingle();
-      has_access = profileHasWagooAccess(
-        freshEmail as { has_paid?: boolean; complimentary_access_until?: string | null },
-      );
+      has_access = profileHasWagooAccess(freshEmail as ProfilePromoRow);
     }
 
     if (!has_access) {
